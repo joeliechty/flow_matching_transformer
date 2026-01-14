@@ -141,6 +141,7 @@ class FlowMatchingTransformerModel(nn.Module):
     def __init__(
         self,
         input_dim,
+        output_dim=None,
         hidden_dim=512,
         num_layers=12,
         num_heads=8,
@@ -163,8 +164,19 @@ class FlowMatchingTransformerModel(nn.Module):
         """
         super().__init__()
         self.input_dim = input_dim
+
+        if output_dim is None:
+            output_dim = input_dim
+        self.output_dim = output_dim
+
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.mlp_ratio = mlp_ratio
+        self.dropout = dropout
+        self.phase_dim = phase_dim
+        self.max_seq_len = max_seq_len
+
         
         # Input projection
         self.input_proj = nn.Linear(input_dim, hidden_dim)
@@ -194,7 +206,7 @@ class FlowMatchingTransformerModel(nn.Module):
         
         # Output layers
         self.final_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
-        self.output_proj = nn.Linear(hidden_dim, input_dim)
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
         
         # Initialize weights
         self._init_weights()
@@ -291,13 +303,149 @@ class FlowMatchingTransformerModel(nn.Module):
         B = x0.shape[0]
         
         x = x0.clone()
-        dt = 1.0 / num_steps
+        dt = torch.tensor(1.0 / num_steps, device=device)
         
         for step in range(num_steps):
-            t = torch.full((B,), step * dt, device=device)
+            t = torch.full((B,), step * dt.item(), device=device)
             
             # Euler method
             v = self.forward(x, t)
             x = add_twist_to_pose(x, v, dt)
         
         return x
+    
+    def save_checkpoint(self, filepath, optimizer=None, epoch=None, loss=None, **extra_info):
+        """
+        Save model checkpoint.
+        
+        Args:
+            filepath: path to save checkpoint
+            optimizer: optional optimizer state to save
+            epoch: optional epoch number
+            loss: optional loss value
+            **extra_info: any additional information to save
+        """
+        checkpoint = {
+            'model_state_dict': self.state_dict(),
+            'model_config': {
+                'input_dim': self.input_dim,
+                'output_dim': self.output_dim,
+                'hidden_dim': self.hidden_dim,
+                'num_layers': self.num_layers,
+                'num_heads': self.num_heads,
+                'mlp_ratio': self.mlp_ratio,
+                'dropout': self.dropout,
+                'phase_dim': self.phase_dim,
+                'max_seq_len': self.max_seq_len
+            }
+        }
+        
+        if optimizer is not None:
+            checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+        if epoch is not None:
+            checkpoint['epoch'] = epoch
+        if loss is not None:
+            checkpoint['loss'] = loss
+        
+        # Add any extra information
+        checkpoint.update(extra_info)
+        
+        torch.save(checkpoint, filepath)
+        
+    @classmethod
+    def load_checkpoint(cls, filepath, device='cpu', optimizer=None, model_config=None):
+        """
+        Load model from checkpoint.
+        
+        Args:
+            filepath: path to checkpoint file
+            device: device to load model on
+            optimizer: optional optimizer to load state into
+            model_config: optional model config dict. Required if checkpoint doesn't contain model_config
+                         (for backward compatibility with old checkpoints)
+            
+        Returns:
+            model: loaded model
+            checkpoint: full checkpoint dict with epoch, loss, etc.
+        """
+        checkpoint = torch.load(filepath, map_location=device)
+        
+        # Get model config from checkpoint or parameter
+        if 'model_config' in checkpoint:
+            config = checkpoint['model_config']
+        elif model_config is not None:
+            config = model_config
+        else:
+            raise ValueError(
+                "Checkpoint does not contain 'model_config'. "
+                "Please provide model_config parameter to load_checkpoint() with the model configuration."
+            )
+        
+        # Create model from config
+        model = cls(**config)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.to(device)
+        
+        # Load optimizer state if provided
+        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        return model, checkpoint
+    
+    @torch.no_grad()
+    def inference(self, start_poses, num_steps=100, return_trajectory=False):
+        """
+        Generate goal poses from start poses using the trained flow model.
+        
+        Args:
+            start_poses: starting poses as tensors [batch, 7] in quaternion format
+                        (x, y, z, qw, qx, qy, qz) or [batch, seq_len, 7]
+            num_steps: number of ODE integration steps
+            return_trajectory: if True, return full trajectory; if False, only final poses
+            
+        Returns:
+            If return_trajectory=False:
+                goal_poses: final poses [batch, 7] or [batch, seq_len, 7]
+            If return_trajectory=True:
+                trajectory: all intermediate poses [batch, num_steps+1, 7] or [batch, num_steps+1, seq_len, 7]
+        """
+        self.eval()
+        
+        # Handle input shape
+        if start_poses.dim() == 2:
+            # [batch, 7] -> [batch, 1, 7]
+            x = start_poses.unsqueeze(1)
+            squeeze_output = True
+        else:
+            # [batch, seq_len, 7]
+            x = start_poses
+            squeeze_output = False
+        
+        device = x.device
+        B = x.shape[0]
+        dt = torch.tensor(1.0 / num_steps, device=device)
+        
+        if return_trajectory:
+            trajectory = [x.clone()]
+        
+        # Integrate ODE from t=0 to t=1
+        for step in range(num_steps):
+            t = torch.full((B,), step * dt.item(), device=device)
+            v = self.forward(x, t)
+            x = add_twist_to_pose(x, v, dt)
+            
+            if return_trajectory:
+                trajectory.append(x.clone())
+        
+        if return_trajectory:
+            # Stack trajectory: [batch, num_steps+1, seq_len, 7]
+            trajectory = torch.stack(trajectory, dim=1)
+            if squeeze_output:
+                # Remove seq_len dimension: [batch, num_steps+1, 7]
+                trajectory = trajectory.squeeze(2)
+            return trajectory
+        else:
+            if squeeze_output:
+                # Remove seq_len dimension: [batch, 7]
+                x = x.squeeze(1)
+            return x

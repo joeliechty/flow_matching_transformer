@@ -1,0 +1,18 @@
+# pycache stuff
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.eggs
+
+# model checkpoints
+checkpoints/
+
+# images
+*.png
+*.jpg
+*.jpeg
+*.gif

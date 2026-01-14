@@ -1,6 +1,7 @@
 import torch
+import os
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, compute_twist_between_poses, add_twist_to_pose
-from models.flow_matching_transformer import FlowMatchingTransformer
+from models.flow_matching_transformer import FlowMatchingTransformerModel
 
 def generate_interpolated_poses(start_poses, goal_poses, n_steps=10):
     """
@@ -187,13 +188,19 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
         
         # Save checkpoint
         if save_path and (epoch + 1) % 10 == 0:
+            # Create directory if it doesn't exist
+            checkpoint_dir = os.path.dirname(save_path)
+            if checkpoint_dir and not os.path.exists(checkpoint_dir):
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                print(f"Created checkpoint directory: {checkpoint_dir}")
+            
             checkpoint_path = f"{save_path}_epoch_{epoch + 1}.pt"
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-            }, checkpoint_path)
+            model.save_checkpoint(
+                filepath=checkpoint_path,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                loss=avg_loss
+            )
             print(f"Checkpoint saved to {checkpoint_path}\n")
     
     print("Training completed!")
@@ -217,7 +224,7 @@ if __name__ == "__main__":
     start_poses_T = convert_twist_to_pose(start_poses, dt=1.0, return_representation='T_mat')
     print("start_poses (as T_mat poses):\n", start_poses_T)
 
-    # goal pose distribution at different position with same orientation
+    # goal pose distribution at different position with with no rotation
     goal_poses = sample_random_twist(batch_size=3, mu=[5,5,5,0,0,0], sigma=[0.1,0.1,0.1,0.1,0.1,0.1], device=device)
     print("goal_poses (as twists):\n", goal_poses)
     goal_poses_ortho6d = convert_twist_to_pose(goal_poses, dt=1.0, return_representation='ortho6d')
@@ -237,20 +244,22 @@ if __name__ == "__main__":
     print("TRAINING FLOW MATCHING TRANSFORMER")
     print("=" * 60)
     
-    # Define distribution parameters
+    # Define distribution parameters (twist representation)
     start_dist_params = {
         'mu': [0, 0, 0, 0, 0, 0],
         'sigma': [1, 1, 1, 1, 1, 1]
     }
     
+    # goal pos at (5,5,5) with 90 deg rotation around z axis (twist representation)
     goal_dist_params = {
-        'mu': [5, 5, 5, 0, 0, 0],
+        'mu': [5, 5, 5, 0, 0, 1.5708],
         'sigma': [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
     }
     
     # Model configuration
     model = FlowMatchingTransformerModel(
         input_dim=7,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
+        output_dim=6,  # twist representation (vx, vy, vz, wx, wy, wz)
         hidden_dim=128,
         num_layers=4,
         num_heads=4,
@@ -267,7 +276,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     
     # Training hyperparameters
-    num_epochs = 50
+    num_epochs = 10
     num_batches_per_epoch = 100
     batch_size = 32
     n_interpolation_steps = 10
@@ -311,7 +320,7 @@ if __name__ == "__main__":
         x0 = x0.unsqueeze(1)  # Add sequence dimension [5, 1, 7]
         
         print("Initial poses (from start distribution):")
-        print(x0.squeeze(1)[:, :3])  # Print positions
+        print(x0.squeeze(1))
         
         # Generate samples by flowing to goal distribution
         x1 = model.sample(x0, num_steps=50, method='euler')
