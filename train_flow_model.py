@@ -3,6 +3,48 @@ import os
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, compute_twist_between_poses, add_twist_to_pose
 from models.flow_matching_transformer import FlowMatchingTransformerModel
 
+def geodesic_optimal_transport_pairing(start_poses, goal_poses):
+    """
+    Compute optimal transport pairing between start and goal poses on SE(3) manifold.
+    
+    Args:
+        start_poses: Tensor of shape [batch_size, 6] representing start poses as twists.
+        goal_poses: Tensor of shape [batch_size, 6] representing goal poses as twists.
+
+    Returns:
+        paired_goal_poses: Tensor of shape [batch_size, 6], reordered goal poses for optimal transport.
+    """
+    # Convert twists to poses (use quat for better batch handling)
+    start_pose = convert_twist_to_pose(start_poses, dt=1.0, return_representation='quat')  # [batch_size, 7]
+    goal_pose = convert_twist_to_pose(goal_poses, dt=1.0, return_representation='quat')    # [batch_size, 7]
+    
+    batch_size = start_pose.shape[0]
+    
+    # Compute pairwise geodesic distances by repeating tensors to have matching batch dimensions
+    # Repeat start for each goal: [batch_size, batch_size, 7]
+    start_repeated = start_pose.unsqueeze(1).repeat(1, batch_size, 1)  # [batch_size, batch_size, 7]
+    # Repeat goal for each start: [batch_size, batch_size, 7]
+    goal_repeated = goal_pose.unsqueeze(0).repeat(batch_size, 1, 1)    # [batch_size, batch_size, 7]
+    
+    # Flatten to compute all pairwise twists
+    start_flat = start_repeated.reshape(batch_size * batch_size, 7)  # [batch_size^2, 7]
+    goal_flat = goal_repeated.reshape(batch_size * batch_size, 7)    # [batch_size^2, 7]
+    
+    # Compute all pairwise twists at once
+    twist_pairwise_flat = compute_twist_between_poses(start_flat, goal_flat, dt=1.0)  # [batch_size^2, 6]
+    
+    # Compute distances (L2 norm of each twist)
+    dists_flat = torch.norm(twist_pairwise_flat, p=2, dim=-1)  # [batch_size^2]
+    dists = dists_flat.reshape(batch_size, batch_size)  # [batch_size, batch_size]
+    
+    # Solve linear sum assignment problem (Hungarian algorithm)
+    from scipy.optimize import linear_sum_assignment
+    row_ind, col_ind = linear_sum_assignment(dists.cpu().numpy())
+    
+    paired_goal_poses = goal_poses[col_ind]
+    
+    return paired_goal_poses
+
 def generate_interpolated_poses(start_poses, goal_poses, n_steps=10):
     """
     Generate interpolated poses between start and goal poses using twist representation.
@@ -88,6 +130,9 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
         sigma=goal_dist_params['sigma'],
         device=device
     )  # [batch_size, 6]
+
+    # optimal transport pairing
+    goal_poses = geodesic_optimal_transport_pairing(start_poses, goal_poses)  # [batch_size, 6]
     
     # Compute interpolated poses, time steps, and target vector fields (twists)
     interpolated_poses, t, twist_target = generate_interpolated_poses(
