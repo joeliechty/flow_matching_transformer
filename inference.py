@@ -358,7 +358,7 @@ if __name__ == "__main__":
     print("=" * 60)
     
     try:
-        batch_size = 10
+        batch_size = 100
         start_dist_params = {
             'mu': [0, 0, 0, 0, 0, 0],
             'sigma': [0.5, 0.5, 0.5, 0.1, 0.1, 0.1]
@@ -378,7 +378,10 @@ if __name__ == "__main__":
         
         print(f"\nPosition Statistics:")
         print(f"  Start mean: ({start_mean[0]:.3f}, {start_mean[1]:.3f}, {start_mean[2]:.3f})")
+        print(f"  Start std:  ({start_poses[:, :3].std(dim=0)[0]:.3f}, {start_poses[:, :3].std(dim=0)[1]:.3f}, {start_poses[:, :3].std(dim=0)[2]:.3f})")
         print(f"  Goal mean:  ({goal_mean[0]:.3f}, {goal_mean[1]:.3f}, {goal_mean[2]:.3f})")
+        print(f"  Goal std:   ({goal_poses[:, :3].std(dim=0)[0]:.3f}, {goal_poses[:, :3].std(dim=0)[1]:.3f}, {goal_poses[:, :3].std(dim=0)[2]:.3f})")
+
         
     except NameError:
         print("Model not loaded. Skipping this example.\n")

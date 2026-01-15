@@ -205,7 +205,7 @@ class FlowMatchingTransformerModel(nn.Module):
         ])
         
         # Output layers
-        self.final_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+        self.final_norm = AdaptiveLayerNorm(hidden_dim, phase_dim)
         self.output_proj = nn.Linear(hidden_dim, output_dim)
         
         # Initialize weights
@@ -260,7 +260,7 @@ class FlowMatchingTransformerModel(nn.Module):
             x = block(x, phase_emb)
         
         # Final normalization and projection
-        x = self.final_norm(x)
+        x = self.final_norm(x, phase_emb)
         x = self.output_proj(x)
         
         return x
