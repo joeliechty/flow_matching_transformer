@@ -1,154 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from utils.tf_utils import add_twist_to_pose
+from models.support_models import AdaptiveLayerNorm, SinusoidalPosEmb, TransformerBlock
 
 
-class AdaptiveLayerNorm(nn.Module):
-    """Adaptive Layer Normalization that modulates scale and shift based on phase."""
-    
-    def __init__(self, dim, phase_dim):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        # Project phase to scale and shift parameters
-        self.phase_proj = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(phase_dim, 2 * dim, bias=True)
-        )
-        
-    def forward(self, x, phase_emb):
-        """
-        Args:
-            x: input tensor [batch, seq_len, dim]
-            phase_emb: phase embedding [batch, phase_dim]
-        """
-        # Get modulation parameters
-        phase_params = self.phase_proj(phase_emb)  # [batch, 2*dim]
-        scale, shift = phase_params.chunk(2, dim=-1)  # Each [batch, dim]
-        
-        # Apply layer norm and modulate
-        x = self.norm(x)
-        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-        return x
-
-
-class FeedForward(nn.Module):
-    """Feed-forward network with GELU activation."""
-    
-    def __init__(self, dim, hidden_dim, dropout=0.0):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
-            nn.Dropout(dropout)
-        )
-        
-    def forward(self, x):
-        return self.net(x)
-
-
-class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention mechanism."""
-    
-    def __init__(self, dim, num_heads=8, dropout=0.0):
-        super().__init__()
-        assert dim % num_heads == 0, "dim must be divisible by num_heads"
-        
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.proj = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        B, N, C = x.shape
-        
-        # Generate Q, K, V
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
-        
-        # Combine heads
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.dropout(x)
-        
-        return x
-
-
-class TransformerBlock(nn.Module):
-    """Transformer block with AdaLN for phase conditioning."""
-    
-    def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.0, phase_dim=256):
-        super().__init__()
-        self.norm1 = AdaptiveLayerNorm(dim, phase_dim)
-        self.attn = MultiHeadAttention(dim, num_heads, dropout)
-        self.norm2 = AdaptiveLayerNorm(dim, phase_dim)
-        self.mlp = FeedForward(dim, int(dim * mlp_ratio), dropout)
-        
-    def forward(self, x, phase_emb):
-        """
-        Args:
-            x: input tensor [batch, seq_len, dim]
-            phase_emb: phase embedding [batch, phase_dim]
-        """
-        # Attention block with residual
-        x = x + self.attn(self.norm1(x, phase_emb))
-        # MLP block with residual
-        x = x + self.mlp(self.norm2(x, phase_emb))
-        return x
-
-
-class SinusoidalPosEmb(nn.Module):
-    """Sinusoidal positional embeddings for phase/time."""
-    
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        
-    def forward(self, t):
-        """
-        Args:
-            t: phase values [batch] or [batch, 1]
-        """
-        device = t.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = t[:, None] * emb[None, :]
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
-        return emb
-
-
-# class GaussianFourierProjection(nn.Module):
-#     """
-#     Project coordinates into a higher dimensional space using high-freq sinusoidal features.
-#     Standard trick from Tancik et al. (NeurIPS 2020) / Song et al. (ICLR 2021).
-#     """
-#     def __init__(self, input_dim, embed_dim, scale=10.0):
-#         super().__init__()
-#         # Randomly sampled weights (fixed during training)
-#         # scale: Higher values = higher frequency sensitivity
-#         self.W = nn.Parameter(torch.randn(embed_dim // 2, input_dim) * scale, requires_grad=False)
-
-#     def forward(self, x):
-#         x_proj = (2 * torch.pi * x) @ self.W.T
-#         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-
-
-class FlowMatchingTransformerModel(nn.Module):
+class ConditionalFlowMatchingTransformerModel(nn.Module):
     """
-    Flow Matching Transformer with Adaptive Layer Normalization.
+    Conditional Flow Matching Transformer with Adaptive Layer Normalization.
     
     This model uses AdaLN to inject phase information into the transformer blocks,
     enabling proper conditioning on the flow matching phase parameter.
@@ -158,6 +17,7 @@ class FlowMatchingTransformerModel(nn.Module):
         self,
         input_dim,
         output_dim=None,
+        obs_dim=6,
         hidden_dim=512,
         num_layers=12,
         num_heads=8,
@@ -171,6 +31,7 @@ class FlowMatchingTransformerModel(nn.Module):
         Args:
             input_dim: dimension of input features
             hidden_dim: dimension of transformer hidden states
+            obs_dim: dimension of observations
             num_layers: number of transformer layers
             num_heads: number of attention heads
             mlp_ratio: ratio of MLP hidden dim to model dim
@@ -192,14 +53,10 @@ class FlowMatchingTransformerModel(nn.Module):
         self.dropout = dropout
         self.phase_dim = phase_dim
         self.max_seq_len = max_seq_len
-
+        self.obs_dim = obs_dim
         
         # Input projection
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        # self.input_proj = nn.Sequential(
-        #     GaussianFourierProjection(input_dim, hidden_dim, scale=10.0),
-        #     nn.Linear(hidden_dim, hidden_dim)
-        # )
         
         # Positional embeddings
         self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, hidden_dim))
@@ -210,6 +67,14 @@ class FlowMatchingTransformerModel(nn.Module):
             nn.Linear(phase_dim, phase_dim),
             nn.SiLU(),
             nn.Linear(phase_dim, phase_dim)
+        )
+        
+        # Observation embedding 
+        # We assume obs is a flat vector [batch, obs_dim] that becomes 1 token [batch, 1, hidden]
+        self.obs_emb = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
         )
         
         # Transformer blocks
@@ -246,7 +111,7 @@ class FlowMatchingTransformerModel(nn.Module):
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
         
-    def forward(self, x, phase):
+    def forward(self, x, obs, phase):
         """
         Forward pass through the flow matching transformer.
         
@@ -260,32 +125,42 @@ class FlowMatchingTransformerModel(nn.Module):
         """
         B, N, _ = x.shape
         
-        # Ensure phase is the right shape
+        # Embed phase
         if phase.dim() == 1:
             phase = phase.view(-1)
         elif phase.dim() == 2:
             phase = phase.squeeze(-1)
-            
-        # Project input
-        x = self.input_proj(x)
-        
-        # Add positional embeddings
-        x = x + self.pos_emb[:, :N, :]
-        
-        # Get phase embeddings
         phase_emb = self.phase_emb(phase)  # [batch, phase_dim]
+
+        # Embed input
+        x_emb = self.input_proj(x)  # [batch, seq_len, hidden_dim]
+        
+        # Add positional embeddings to denoising tokens
+        x_emb = x_emb + self.pos_emb[:, :N, :]
+
+        # Embed observations
+        o_emb = self.obs_emb(obs)  # [batch, 1, hidden_dim]
+
+        # Concatenate: [Obs_Token, Sequence_Tokens]
+        # Shape becomes [batch, 1 + seq_len, hidden_dim]
+        h = torch.cat([o_emb, x_emb], dim=1)
         
         # Apply transformer blocks with phase conditioning
         for block in self.blocks:
-            x = block(x, phase_emb)
+            h = block(h, phase_emb)
         
         # Final normalization and projection
-        x = self.final_norm(x, phase_emb)
-        x = self.output_proj(x)
+        # We only want to predict the vector field for the sequence 'x', 
+        # so we slice off the observation token (index 0). Take from 
+        # index 1 to end: [batch, N, hidden_dim]
+        h_seq = h[:, 1:, :]
+
+        h_seq = self.final_norm(h_seq, phase_emb)
+        x = self.output_proj(h_seq) # [batch, seq_len, output_dim]
         
         return x
     
-    def cfm_loss(self, x_t, t, v_target, reduction='mean'):
+    def cfm_loss(self, x_t, t, v_target, obs, reduction='mean'):
         """
         Compute conditional flow matching loss using optimal transport path.
         
@@ -299,7 +174,7 @@ class FlowMatchingTransformerModel(nn.Module):
         """
         
         # Predict vector field
-        v_pred = self.forward(x_t, t)
+        v_pred = self.forward(x_t, obs, t)
         
         # Compute MSE loss
         loss = F.mse_loss(v_pred, v_target, reduction=reduction)
@@ -307,7 +182,7 @@ class FlowMatchingTransformerModel(nn.Module):
         return loss
     
     @torch.no_grad()
-    def sample(self, x0, num_steps=100, method='euler'):
+    def sample(self, x0, obs, num_steps=100, method='euler'):
         """
         Generate samples using ODE integration.
         
@@ -329,7 +204,7 @@ class FlowMatchingTransformerModel(nn.Module):
             t = torch.full((B,), step * dt.item(), device=device)
             
             # Euler method
-            v = self.forward(x, t)
+            v = self.forward(x, obs, t)
             x = add_twist_to_pose(x, v, dt)
         
         return x
@@ -356,7 +231,8 @@ class FlowMatchingTransformerModel(nn.Module):
                 'mlp_ratio': self.mlp_ratio,
                 'dropout': self.dropout,
                 'phase_dim': self.phase_dim,
-                'max_seq_len': self.max_seq_len
+                'max_seq_len': self.max_seq_len,
+                'obs_dim': self.obs_dim
             }
         }
         
@@ -413,7 +289,7 @@ class FlowMatchingTransformerModel(nn.Module):
         return model, checkpoint
     
     @torch.no_grad()
-    def inference(self, start_poses, num_steps=100, return_trajectory=False):
+    def inference(self, start_poses, obs, num_steps=100, return_trajectory=False):
         """
         Generate goal poses from start poses using the trained flow model.
         
@@ -451,7 +327,7 @@ class FlowMatchingTransformerModel(nn.Module):
         # Integrate ODE from t=0 to t=1
         for step in range(num_steps):
             t = torch.full((B,), step * dt.item(), device=device)
-            v = self.forward(x, t)
+            v = self.forward(x, obs, t)
             x = add_twist_to_pose(x, v, dt)
             
             if return_trajectory:

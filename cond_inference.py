@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from models.flow_matching_transformer import FlowMatchingTransformerModel
+from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, _quat_to_rot_mat
 
 
@@ -17,7 +17,7 @@ def load_model(checkpoint_path, device='cpu', model_config=None):
         model: loaded FlowMatchingTransformerModel
         checkpoint: full checkpoint dict
     """
-    model, checkpoint = FlowMatchingTransformerModel.load_checkpoint(
+    model, checkpoint = ConditionalFlowMatchingTransformerModel.load_checkpoint(
         checkpoint_path, device=device, model_config=model_config
     )
     model.eval()
@@ -31,13 +31,14 @@ def load_model(checkpoint_path, device='cpu', model_config=None):
     return model, checkpoint
 
 
-def generate_from_start_poses(model, start_poses, num_steps=100, return_trajectory=False, device='cpu'):
+def generate_from_start_poses(model, start_poses, obs, num_steps=100, return_trajectory=False, device='cpu'):
     """
     Generate goal poses from start poses using the trained model.
     
     Args:
         model: trained FlowMatchingTransformerModel
         start_poses: start poses as twists [batch, 6] or quaternions [batch, 7]
+        obs: observation conditioning tensor [batch, obs_dim]
         num_steps: number of ODE integration steps
         return_trajectory: if True, return full trajectory
         device: device to run on
@@ -62,12 +63,12 @@ def generate_from_start_poses(model, start_poses, num_steps=100, return_trajecto
         x0 = x0.to(device)
         
         # Generate goal poses
-        result = model.inference(x0, num_steps=num_steps, return_trajectory=return_trajectory)
+        result = model.inference(x0, obs, num_steps=num_steps, return_trajectory=return_trajectory)
         
     return result
 
 
-def generate_from_distribution(model, distribution_params, batch_size, num_steps=100, 
+def generate_from_distribution(model, distribution_params, obs_params, batch_size, num_steps=100, 
                                return_trajectory=False, device='cpu'):
     """
     Sample start poses from a distribution and generate goal poses.
@@ -93,12 +94,21 @@ def generate_from_distribution(model, distribution_params, batch_size, num_steps
         device=device
     )
     
+    obs = sample_random_twist(
+        batch_size=batch_size,
+        mu=obs_params['mu'],
+        sigma=obs_params['sigma'],
+        device=device
+    )
+
+    obs = obs.unsqueeze(1)  # Add sequence dimension
+
     # Convert to quaternion format
     start_poses = convert_twist_to_pose(start_twists, dt=1.0, return_representation='quat')
     
     # Generate goal poses
     result = generate_from_start_poses(
-        model, start_poses, num_steps=num_steps, 
+        model, start_poses, obs, num_steps=num_steps, 
         return_trajectory=return_trajectory, device=device
     )
     
@@ -273,7 +283,7 @@ if __name__ == "__main__":
     print("EXAMPLE 1: Load model and generate from start poses")
     print("=" * 60)
     
-    checkpoint_path = "checkpoints/flow_matching_model_NO_OT_epoch_10.pt"
+    checkpoint_path = "checkpoints/cond_flow_matching_model_OT_epoch_10.pt"
     
     # Model config (needed for old checkpoints that don't have model_config saved)
     # This should match the configuration used during training
@@ -301,10 +311,18 @@ if __name__ == "__main__":
         
         start_poses = convert_twist_to_pose(start_twists, dt=1.0, return_representation='quat')
         print_poses(start_poses, "Start Poses")
+
+        # all "go down" observations
+        obs = torch.tensor([
+            [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+        ], device=device)
+        obs = obs.unsqueeze(1)  # Add sequence dimension
         
         # Generate goal poses
         goal_poses = generate_from_start_poses(
-            model, start_poses, num_steps=100, return_trajectory=False, device=device
+            model, start_poses, obs, num_steps=100, return_trajectory=False, device=device
         )
         print_poses(goal_poses, "Generated Goal Poses")
         
@@ -328,11 +346,16 @@ if __name__ == "__main__":
             'mu': [5, 5, 5, 0, 0, 1.5708],  # 90 deg around z
             'sigma': [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
         }
+
+        obs_dist_params = {
+            'mu': [0, 0, -1, 0, 0, 0],  # "go up"
+            'sigma': [0.0, 0.0, 0.1, 0.0, 0.0, 0.0]
+        }
         
         n_samples = 15
         # Generate trajectories
         start_poses, trajectory = generate_from_distribution(
-            model, start_dist_params, batch_size=n_samples, num_steps=50,
+            model, start_dist_params, obs_dist_params, batch_size=n_samples, num_steps=50,
             return_trajectory=True, device=device
         )
         

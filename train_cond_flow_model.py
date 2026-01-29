@@ -1,7 +1,7 @@
 import torch
 import os
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, compute_twist_between_poses, add_twist_to_pose
-from models.flow_matching_transformer import FlowMatchingTransformerModel
+from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel
 from scipy.optimize import linear_sum_assignment
 import numpy as np
 
@@ -51,7 +51,6 @@ def geodesic_optimal_transport_pairing(start_poses, goal_poses):
     paired_start_poses = start_poses[row_ind[sorted_indices]]
     
     return paired_start_poses
-    
 
 def generate_interpolated_poses(start_poses, goal_poses, n_steps=10):
     """
@@ -105,7 +104,7 @@ def generate_interpolated_poses(start_poses, goal_poses, n_steps=10):
 
     return interpolated_poses, t, twist_start_to_goal
 
-def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params, goal_dist_params, device='cpu'):
+def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params, goal_dist_params, action_dist_params, device='cpu'):
     """
     Train for one minibatch.
     
@@ -134,7 +133,7 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
         device=device
     )  # [batch_size, 6]
     
-    # Sample goal poses from goal distribution
+    # Sample goal poses from goal distributions, shape: [batch_size, 6]
     for i in range(len(goal_dist_params['mu'])):
         if i == 0:
             goal_poses = sample_random_twist(
@@ -153,12 +152,26 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
                     device=device
                 )
             ), dim=0)
-    # goal_poses = sample_random_twist(
-    #     batch_size=batch_size,
-    #     mu=goal_dist_params['mu'],
-    #     sigma=goal_dist_params['sigma'],
-    #     device=device
-    # )  # [batch_size, 6]
+
+    # Sample actions from action distributions: shape [batch_size, 6]
+    for i in range(len(action_dist_params['mu'])):
+        if i == 0:
+            obs = sample_random_twist(
+                batch_size=batch_size // len(action_dist_params['mu']),
+                mu=action_dist_params['mu'][i],
+                sigma=action_dist_params['sigma'][i],
+                device=device
+            )
+        else:
+            obs = torch.cat((
+                obs,
+                sample_random_twist(
+                    batch_size=batch_size // len(action_dist_params['mu']),
+                    mu=action_dist_params['mu'][i],
+                    sigma=action_dist_params['sigma'][i],
+                    device=device
+                )
+            ), dim=0)
 
     # optimal transport pairing
     start_poses = geodesic_optimal_transport_pairing(start_poses, goal_poses)  # [batch_size, 6]
@@ -177,9 +190,12 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
     # Add sequence dimension (treating each pose as a single sequence element)
     x_t = x_t.unsqueeze(1)  # [batch_size * n_steps, 1, 7]
     v_target = v_target.unsqueeze(1)  # [batch_size * n_steps, 1, 6]
+
+    # Repeat observations and flatten, add sequence dimension
+    obs = obs.unsqueeze(1).repeat_interleave(n_steps, dim=0)  # [batch_size * n_steps, 6]
     
     # Compute loss
-    loss = model.cfm_loss(x_t, t_flat, v_target, reduction='mean')
+    loss = model.cfm_loss(x_t, t_flat, v_target, obs, reduction='mean')
     
     # Backpropagate and optimize
     optimizer.zero_grad()
@@ -188,7 +204,7 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
     
     return loss.item()
 
-def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_dist_params, goal_dist_params, device='cpu'):
+def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_dist_params, goal_dist_params, action_dist_params, device='cpu'):
     """
     Train for one epoch.
     
@@ -200,6 +216,7 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
         n_steps: number of interpolation steps per trajectory
         start_dist_params: dict with 'mu' and 'sigma' for start pose distribution
         goal_dist_params: dict with 'mu' and 'sigma' for goal pose distribution
+        action_dist_params: dict with 'mu' and 'sigma' for action distribution
         device: device to run on
         
     Returns:
@@ -210,7 +227,7 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
     for batch_idx in range(num_batches):
         loss = train_one_minibatch(
             model, optimizer, batch_size, n_steps,
-            start_dist_params, goal_dist_params, device
+            start_dist_params, goal_dist_params, action_dist_params, device
         )
         total_loss += loss
         
@@ -221,7 +238,7 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
     return avg_loss
 
 def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_steps, 
-          start_dist_params, goal_dist_params, device='cpu', save_path=None):
+          start_dist_params, goal_dist_params, action_dist_params, device='cpu', save_path=None):
     """
     Full training loop.
     
@@ -234,6 +251,7 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
         n_steps: number of interpolation steps per trajectory
         start_dist_params: dict with 'mu' and 'sigma' for start pose distribution
         goal_dist_params: dict with 'mu' and 'sigma' for goal pose distribution
+        action_dist_params: dict with 'mu' and 'sigma' for action distribution
         device: device to run on
         save_path: path to save model checkpoints (optional)
         
@@ -254,7 +272,7 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
         
         avg_loss = train_one_epoch(
             model, optimizer, num_batches_per_epoch, batch_size, n_steps,
-            start_dist_params, goal_dist_params, device
+            start_dist_params, goal_dist_params, action_dist_params, device
         )
         
         loss_history.append(avg_loss)
@@ -329,11 +347,18 @@ if __name__ == "__main__":
         'mu': [[5, 5, 5, 0, 0, 1.5708],[5, 5, -5, 0, 0, -1.5708]],
         'sigma': [[0.1, 0.1, 0.1, 0.1, 0.1, 0.1],[0.1, 0.1, 0.1, 0.1, 0.1, 0.1]]
     }
+
+    # the "go up" twist and the "go down" twist
+    action_dist_params = {
+        'mu': [[0, 0, 1, 0, 0, 0],[0, 0, -1, 0, 0, 0]],
+        'sigma': [[0.0, 0.0, 0.1, 0.0, 0.0, 0.0],[0.0, 0.0, 0.1, 0.0, 0.0, 0.0]]
+    }
     
     # Model configuration
-    model = FlowMatchingTransformerModel(
+    model = ConditionalFlowMatchingTransformerModel(
         input_dim=7,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
         output_dim=6,  # twist representation (vx, vy, vz, wx, wy, wz)
+        obs_dim=6,
         hidden_dim=128,
         num_layers=4,
         num_heads=4,
@@ -365,8 +390,9 @@ if __name__ == "__main__":
         n_steps=n_interpolation_steps,
         start_dist_params=start_dist_params,
         goal_dist_params=goal_dist_params,
+        action_dist_params=action_dist_params,
         device=device,
-        save_path='checkpoints/flow_matching_model_OT'
+        save_path='checkpoints/cond_flow_matching_model_OT'
     )
     
     # Plot loss history
