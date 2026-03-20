@@ -233,6 +233,12 @@ if __name__ == "__main__":
         'mu': [[5, 5, 5, 0, 0, 1.5708],[5, 5, -5, 0, 0, -1.5708]],
         'sigma': [[0.1, 0.1, 0.1, 0.1, 0.1, 0.1],[0.1, 0.1, 0.1, 0.1, 0.1, 0.1]]
     }
+
+    # Training hyperparameters
+    num_epochs = 10
+    num_batches_per_epoch = 100
+    batch_size = len(goal_dist_params['mu'])*32
+    n_interpolation_steps = 10
     
     # Model configuration
     model = FlowMatchingTransformerModel(
@@ -252,12 +258,6 @@ if __name__ == "__main__":
     
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    
-    # Training hyperparameters
-    num_epochs = 10
-    num_batches_per_epoch = 100
-    batch_size = len(goal_dist_params['mu'])*32
-    n_interpolation_steps = 10
     
     # Train the model
     loss_history = train(

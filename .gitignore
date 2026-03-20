@@ -16,3 +16,6 @@ checkpoints/
 *.jpg
 *.jpeg
 *.gif
+
+setup_log.txt
+

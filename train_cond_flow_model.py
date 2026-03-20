@@ -2,8 +2,9 @@ import torch
 import os
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, compute_twist_between_poses, add_twist_to_pose
 from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel
+from models.flow_matching_transformer import FlowMatchingTransformerModel
 from utils.train_utils import geodesic_optimal_transport_pairing, generate_interpolated_poses
-
+from omegaconf import OmegaConf
 
 
 def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params, goal_dist_params, action_dist_params, device='cpu'):
@@ -200,16 +201,96 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
     print("Training completed!")
     return loss_history
 
-if __name__ == "__main__":
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}\n")
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="Train Conditional Flow Matching Transformer Model")
+    parser.add_argument('--num_epochs', '-E', type=int, default=10, help='Number of training epochs')
+    parser.add_argument('--num_batches_per_epoch', '-BE', type=int, default=100, help='Number of minibatches per epoch')
+    parser.add_argument('--batch_size', '-B', type=int, default=None, help='Number of samples in each minibatch')
+    parser.add_argument('--conditional', '-C', action='store_true', help='Whether to train conditional model (with observations)')
+    parser.add_argument('--n_steps', type=int, default=10, help='Number of interpolation steps per trajectory')
+    parser.add_argument('--save_path', type=str, default='checkpoints/', help='Path to save model checkpoints')
+    args = parser.parse_args()
+    return args
+
+def generate_training_and_model_config(args, start_dist_params=None, goal_dist_params=None, action_dist_params=None):
+    # Define distribution parameters (twist representation)
+    if start_dist_params is None:
+        start_dist_params = {
+            'mu': [0, 0, 0, 0, 0, 0],
+            'sigma': [1, 1, 1, 1, 1, 1]
+        }
     
-    # Test data generation
-    print("=" * 60)
-    print("TESTING DATA GENERATION")
-    print("=" * 60)
-    
+    # goal pos at (5,5,5) with 90 deg rotation around z axis (twist representation)
+    if goal_dist_params is None:
+        goal_dist_params = {
+            'mu': [[5, 5, 5, 0, 0, 1.5708],[5, 5, -5, 0, 0, -1.5708]],
+            'sigma': [[0.1, 0.1, 0.1, 0.1, 0.1, 0.1],[0.1, 0.1, 0.1, 0.1, 0.1, 0.1]]
+        }
+
+    if args.conditional:
+        if action_dist_params is None:
+            # the "go up" twist and the "go down" twist
+            action_dist_params = {
+                'mu': [[0, 0, 1, 0, 0, 0],[0, 0, -1, 0, 0, 0]],
+                'sigma': [[0.0, 0.0, 0.1, 0.0, 0.0, 0.0],[0.0, 0.0, 0.1, 0.0, 0.0, 0.0]]
+            }
+
+    if args.batch_size is None:
+        batch_size = len(goal_dist_params['mu'])*32
+    else:
+        batch_size = args.batch_size
+
+    if args.conditional:
+        save_path = os.path.join(args.save_path, 'cond_flow_matching_model_OT')
+        obs_dim = 6  # action representation (vx, vy, vz, wx, wy, wz)
+    else:
+        save_path = os.path.join(args.save_path, 'flow_matching_model_OT')
+        obs_dim = None
+
+    # make a config object
+    training_config = {
+        'conditional': args.conditional,
+        'num_epochs': args.num_epochs,
+        'num_batches_per_epoch': args.num_batches_per_epoch,
+        'batch_size': batch_size,
+        'n_interp_steps': args.n_steps,
+        'save_path': save_path,
+        'start_dist_params': start_dist_params,
+        'goal_dist_params': goal_dist_params,
+        'action_dist_params': action_dist_params if args.conditional else None,
+        'lr': 1e-4,
+        'weight_decay': 1e-5
+    }    
+    model_config = {
+        'input_dim': 7,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
+        'output_dim': 6,  # twist representation (vx, vy, vz, wx, wy, wz)
+        'obs_dim': obs_dim,  # action representation (vx, vy, vz, wx, wy, wz)
+        'hidden_dim': 128,
+        'num_layers': 4,
+        'num_heads': 4,
+        'mlp_ratio': 4.0,
+        'dropout': 0.1,
+        'phase_dim': 128,
+        'max_seq_len': 1
+    }
+    config_dict = {
+        'training': training_config,
+        'model': model_config
+    }
+    config = OmegaConf.create(config_dict)
+
+    # save the config to the same directory as the checkpoints
+    if not os.path.exists(args.save_path):
+        os.makedirs(args.save_path, exist_ok=True)
+        print(f"Created directory for saving checkpoints and config: {args.save_path}")
+    config_save_path = save_path + '_training_config.yaml'
+    OmegaConf.save(config, config_save_path)
+    print(f"Training and model configuration saved to {config_save_path}\n")
+
+    return config
+
+def test_data_generation(device):
     # start pose distribution at the origin
     start_poses = sample_random_twist(batch_size=3, mu=[0,0,0,0,0,0], sigma=[1,1,1,1,1,1], device=device)
     print("start_poses (as twists):\n", start_poses)
@@ -232,69 +313,76 @@ if __name__ == "__main__":
     print("t shape:", t.shape)
     print("twist_target shape:", twist_target.shape)
     print()
+
+if __name__ == "__main__":
+
+    args = parse_args()
+
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}\n")
+    
+    # Test data generation
+    print("=" * 60)
+    print("TESTING DATA GENERATION")
+    print("=" * 60)
+    
+    test_data_generation(device)
     
     # Training setup
     print("=" * 60)
     print("TRAINING FLOW MATCHING TRANSFORMER")
     print("=" * 60)
     
-    # Define distribution parameters (twist representation)
-    start_dist_params = {
-        'mu': [0, 0, 0, 0, 0, 0],
-        'sigma': [1, 1, 1, 1, 1, 1]
-    }
-    
-    # goal pos at (5,5,5) with 90 deg rotation around z axis (twist representation)
-    goal_dist_params = {
-        'mu': [[5, 5, 5, 0, 0, 1.5708],[5, 5, -5, 0, 0, -1.5708]],
-        'sigma': [[0.1, 0.1, 0.1, 0.1, 0.1, 0.1],[0.1, 0.1, 0.1, 0.1, 0.1, 0.1]]
-    }
+    config = generate_training_and_model_config(args)
 
-    # the "go up" twist and the "go down" twist
-    action_dist_params = {
-        'mu': [[0, 0, 1, 0, 0, 0],[0, 0, -1, 0, 0, 0]],
-        'sigma': [[0.0, 0.0, 0.1, 0.0, 0.0, 0.0],[0.0, 0.0, 0.1, 0.0, 0.0, 0.0]]
-    }
-    
-    # Model configuration
-    model = ConditionalFlowMatchingTransformerModel(
-        input_dim=7,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
-        output_dim=6,  # twist representation (vx, vy, vz, wx, wy, wz)
-        obs_dim=6,
-        hidden_dim=128,
-        num_layers=4,
-        num_heads=4,
-        mlp_ratio=4.0,
-        dropout=0.1,
-        phase_dim=128,
-        max_seq_len=1
-    ).to(device)
-    
+    print(f"Input Dimension: {config.model.input_dim}")
+    print(f"Number of Epochs: {config.training.num_epochs}")
+
+    if args.conditional:
+        model = ConditionalFlowMatchingTransformerModel(
+            input_dim=config.model.input_dim,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
+            output_dim=config.model.output_dim,  # twist representation (vx, vy, vz, wx, wy, wz)
+            obs_dim=config.model.obs_dim,  # action representation (vx, vy, vz, wx, wy, wz)
+            hidden_dim=config.model.hidden_dim,
+            num_layers=config.model.num_layers,
+            num_heads=config.model.num_heads,
+            mlp_ratio=config.model.mlp_ratio,
+            dropout=config.model.dropout,
+            phase_dim=config.model.phase_dim,
+            max_seq_len=config.model.max_seq_len
+        ).to(device)
+    else:
+        model = FlowMatchingTransformerModel(
+            input_dim=config.model.input_dim,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
+            output_dim=config.model.output_dim,  # twist representation (vx, vy, vz, wx, wy, wz)
+            hidden_dim=config.model.hidden_dim,
+            num_layers=config.model.num_layers,
+            num_heads=config.model.num_heads,
+            mlp_ratio=config.model.mlp_ratio,
+            dropout=config.model.dropout,
+            phase_dim=config.model.phase_dim,
+            max_seq_len=config.model.max_seq_len
+        ).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print()
     
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    
-    # Training hyperparameters
-    num_epochs = 10
-    num_batches_per_epoch = 100
-    batch_size = len(goal_dist_params['mu'])*32
-    n_interpolation_steps = 10
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr, weight_decay=config.training.weight_decay)
     
     # Train the model
     loss_history = train(
         model=model,
         optimizer=optimizer,
-        num_epochs=num_epochs,
-        num_batches_per_epoch=num_batches_per_epoch,
-        batch_size=batch_size,
-        n_steps=n_interpolation_steps,
-        start_dist_params=start_dist_params,
-        goal_dist_params=goal_dist_params,
-        action_dist_params=action_dist_params,
+        num_epochs=config.training.num_epochs,
+        num_batches_per_epoch=config.training.num_batches_per_epoch,
+        batch_size=config.training.batch_size,
+        n_steps=config.training.n_interp_steps,
+        start_dist_params=config.training.start_dist_params,
+        goal_dist_params=config.training.goal_dist_params,
+        action_dist_params=config.training.action_dist_params,
         device=device,
-        save_path='checkpoints/cond_flow_matching_model_OT'
+        save_path=args.save_path
     )
     
     # Plot loss history
@@ -302,35 +390,44 @@ if __name__ == "__main__":
     for epoch, loss in enumerate(loss_history, 1):
         print(f"Epoch {epoch}: {loss:.6f}")
     
-    # Test sampling
-    print("\n" + "=" * 60)
-    print("TESTING SAMPLING")
-    print("=" * 60)
+    # # Test sampling
+    # print("\n" + "=" * 60)
+    # print("TESTING SAMPLING")
+    # print("=" * 60)
     
-    model.eval()
-    with torch.no_grad():
-        # Sample from start distribution
-        test_start_poses = sample_random_twist(
-            batch_size=5,
-            mu=start_dist_params['mu'],
-            sigma=start_dist_params['sigma'],
-            device=device
-        )
+    # model.eval()
+    # with torch.no_grad():
+    #     # Sample from start distribution
+    #     test_start_poses = sample_random_twist(
+    #         batch_size=6,
+    #         mu=config.training.start_dist_params.mu,
+    #         sigma=config.training.start_dist_params.sigma,
+    #         device=device
+    #     )
+
+    #     # go up obs
+    #     down = torch.tensor([
+    #         [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+    #     ], device=device)
+    #     # go down obs
+    #     up = down*-1.0
+    #     obs = torch.cat((up.repeat(3,1), down.repeat(3,1)), dim=0)  # [6, 6]
+    #     obs = obs.unsqueeze(1)  # Add sequence dimension
         
-        # Convert to pose representation
-        x0 = convert_twist_to_pose(test_start_poses, dt=1.0, return_representation='quat')
-        x0 = x0.unsqueeze(1)  # Add sequence dimension [5, 1, 7]
+    #     # Convert to pose representation
+    #     x0 = convert_twist_to_pose(test_start_poses, dt=1.0, return_representation='quat')
+    #     x0 = x0.unsqueeze(1)  # Add sequence dimension [5, 1, 7]
         
-        print("Initial poses (from start distribution):")
-        print(x0.squeeze(1))
+    #     print("Initial poses (from start distribution):")
+    #     print(x0.squeeze(1))
         
-        # Generate samples by flowing to goal distribution
-        x1 = model.sample(x0, num_steps=50, method='euler')
+    #     # Generate samples by flowing to goal distribution
+    #     x1 = model.sample(x0, num_steps=50, method='euler')
         
-        print("\nGenerated poses (should be near goal distribution):")
-        print(x1.squeeze(1)[:, :3])  # Print positions
+    #     print("\nGenerated poses (should be near goal distribution):")
+    #     print(x1.squeeze(1)[:, :3])  # Print positions
         
-        print("\nExpected goal positions around:", goal_dist_params['mu'][:3])
+    #     print("\nExpected goal positions around:", config.training.goal_dist_params.mu[:3])
 
 
     
