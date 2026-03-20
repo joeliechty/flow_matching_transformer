@@ -27,6 +27,12 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
 
     if batch_size % len(goal_dist_params['mu']) != 0:
         raise ValueError("Batch size must be divisible by the number of goal distribution modes.")
+
+    if action_dist_params is not None:
+        if batch_size % len(action_dist_params['mu']) != 0:
+            raise ValueError("Batch size must be divisible by the number of action distribution modes.")
+        if len(goal_dist_params['mu']) != len(action_dist_params['mu']):
+            raise ValueError("Number of goal and action distribution modes must match for conditional models.")
     
     # Sample start poses from start distribution
     start_poses = sample_random_twist(
@@ -56,49 +62,56 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
                 )
             ), dim=0)
 
-    # Sample actions from action distributions: shape [batch_size, 6]
-    for i in range(len(action_dist_params['mu'])):
-        if i == 0:
-            obs = sample_random_twist(
-                batch_size=batch_size // len(action_dist_params['mu']),
-                mu=action_dist_params['mu'][i],
-                sigma=action_dist_params['sigma'][i],
-                device=device
-            )
-        else:
-            obs = torch.cat((
-                obs,
-                sample_random_twist(
+    # Sample actions from action distributions (only for conditional models)
+    if action_dist_params is not None:
+        for i in range(len(action_dist_params['mu'])):
+            if i == 0:
+                obs = sample_random_twist(
                     batch_size=batch_size // len(action_dist_params['mu']),
                     mu=action_dist_params['mu'][i],
                     sigma=action_dist_params['sigma'][i],
                     device=device
                 )
-            ), dim=0)
+            else:
+                obs = torch.cat((
+                    obs,
+                    sample_random_twist(
+                        batch_size=batch_size // len(action_dist_params['mu']),
+                        mu=action_dist_params['mu'][i],
+                        sigma=action_dist_params['sigma'][i],
+                        device=device
+                    )
+                ), dim=0)
+    else:
+        obs = None
 
     # optimal transport pairing
     start_poses = geodesic_optimal_transport_pairing(start_poses, goal_poses)  # [batch_size, 6]
-    
+
     # Compute interpolated poses, time steps, and target vector fields (twists)
     interpolated_poses, t, twist_target = generate_interpolated_poses(
         start_poses, goal_poses, n_steps=n_steps
     )  # [batch_size, n_steps, 7], [batch_size, n_steps], [batch_size, n_steps, 6]
-    
+
     # Flatten batch and steps dimensions
     batch_steps = batch_size * n_steps
     x_t = interpolated_poses.reshape(batch_steps, 7)  # [batch_size * n_steps, 7]
     t_flat = t.reshape(batch_steps)  # [batch_size * n_steps]
     v_target = twist_target.reshape(batch_steps, 6)  # [batch_size * n_steps, 6]
-    
+
     # Add sequence dimension (treating each pose as a single sequence element)
     x_t = x_t.unsqueeze(1)  # [batch_size * n_steps, 1, 7]
     v_target = v_target.unsqueeze(1)  # [batch_size * n_steps, 1, 6]
 
-    # Repeat observations and flatten, add sequence dimension
-    obs = obs.unsqueeze(1).repeat_interleave(n_steps, dim=0)  # [batch_size * n_steps, 6]
-    
-    # Compute loss
-    loss = model.cfm_loss(x_t, t_flat, v_target, obs, reduction='mean')
+    # For conditional models, repeat observations and flatten, add sequence dimension
+    if obs is not None:
+        obs = obs.unsqueeze(1).repeat_interleave(n_steps, dim=0)  # [batch_size * n_steps, 6]
+
+    # Compute loss (conditional vs non-conditional)
+    if isinstance(model, ConditionalFlowMatchingTransformerModel):
+        loss = model.cfm_loss(x_t, t_flat, v_target, obs, reduction='mean')
+    else:
+        loss = model.cfm_loss(x_t, t_flat, v_target, reduction='mean')
     
     # Backpropagate and optimize
     optimizer.zero_grad()
@@ -318,8 +331,8 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Set device (cuda > mps > cpu)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Using device: {device}\n")
     
     # Test data generation
@@ -382,7 +395,7 @@ if __name__ == "__main__":
         goal_dist_params=config.training.goal_dist_params,
         action_dist_params=config.training.action_dist_params,
         device=device,
-        save_path=args.save_path
+        save_path=config.training.save_path
     )
     
     # Plot loss history
