@@ -287,17 +287,18 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         return model, checkpoint
     
     @torch.no_grad()
-    def inference(self, start_poses, obs, num_steps=100, return_trajectory=False, cfg_scale=3.0):
+    def inference(self, start_poses, obs=None, num_steps=100, return_trajectory=False, cfg_scale=3.0):
         """
         Generate goal poses from start poses using the trained flow model.
-        
+
         Args:
             start_poses: starting poses as tensors [batch, 7] in quaternion format
                         (x, y, z, qw, qx, qy, qz) or [batch, seq_len, 7]
+            obs: observation tensor [batch, M, obs_dim]; if None, all tokens replaced with null
             num_steps: number of ODE integration steps
             return_trajectory: if True, return full trajectory; if False, only final poses
             cfg_scale: classifier-free guidance scale (if >1.0, amplifies the predicted vector field for more aggressive generation)
-            
+
         Returns:
             If return_trajectory=False:
                 goal_poses: final poses [batch, 7] or [batch, seq_len, 7]
@@ -305,7 +306,7 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
                 trajectory: all intermediate poses [batch, num_steps+1, 7] or [batch, num_steps+1, seq_len, 7]
         """
         self.eval()
-        
+
         x = start_poses.unsqueeze(1) if start_poses.dim() == 2 else start_poses  # Ensure shape [batch, seq_len, 7]
         squeeze_output = start_poses.dim() == 2
 
@@ -313,17 +314,22 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         B = x.shape[0]
         dt = torch.tensor(1.0 / num_steps, device=device)
 
-        # create a fully masked boolean tensor for unconditional CFG passes
-        uncond_mask = torch.ones(B,obs.shape[1], dtype=torch.bool, device=device)
-        cond_mask = torch.zeros(B,obs.shape[1], dtype=torch.bool, device=device)
+        # When obs is None, use a dummy obs and replace all tokens with null (unconditional)
+        if obs is None:
+            obs = torch.zeros(B, 1, self.obs_dim, device=device)
+            cond_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
+            uncond_mask = cond_mask  # both passes identical; CFG is a no-op
+        else:
+            uncond_mask = torch.ones(B, obs.shape[1], dtype=torch.bool, device=device)
+            cond_mask = torch.zeros(B, obs.shape[1], dtype=torch.bool, device=device)
 
         if return_trajectory: trajectory = [x.clone()]
 
         for step in range(num_steps):
             t = torch.full((B,), step * dt.item(), device=device)
 
-            if cfg_scale > 1.0:
-                # double forward pass for CFG
+            if cfg_scale > 1.0 and not torch.all(cond_mask):
+                # double forward pass for CFG (skipped when fully unconditional)
                 x_double = torch.cat([x, x], dim=0)  # [2*batch, seq_len, 7]
                 t_double = torch.cat([t, t], dim=0)  # [2*batch]
                 obs_double = torch.cat([obs, obs], dim=0)  # [2*batch, obs_dim]
@@ -333,7 +339,7 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
                 v_cond, v_uncond = v_double.chunk(2, dim=0)  # Each [batch, seq_len, 7]
                 v = v_uncond + cfg_scale * (v_cond - v_uncond)  # Amplify the difference
             else:
-                v = self.forward(x, obs, t)  # [batch, seq_len, 7]
+                v = self.forward(x, obs, t, cond_mask=cond_mask)  # [batch, seq_len, 7]
             
             x = add_twist_to_pose(x, v, dt)  # Integrate ODE step
 

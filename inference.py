@@ -76,13 +76,8 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
         # Check if model is conditional
         is_conditional = isinstance(model, ConditionalFlowMatchingTransformerModel)
 
-        # For conditional models, ensure obs is provided (use zeros if None)
-        if is_conditional:
-            if obs is None:
-                batch_size = x0.shape[0]
-                obs = torch.zeros(batch_size, 1, 6, device=device)
-            else:
-                obs = obs.to(device)
+        if is_conditional and obs is not None:
+            obs = obs.to(device)
 
         # Generate goal poses
         try:
@@ -140,7 +135,7 @@ def generate_from_distribution(model, distribution_params, batch_size, obs=None,
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description="Inference with trained flow matching model")
-    parser.add_argument('--actions', '-A', type=str, nargs='+', default=['top', 'right'], help="List of conditions to combine (e.g., top left, bottom right, top)")
+    parser.add_argument('--actions', '-A', type=str, nargs='*', default=None, help="List of conditions to combine (e.g., top left, bottom right, top). Omit for unconditional (null-token) inference.")
     parser.add_argument('--conditional', '-C', action='store_true', help="Whether to use conditional model (requires obs parameters)")
     parser.add_argument('--checkpoint_epoch', '-CE', type=int, default=10, help="Model epoch to load")
     parser.add_argument('--checkpoint_path', '-CP', type=str, default=None, help="Path to checkpoint directory (default: checkpoints/)")
@@ -248,9 +243,12 @@ if __name__ == "__main__":
         print_poses(start_poses, "Start Poses")
 
         # Create observations for conditional model
-        if args.conditional:
+        if args.conditional and args.actions:
             obs = build_obs_from_actions(args.actions, start_poses.shape[0], device)
             print(f"Using actions '{args.actions}' with {obs.shape[1]} tokens.")
+        elif args.conditional:
+            obs = None
+            print("No actions provided — using null tokens (unconditional).")
         else:
             obs = None
 
@@ -277,12 +275,16 @@ if __name__ == "__main__":
     goal_dist = OmegaConf.to_container(config.training.goal_dist_params, resolve=True)
     goal_dist_params = {'mu': goal_dist['mu'][0], 'sigma': goal_dist['sigma'][0]}
 
-    if args.conditional:
+    if args.conditional and args.actions:
         obs = build_obs_from_actions(args.actions, args.num_samples, device)
         goal_all_means = get_goal_modes_for_actions(args.actions, goal_dist)
         print(f"Using actions '{args.actions}', matched {len(goal_all_means)} goal mode(s):")
+    elif args.conditional:
+        obs = None
+        goal_all_means = goal_dist['mu']
+        print(f"No actions provided — using null tokens (unconditional). All goal modes ({len(goal_all_means)}):")
     else:
-        obs_dist_params = None
+        obs = None
         goal_all_means = goal_dist['mu']
         print(f"Goal distribution ({len(goal_all_means)} modes):")
 
@@ -314,7 +316,7 @@ if __name__ == "__main__":
 
     batch_size = 100
 
-    obs_batch = build_obs_from_actions(args.actions, batch_size, device) if args.conditional else None
+    obs_batch = build_obs_from_actions(args.actions, batch_size, device) if (args.conditional and args.actions) else None
     start_poses, goal_poses = generate_from_distribution(
         model, start_dist_params, batch_size=batch_size, obs=obs_batch,
         num_steps=args.num_steps, return_trajectory=False, device=device
