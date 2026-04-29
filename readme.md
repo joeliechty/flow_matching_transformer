@@ -1,4 +1,3 @@
-```markdown
 # SE(3) Manifold Flow Matching Transformer
 
 This repository serves as a practical tutorial and reference implementation for Continuous-Time Generative Modeling on the SE(3) Manifold. It demonstrates how to train a Flow Matching model using a Transformer backbone to generate 3D poses (position and orientation) by learning and integrating spatial velocities (twists).
@@ -29,7 +28,7 @@ The `ConditionalFlowMatchingTransformerModel` extends the architecture to suppor
 
 The repository uses Conda to manage dependencies and isolate the environment.
 
-For Linux/Windows (CUDA):
+For Linux (CUDA):
 ```bash
 git clone <your-repo-url>
 cd flow_matching_transformer
@@ -97,4 +96,3 @@ When you run inference with the `--return_trajectory` flag, the script will auto
   * `visualization_utils.py`: 3D plotting utilities for visualizing SE(3) pose trajectories over time.
 * `train_FmT.py`: The main training loop, loss computation, and checkpointing logic.
 * `inference.py`: ODE solver (Euler integration) for sampling from the trained vector field.
-```
