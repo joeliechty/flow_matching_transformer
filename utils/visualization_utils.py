@@ -3,14 +3,14 @@ import numpy as np
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, _quat_to_rot_mat
 
 
-def visualize_trajectory(trajectory, save_path=None, mean_goal_pose=None):
+def visualize_trajectory(trajectory, save_path=None, mean_goal_poses=None):
     """
     Visualize the trajectory of poses (positions and orientations).
-    
+
     Args:
         trajectory: tensor of shape [batch, num_steps, 7]
         save_path: optional path to save figure
-        mean_goal_pose: optional mean goal pose tensor of shape [7] to display as reference
+        mean_goal_poses: optional list of mean goal poses (each 6D twist or 7D quat) to display as reference
     """
     try:
         import matplotlib.pyplot as plt
@@ -76,58 +76,67 @@ def visualize_trajectory(trajectory, save_path=None, mean_goal_pose=None):
                      length=length, linewidth=linewidth, alpha=alpha,
                      arrow_length_ratio=0.3, color='blue')
     
-    # Plot mean goal pose if provided
-    if mean_goal_pose is not None:
-        # convert from either torch tensor or list to numpy
-        if torch.is_tensor(mean_goal_pose):
-            mean_pose_np = mean_goal_pose.cpu().numpy()
-        elif isinstance(mean_goal_pose, list):
-            mean_pose_np = np.array(mean_goal_pose)
-        else:
-            mean_pose_np = mean_goal_pose
-        
-        # Check if it's a twist (6 elements) or pose (7 elements)
-        if mean_pose_np.shape[-1] == 6:
-            # Convert twist to pose
-            mean_twist_tensor = torch.from_numpy(mean_pose_np).float()
-            mean_pose_tensor = convert_twist_to_pose(mean_twist_tensor, dt=1.0, return_representation='quat')
-            mean_pose_np = mean_pose_tensor.cpu().numpy()
-        
-        mean_pos = mean_pose_np[:3]
-        mean_quat = mean_pose_np[3:7]
-        
-        # Convert quaternion to rotation matrix using tf_utils
-        mean_quat_tensor = torch.from_numpy(mean_quat).float()
-        R_mean = _quat_to_rot_mat(mean_quat_tensor, w_first=True).numpy()
-        
-        # Extract axes
-        x_axis_mean = R_mean[:, 0]
-        y_axis_mean = R_mean[:, 1]
-        z_axis_mean = R_mean[:, 2]
-        
-        # Plot mean goal pose with distinctive styling (extra large and thick, darker colors)
-        mean_length = arrow_length * 3.0  # Even larger than start/end
-        mean_linewidth = arrow_linewidth * 4.0  # Extra thick
-        
-        ax.quiver(mean_pos[0], mean_pos[1], mean_pos[2],
-                 x_axis_mean[0], x_axis_mean[1], x_axis_mean[2],
-                 length=mean_length, linewidth=mean_linewidth, alpha=1.0,
-                 arrow_length_ratio=0.3, color='darkred', label='Mean Goal')
-        ax.quiver(mean_pos[0], mean_pos[1], mean_pos[2],
-                 y_axis_mean[0], y_axis_mean[1], y_axis_mean[2],
-                 length=mean_length, linewidth=mean_linewidth, alpha=1.0,
-                 arrow_length_ratio=0.3, color='darkgreen')
-        ax.quiver(mean_pos[0], mean_pos[1], mean_pos[2],
-                 z_axis_mean[0], z_axis_mean[1], z_axis_mean[2],
-                 length=mean_length, linewidth=mean_linewidth, alpha=1.0,
-                 arrow_length_ratio=0.3, color='darkblue')
+    # Plot mean goal poses if provided
+    if mean_goal_poses is not None:
+        # Normalize to a list of poses
+        if not isinstance(mean_goal_poses, (list, tuple)) or (
+            len(mean_goal_poses) > 0 and not isinstance(mean_goal_poses[0], (list, tuple, np.ndarray))
+        ):
+            mean_goal_poses = [mean_goal_poses]
+
+        mode_colors = [
+            ('darkred',    'darkgreen',      'darkblue'),
+            ('saddlebrown','darkolivegreen',  'navy'),
+            ('maroon',     'teal',            'indigo'),
+            ('sienna',     'darkslategray',   'midnightblue'),
+        ]
+
+        mean_length = arrow_length * 3.0
+        mean_linewidth = arrow_linewidth * 4.0
+
+        for mode_idx, mean_goal_pose in enumerate(mean_goal_poses):
+            if torch.is_tensor(mean_goal_pose):
+                mean_pose_np = mean_goal_pose.cpu().numpy()
+            elif isinstance(mean_goal_pose, list):
+                mean_pose_np = np.array(mean_goal_pose)
+            else:
+                mean_pose_np = mean_goal_pose
+
+            if mean_pose_np.shape[-1] == 6:
+                mean_twist_tensor = torch.from_numpy(mean_pose_np).float()
+                mean_pose_tensor = convert_twist_to_pose(mean_twist_tensor, dt=1.0, return_representation='quat')
+                mean_pose_np = mean_pose_tensor.cpu().numpy()
+
+            mean_pos = mean_pose_np[:3]
+            mean_quat = mean_pose_np[3:7]
+
+            mean_quat_tensor = torch.from_numpy(mean_quat).float()
+            R_mean = _quat_to_rot_mat(mean_quat_tensor, w_first=True).numpy()
+
+            x_axis_mean = R_mean[:, 0]
+            y_axis_mean = R_mean[:, 1]
+            z_axis_mean = R_mean[:, 2]
+
+            colors = mode_colors[mode_idx % len(mode_colors)]
+            ax.quiver(mean_pos[0], mean_pos[1], mean_pos[2],
+                     x_axis_mean[0], x_axis_mean[1], x_axis_mean[2],
+                     length=mean_length, linewidth=mean_linewidth, alpha=1.0,
+                     arrow_length_ratio=0.3, color=colors[0], label=f'Goal Mode {mode_idx}')
+            ax.quiver(mean_pos[0], mean_pos[1], mean_pos[2],
+                     y_axis_mean[0], y_axis_mean[1], y_axis_mean[2],
+                     length=mean_length, linewidth=mean_linewidth, alpha=1.0,
+                     arrow_length_ratio=0.3, color=colors[1])
+            ax.quiver(mean_pos[0], mean_pos[1], mean_pos[2],
+                     z_axis_mean[0], z_axis_mean[1], z_axis_mean[2],
+                     length=mean_length, linewidth=mean_linewidth, alpha=1.0,
+                     arrow_length_ratio=0.3, color=colors[2])
     
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
     title = 'Flow Matching Trajectories\n(RGB Arrows=XYZ Axes, Larger=Start/Goal'
-    if mean_goal_pose is not None:
-        title += ', Largest/Dark=Mean Goal'
+    if mean_goal_poses is not None:
+        title += ', Largest/Dark=Goal Modes'
     title += ')'
     ax.set_title(title)
     ax.legend()

@@ -1,3 +1,4 @@
+import sys
 import torch
 import os
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, compute_twist_between_poses, add_twist_to_pose
@@ -7,7 +8,27 @@ from utils.train_utils import geodesic_optimal_transport_pairing, generate_inter
 from omegaconf import OmegaConf
 
 
-def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params, goal_dist_params, action_dist_params, device='cpu'):
+class _Tee:
+    def __init__(self, log_path):
+        os.makedirs(os.path.dirname(log_path) or '.', exist_ok=True)
+        self._file = open(log_path, 'w')
+        self._stdout = sys.stdout
+        sys.stdout = self
+
+    def write(self, data):
+        self._stdout.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        sys.stdout = self._stdout
+        self._file.close()
+
+
+def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params, goal_dist_params, action_dist_params, use_ot=True, device='cpu'):
     """
     Train for one minibatch.
     
@@ -64,29 +85,28 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
 
     # Sample actions from action distributions (only for conditional models)
     if action_dist_params is not None:
-        for i in range(len(action_dist_params['mu'])):
-            if i == 0:
-                obs = sample_random_twist(
-                    batch_size=batch_size // len(action_dist_params['mu']),
-                    mu=action_dist_params['mu'][i],
-                    sigma=action_dist_params['sigma'][i],
-                    device=device
-                )
-            else:
-                obs = torch.cat((
-                    obs,
-                    sample_random_twist(
-                        batch_size=batch_size // len(action_dist_params['mu']),
-                        mu=action_dist_params['mu'][i],
-                        sigma=action_dist_params['sigma'][i],
-                        device=device
-                    )
-                ), dim=0)
+        obs_list = []
+        num_modes = len(action_dist_params['mu'])
+        bs_per_mode = batch_size // num_modes
+
+        for i in range(num_modes):
+            # mu_tensor shape: [M, 6]
+            mu_tensor = torch.tensor(action_dist_params['mu'][i], dtype=torch.float32, device=device)
+            sigma_tensor = torch.tensor(action_dist_params['sigma'][i], dtype=torch.float32, device=device)
+
+            # Sample noise for [bs_per_mode, M, 6]
+            eps = torch.randn(bs_per_mode, mu_tensor.shape[0], mu_tensor.shape[1], device=device)
+            obs_i = mu_tensor.unsqueeze(0) + eps * sigma_tensor.unsqueeze(0)
+            obs_list.append(obs_i)
+        
+        obs = torch.cat(obs_list, dim=0) # [batch_size, M, 6]
+
     else:
         obs = None
 
     # optimal transport pairing
-    start_poses = geodesic_optimal_transport_pairing(start_poses, goal_poses)  # [batch_size, 6]
+    if use_ot:
+        start_poses = geodesic_optimal_transport_pairing(start_poses, goal_poses)  # [batch_size, 6]
 
     # Compute interpolated poses, time steps, and target vector fields (twists)
     interpolated_poses, t, twist_target = generate_interpolated_poses(
@@ -105,11 +125,26 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
 
     # For conditional models, repeat observations and flatten, add sequence dimension
     if obs is not None:
-        obs = obs.unsqueeze(1).repeat_interleave(n_steps, dim=0)  # [batch_size * n_steps, 6]
+        # Expand [batch_size, M, 6] to [batch_size * n_steps, M, 6]
+        obs = obs.repeat_interleave(n_steps, dim=0)
+
+        # Independent conditioning mask
+        B_steps, M, _ = obs.shape
+
+        # Independent dropout (10% chance to drop each specific observation token)
+        indep_mask = torch.rand(B_steps, M, device=device) < 0.1  # [B_steps, M]
+
+        # Unconditional dropout (10% chance to drop ALL observation tokens in a batch)
+        uncond_mask = torch.rand(B_steps, device=device) < 0.1
+
+        # combine: Token is masked if individually dropped OR batch is fully dropped
+        cond_mask = indep_mask | uncond_mask.unsqueeze(-1)  # [B_steps, M]
+    else:
+        cond_mask = None
 
     # Compute loss (conditional vs non-conditional)
     if isinstance(model, ConditionalFlowMatchingTransformerModel):
-        loss = model.cfm_loss(x_t, t_flat, v_target, obs, reduction='mean')
+        loss = model.cfm_loss(x_t, t_flat, v_target, obs, cond_mask=cond_mask, reduction='mean')
     else:
         loss = model.cfm_loss(x_t, t_flat, v_target, reduction='mean')
     
@@ -120,7 +155,7 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
     
     return loss.item()
 
-def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_dist_params, goal_dist_params, action_dist_params, device='cpu'):
+def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_dist_params, goal_dist_params, action_dist_params, use_ot=True, device='cpu'):
     """
     Train for one epoch.
     
@@ -143,7 +178,7 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
     for batch_idx in range(num_batches):
         loss = train_one_minibatch(
             model, optimizer, batch_size, n_steps,
-            start_dist_params, goal_dist_params, action_dist_params, device
+            start_dist_params, goal_dist_params, action_dist_params, use_ot=use_ot, device=device
         )
         total_loss += loss
         
@@ -153,8 +188,8 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
     avg_loss = total_loss / num_batches
     return avg_loss
 
-def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_steps, 
-          start_dist_params, goal_dist_params, action_dist_params, device='cpu', save_path=None):
+def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_steps,
+          start_dist_params, goal_dist_params, action_dist_params, use_ot=True, device='cpu', save_path=None):
     """
     Full training loop.
     
@@ -188,7 +223,7 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
         
         avg_loss = train_one_epoch(
             model, optimizer, num_batches_per_epoch, batch_size, n_steps,
-            start_dist_params, goal_dist_params, action_dist_params, device
+            start_dist_params, goal_dist_params, action_dist_params, use_ot=use_ot, device=device
         )
         
         loss_history.append(avg_loss)
@@ -223,6 +258,7 @@ def parse_args():
     parser.add_argument('--conditional', '-C', action='store_true', help='Whether to train conditional model (with observations)')
     parser.add_argument('--n_steps', type=int, default=10, help='Number of interpolation steps per trajectory')
     parser.add_argument('--save_path', type=str, default='checkpoints/', help='Path to save model checkpoints')
+    parser.add_argument('--no_ot', action='store_true', help='Disable optimal transport pairing during training')
     args = parser.parse_args()
     return args
 
@@ -237,16 +273,34 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
     # goal pos at (5,5,5) with 90 deg rotation around z axis (twist representation)
     if goal_dist_params is None:
         goal_dist_params = {
-            'mu': [[5, 5, 5, 0, 0, 1.5708],[5, 5, -5, 0, 0, -1.5708]],
-            'sigma': [[0.1, 0.1, 0.1, 0.1, 0.1, 0.1],[0.1, 0.1, 0.1, 0.1, 0.1, 0.1]]
+            'mu': [
+                [5, 5, 5, 0, 0, 1.5708],    # Top-right with 90 deg rotation
+                [5, 5, -5, 0, 0, -1.5708],  # Bottom-right with -90 deg rotation
+                [5, -5, 5, 0, 0, 3.14159],  # Top-left with 180 deg rotation
+                [5, -5, -5, 0, 0, 3.14159]  # Bottom-left with 180 deg rotation
+                   ],
+            'sigma': [
+                [0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+                [0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+                [0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
+                [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+                      ]
         }
 
     if args.conditional:
         if action_dist_params is None:
             # the "go up" twist and the "go down" twist
+            t_v, b_v = [0, 0, 1, 0, 0, 0], [0, 0, -1, 0, 0, 0]
+            r_v, l_v = [0, 1, 0, 0, 0, 0], [0, -1, 0, 0, 0, 0]
+
             action_dist_params = {
-                'mu': [[0, 0, 1, 0, 0, 0],[0, 0, -1, 0, 0, 0]],
-                'sigma': [[0.0, 0.0, 0.1, 0.0, 0.0, 0.0],[0.0, 0.0, 0.1, 0.0, 0.0, 0.0]]
+                'mu': [
+                    [t_v, r_v], # TR matches goal index 0 (Top-right)
+                    [b_v, r_v], # BR matches goal index 1 (Bottom-right)
+                    [t_v, l_v], # TL matches goal index 2 (Top-left)
+                    [b_v, l_v]  # BL matches goal index 3 (Bottom-left)
+                ],
+                'sigma': [[[0.0]*6, [0.0]*6]] * 4
             }
 
     if args.batch_size is None:
@@ -254,16 +308,18 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
     else:
         batch_size = args.batch_size
 
+    ot_suffix = '' if args.no_ot else '_OT'
     if args.conditional:
-        save_path = os.path.join(args.save_path, 'cond_flow_matching_model_OT')
+        save_path = os.path.join(args.save_path, f'cond_flow_matching_model{ot_suffix}')
         obs_dim = 6  # action representation (vx, vy, vz, wx, wy, wz)
     else:
-        save_path = os.path.join(args.save_path, 'flow_matching_model_OT')
+        save_path = os.path.join(args.save_path, f'flow_matching_model{ot_suffix}')
         obs_dim = None
 
     # make a config object
     training_config = {
         'conditional': args.conditional,
+        'use_ot': not args.no_ot,
         'num_epochs': args.num_epochs,
         'num_batches_per_epoch': args.num_batches_per_epoch,
         'batch_size': batch_size,
@@ -331,6 +387,11 @@ if __name__ == "__main__":
 
     args = parse_args()
 
+    _ot_suffix = '' if args.no_ot else '_OT'
+    _model_name = 'cond_flow_matching_model' if args.conditional else 'flow_matching_model'
+    _log_root = os.path.join(args.save_path, f'{_model_name}{_ot_suffix}')
+    _tee = _Tee(_log_root + '_log.txt')
+
     # Set device (cuda > mps > cpu)
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Using device: {device}\n")
@@ -394,6 +455,7 @@ if __name__ == "__main__":
         start_dist_params=config.training.start_dist_params,
         goal_dist_params=config.training.goal_dist_params,
         action_dist_params=config.training.action_dist_params,
+        use_ot=config.training.use_ot,
         device=device,
         save_path=config.training.save_path
     )
@@ -402,6 +464,8 @@ if __name__ == "__main__":
     print("\nLoss history:")
     for epoch, loss in enumerate(loss_history, 1):
         print(f"Epoch {epoch}: {loss:.6f}")
+
+    _tee.close()
     
     # # Test sampling
     # print("\n" + "=" * 60)

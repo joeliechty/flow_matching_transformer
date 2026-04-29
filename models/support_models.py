@@ -84,26 +84,64 @@ class MultiHeadAttention(nn.Module):
         return x
 
 
+class CrossAttention(nn.Module):
+    """Cross-attention mechanism for conditioning."""
+    def __init__(self, dim, context_dim=None, num_heads=8, dropout=0.0):
+        super().__init__()
+        if context_dim is None:
+            context_dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.q = nn.Linear(dim, dim, bias=False)
+        self.kv = nn.Linear(context_dim, dim * 2, bias=False)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, context):
+        B, N, C = x.shape
+        B_c, M, C_c = context.shape
+        
+        q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        # K and V come from the context (the condition tokens)
+        kv = self.kv(context).reshape(B_c, M, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv[0], kv[1]
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        return self.dropout(out)
+    
+
 class TransformerBlock(nn.Module):
-    """Transformer block with AdaLN for phase conditioning."""
+    """Transformer block with Self-Attention, Cross-Attention, and AdaLN."""
     
     def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.0, phase_dim=256):
         super().__init__()
         self.norm1 = AdaptiveLayerNorm(dim, phase_dim)
         self.attn = MultiHeadAttention(dim, num_heads, dropout)
         self.norm2 = AdaptiveLayerNorm(dim, phase_dim)
+        self.cross_attn = CrossAttention(dim, dim, num_heads, dropout)
+        self.norm3 = AdaptiveLayerNorm(dim, phase_dim)
         self.mlp = FeedForward(dim, int(dim * mlp_ratio), dropout)
         
-    def forward(self, x, phase_emb):
+    def forward(self, x, phase_emb, context=None):
         """
         Args:
             x: input tensor [batch, seq_len, dim]
             phase_emb: phase embedding [batch, phase_dim]
         """
-        # Attention block with residual
+        # Self-attention block with residual
         x = x + self.attn(self.norm1(x, phase_emb))
+        # Cross-attention to inject conditions
+        if context is not None:
+            x = x + self.cross_attn(self.norm2(x, phase_emb), context)
         # MLP block with residual
-        x = x + self.mlp(self.norm2(x, phase_emb))
+        x = x + self.mlp(self.norm3(x, phase_emb))
         return x
 
 

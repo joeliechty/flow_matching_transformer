@@ -92,6 +92,9 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         # Output layers
         self.final_norm = AdaptiveLayerNorm(hidden_dim, phase_dim)
         self.output_proj = nn.Linear(hidden_dim, output_dim)
+
+        # Learnable NULL token for unconditional generation/masking
+        self.null_token = nn.Parameter(torch.rand(1, 1, hidden_dim))
         
         # Initialize weights
         self._init_weights()
@@ -111,14 +114,15 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
         
-    def forward(self, x, obs, phase):
+    def forward(self, x, obs, phase, cond_mask=None):
         """
         Forward pass through the flow matching transformer.
         
         Args:
             x: input tensor [batch, seq_len, input_dim]
-            phase: flow matching phase parameter [batch] or [batch, 1], 
-                   typically in range [0, 1]
+            obs: observation tensor [batch, obs_dim]
+            phase: flow matching phase tensor [batch] or [batch, 1]
+            cond_mask: optional boolean mask [batch] indicating which samples are conditioned (if None, all are conditioned)
         
         Returns:
             output: predicted vector field [batch, seq_len, input_dim]
@@ -126,10 +130,8 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         B, N, _ = x.shape
         
         # Embed phase
-        if phase.dim() == 1:
-            phase = phase.view(-1)
-        elif phase.dim() == 2:
-            phase = phase.squeeze(-1)
+        if phase.dim() == 1: phase = phase.view(-1)
+        elif phase.dim() == 2: phase = phase.squeeze(-1)
         phase_emb = self.phase_emb(phase)  # [batch, phase_dim]
 
         # Embed input
@@ -138,29 +140,25 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         # Add positional embeddings to denoising tokens
         x_emb = x_emb + self.pos_emb[:, :N, :]
 
-        # Embed observations
+        # Embed observations (Handles [batch, M, obs_dim] -> [batch, M, hidden_dim])
         o_emb = self.obs_emb(obs)  # [batch, 1, hidden_dim]
+        if cond_mask is not None:
+            # cond_mask is a boolean [batch, M]. True means repalce with NULL token
+            expanded_null = self.null_token.expand(B, o_emb.shape[1], -1)  # [batch, M, hidden_dim]
+            o_emb = torch.where(cond_mask.unsqueeze(-1), expanded_null, o_emb)  # [batch, M, hidden_dim]
 
-        # Concatenate: [Obs_Token, Sequence_Tokens]
-        # Shape becomes [batch, 1 + seq_len, hidden_dim]
-        h = torch.cat([o_emb, x_emb], dim=1)
-        
-        # Apply transformer blocks with phase conditioning
+        h = x_emb
+        # pass o_emb as context for cross-attention
         for block in self.blocks:
-            h = block(h, phase_emb)
+            h = block(h, phase_emb, context=o_emb)
         
         # Final normalization and projection
-        # We only want to predict the vector field for the sequence 'x', 
-        # so we slice off the observation token (index 0). Take from 
-        # index 1 to end: [batch, N, hidden_dim]
-        h_seq = h[:, 1:, :]
-
-        h_seq = self.final_norm(h_seq, phase_emb)
-        x = self.output_proj(h_seq) # [batch, seq_len, output_dim]
+        h = self.final_norm(h, phase_emb)
+        x = self.output_proj(h) # [batch, seq_len, output_dim]
         
         return x
     
-    def cfm_loss(self, x_t, t, v_target, obs, reduction='mean'):
+    def cfm_loss(self, x_t, t, v_target, obs, cond_mask=None, reduction='mean'):
         """
         Compute conditional flow matching loss using optimal transport path.
         
@@ -174,7 +172,7 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         """
         
         # Predict vector field
-        v_pred = self.forward(x_t, obs, t)
+        v_pred = self.forward(x_t, obs, t, cond_mask=cond_mask)
         
         # Compute MSE loss
         loss = F.mse_loss(v_pred, v_target, reduction=reduction)
@@ -289,7 +287,7 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         return model, checkpoint
     
     @torch.no_grad()
-    def inference(self, start_poses, obs, num_steps=100, return_trajectory=False):
+    def inference(self, start_poses, obs, num_steps=100, return_trajectory=False, cfg_scale=3.0):
         """
         Generate goal poses from start poses using the trained flow model.
         
@@ -298,6 +296,7 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
                         (x, y, z, qw, qx, qy, qz) or [batch, seq_len, 7]
             num_steps: number of ODE integration steps
             return_trajectory: if True, return full trajectory; if False, only final poses
+            cfg_scale: classifier-free guidance scale (if >1.0, amplifies the predicted vector field for more aggressive generation)
             
         Returns:
             If return_trajectory=False:
@@ -307,31 +306,38 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         """
         self.eval()
         
-        # Handle input shape
-        if start_poses.dim() == 2:
-            # [batch, 7] -> [batch, 1, 7]
-            x = start_poses.unsqueeze(1)
-            squeeze_output = True
-        else:
-            # [batch, seq_len, 7]
-            x = start_poses
-            squeeze_output = False
-        
+        x = start_poses.unsqueeze(1) if start_poses.dim() == 2 else start_poses  # Ensure shape [batch, seq_len, 7]
+        squeeze_output = start_poses.dim() == 2
+
         device = x.device
         B = x.shape[0]
         dt = torch.tensor(1.0 / num_steps, device=device)
-        
-        if return_trajectory:
-            trajectory = [x.clone()]
-        
-        # Integrate ODE from t=0 to t=1
+
+        # create a fully masked boolean tensor for unconditional CFG passes
+        uncond_mask = torch.ones(B,obs.shape[1], dtype=torch.bool, device=device)
+        cond_mask = torch.zeros(B,obs.shape[1], dtype=torch.bool, device=device)
+
+        if return_trajectory: trajectory = [x.clone()]
+
         for step in range(num_steps):
             t = torch.full((B,), step * dt.item(), device=device)
-            v = self.forward(x, obs, t)
-            x = add_twist_to_pose(x, v, dt)
+
+            if cfg_scale > 1.0:
+                # double forward pass for CFG
+                x_double = torch.cat([x, x], dim=0)  # [2*batch, seq_len, 7]
+                t_double = torch.cat([t, t], dim=0)  # [2*batch]
+                obs_double = torch.cat([obs, obs], dim=0)  # [2*batch, obs_dim]
+                mask_double = torch.cat([cond_mask, uncond_mask], dim=0)  # [2*batch, M]
+
+                v_double = self.forward(x_double, obs_double, t_double, cond_mask=mask_double)  # [2*batch, seq_len, 7]
+                v_cond, v_uncond = v_double.chunk(2, dim=0)  # Each [batch, seq_len, 7]
+                v = v_uncond + cfg_scale * (v_cond - v_uncond)  # Amplify the difference
+            else:
+                v = self.forward(x, obs, t)  # [batch, seq_len, 7]
             
-            if return_trajectory:
-                trajectory.append(x.clone())
+            x = add_twist_to_pose(x, v, dt)  # Integrate ODE step
+
+            if return_trajectory: trajectory.append(x.clone())
         
         if return_trajectory:
             # Stack trajectory: [batch, num_steps+1, seq_len, 7]

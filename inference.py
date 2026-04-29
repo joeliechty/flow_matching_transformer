@@ -96,7 +96,7 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
 
     return result
 
-def generate_from_distribution(model, distribution_params, batch_size, obs_params=None, num_steps=100,
+def generate_from_distribution(model, distribution_params, batch_size, obs=None, num_steps=100,
                                return_trajectory=False, device='cpu'):
     """
     Sample start poses from a distribution and generate goal poses.
@@ -105,7 +105,7 @@ def generate_from_distribution(model, distribution_params, batch_size, obs_param
         model: trained FlowMatchingTransformerModel (conditional or non-conditional)
         distribution_params: dict with 'mu' and 'sigma' for twist distribution
         batch_size: number of samples to generate
-        obs_params: dict with 'mu' and 'sigma' for observation distribution (only for conditional models)
+        obs: tensor of observations
         num_steps: number of ODE integration steps
         return_trajectory: if True, return full trajectory
         device: device to run on
@@ -123,21 +123,6 @@ def generate_from_distribution(model, distribution_params, batch_size, obs_param
         device=device
     )
 
-    # Check if model is conditional
-    is_conditional = isinstance(model, ConditionalFlowMatchingTransformerModel)
-
-    # Only create observations for conditional models
-    if is_conditional and obs_params is not None:
-        obs = sample_random_twist(
-            batch_size=batch_size,
-            mu=obs_params['mu'],
-            sigma=obs_params['sigma'],
-            device=device
-        )
-        obs = obs.unsqueeze(1)  # Add sequence dimension
-    else:
-        obs = None
-
     # Convert to quaternion format
     start_poses = convert_twist_to_pose(start_twists, dt=1.0, return_representation='quat')
 
@@ -152,19 +137,18 @@ def generate_from_distribution(model, distribution_params, batch_size, obs_param
     else:
         return start_poses, result
 
-
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description="Inference with trained flow matching model")
-    parser.add_argument('--action', '-A', type=str, default='up', choices=['up', 'down'], help="Inference action to perform (for conditional models)")
+    parser.add_argument('--actions', '-A', type=str, nargs='+', default=['top', 'right'], help="List of conditions to combine (e.g., top left, bottom right, top)")
     parser.add_argument('--conditional', '-C', action='store_true', help="Whether to use conditional model (requires obs parameters)")
     parser.add_argument('--checkpoint_epoch', '-CE', type=int, default=10, help="Model epoch to load")
     parser.add_argument('--checkpoint_path', '-CP', type=str, default=None, help="Path to checkpoint directory (default: checkpoints/)")
     parser.add_argument('--num_samples', '-N', type=int, default=10, help="Number of samples to generate")
     parser.add_argument('--num_steps', '-STEPS', type=int, default=100, help="Number of ODE integration steps")
     parser.add_argument('--return_trajectory', '-RT', action='store_true', help="Whether to return full trajectory")
+    parser.add_argument('--no_ot', action='store_true', help="Load a model trained without optimal transport pairing")
     return parser.parse_args()
-
 
 def get_config_and_checkpoint_paths(args):
     """
@@ -175,68 +159,50 @@ def get_config_and_checkpoint_paths(args):
         checkpoint_path: path to model checkpoint
     """
     base_path = args.checkpoint_path if args.checkpoint_path else "checkpoints/"
+    ot_suffix = '' if args.no_ot else '_OT'
+    model_name = 'cond_flow_matching_model' if args.conditional else 'flow_matching_model'
 
-    if args.conditional:
-        config_path = f"{base_path}cond_flow_matching_model_OT_training_config.yaml"
-        checkpoint_path = f"{base_path}cond_flow_matching_model_OT_epoch_{args.checkpoint_epoch}.pt"
-    else:
-        config_path = f"{base_path}flow_matching_model_OT_training_config.yaml"
-        checkpoint_path = f"{base_path}flow_matching_model_OT_epoch_{args.checkpoint_epoch}.pt"
+    config_path = f"{base_path}{model_name}{ot_suffix}_training_config.yaml"
+    checkpoint_path = f"{base_path}{model_name}{ot_suffix}_epoch_{args.checkpoint_epoch}.pt"
 
     return config_path, checkpoint_path
 
+def get_goal_modes_for_actions(actions, goal_dist):
+    """Returns the subset of goal mode means whose positions satisfy all action conditions.
 
-def get_obs_params_for_action(config, action):
+    Actions filter on the goal twist (y=index1, z=index2):
+      top/bottom → z > 0 / z < 0
+      right/left → y > 0 / y < 0
+    When multiple actions are given, only modes satisfying ALL conditions are returned.
     """
-    Get observation distribution params for a given action.
-    For conditional models, maps action name to the corresponding distribution.
+    conditions = {
+        'top':    lambda mu: mu[2] > 0,
+        'bottom': lambda mu: mu[2] < 0,
+        'right':  lambda mu: mu[1] > 0,
+        'left':   lambda mu: mu[1] < 0,
+    }
+    return [mu for mu in goal_dist['mu']
+            if all(conditions[a](mu) for a in actions if a in conditions)]
 
-    Args:
-        config: training config with action_dist_params
-        action: 'up' or 'down'
-
-    Returns:
-        obs_dist_params: dict with 'mu' and 'sigma'
-    """
-    action_dist = config.training.action_dist_params
-    if action_dist is None:
-        return None
-
-    # Map action to index (assumes 'up'=0, 'down'=1 based on typical config)
-    # The action_dist_params has multiple modes, match by z-component sign
-    for i, mu in enumerate(action_dist['mu']):
-        if action == 'up' and mu[2] > 0:
-            return {'mu': list(mu), 'sigma': list(action_dist['sigma'][i])}
-        elif action == 'down' and mu[2] < 0:
-            return {'mu': list(mu), 'sigma': list(action_dist['sigma'][i])}
-
-    # Fallback to first mode
-    return {'mu': list(action_dist['mu'][0]), 'sigma': list(action_dist['sigma'][0])}
-
-
-def get_goal_params_for_action(config, action):
-    """
-    Get goal distribution params for a given action.
-    For conditional models, maps action to corresponding goal distribution.
-
-    Args:
-        config: training config with goal_dist_params
-        action: 'up' or 'down'
-
-    Returns:
-        goal_dist_params: dict with 'mu' and 'sigma'
-    """
-    goal_dist = config.training.goal_dist_params
-
-    # Map action to goal by matching z-component sign
-    for i, mu in enumerate(goal_dist['mu']):
-        if action == 'up' and mu[2] > 0:
-            return {'mu': list(mu), 'sigma': list(goal_dist['sigma'][i])}
-        elif action == 'down' and mu[2] < 0:
-            return {'mu': list(mu), 'sigma': list(goal_dist['sigma'][i])}
-
-    # Fallback to first mode
-    return {'mu': list(goal_dist['mu'][0]), 'sigma': list(goal_dist['sigma'][0])}
+def build_obs_from_actions(actions, batch_size, device):
+    """Dynamically builds [batch, M, 6] tensor based on requested conditions."""
+    action_map = {
+        'top':    [0.0,  0.0, 1.0, 0.0, 0.0, 0.0],
+        'bottom': [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+        'right':  [0.0,  1.0, 0.0, 0.0, 0.0, 0.0],
+        'left':   [0.0, -1.0, 0.0, 0.0, 0.0, 0.0]
+    }
+    
+    obs_tokens = []
+    for a in actions:
+        if a in action_map:
+            obs_tokens.append(action_map[a])
+        else:
+            raise ValueError(f"Unknown action: {a}")
+            
+    # [M, 6] -> [1, M, 6] -> [batch, M, 6]
+    obs_tensor = torch.tensor(obs_tokens, dtype=torch.float32, device=device)
+    return obs_tensor.unsqueeze(0).repeat(batch_size, 1, 1)
 
 
 if __name__ == "__main__":
@@ -283,15 +249,8 @@ if __name__ == "__main__":
 
         # Create observations for conditional model
         if args.conditional:
-            obs_params = get_obs_params_for_action(config, args.action)
-            obs = sample_random_twist(
-                batch_size=start_poses.shape[0],
-                mu=obs_params['mu'],
-                sigma=obs_params['sigma'],
-                device=device
-            )
-            obs = obs.unsqueeze(1)  # Add sequence dimension
-            print(f"Using action '{args.action}' with observation mu: {obs_params['mu']}")
+            obs = build_obs_from_actions(args.actions, start_poses.shape[0], device)
+            print(f"Using actions '{args.actions}' with {obs.shape[1]} tokens.")
         else:
             obs = None
 
@@ -314,23 +273,25 @@ if __name__ == "__main__":
     # Get distribution params from config
     start_dist_params = OmegaConf.to_container(config.training.start_dist_params, resolve=True)
 
-    # Get goal distribution based on action (for conditional) or first mode (for non-conditional)
+    # Read all goal distribution modes from config
+    goal_dist = OmegaConf.to_container(config.training.goal_dist_params, resolve=True)
+    goal_dist_params = {'mu': goal_dist['mu'][0], 'sigma': goal_dist['sigma'][0]}
+
     if args.conditional:
-        goal_dist_params = get_goal_params_for_action(config, args.action)
-        obs_dist_params = get_obs_params_for_action(config, args.action)
-        print(f"Using action '{args.action}':")
-        print(f"  Goal mu: {goal_dist_params['mu']}")
-        print(f"  Obs mu: {obs_dist_params['mu']}")
+        obs = build_obs_from_actions(args.actions, args.num_samples, device)
+        goal_all_means = get_goal_modes_for_actions(args.actions, goal_dist)
+        print(f"Using actions '{args.actions}', matched {len(goal_all_means)} goal mode(s):")
     else:
-        # For non-conditional, use first goal mode
-        goal_dist = OmegaConf.to_container(config.training.goal_dist_params, resolve=True)
-        goal_dist_params = {'mu': goal_dist['mu'][0], 'sigma': goal_dist['sigma'][0]}
         obs_dist_params = None
-        print(f"Goal mu: {goal_dist_params['mu']}")
+        goal_all_means = goal_dist['mu']
+        print(f"Goal distribution ({len(goal_all_means)} modes):")
+
+    for i, mu in enumerate(goal_all_means):
+        print(f"  Mode {i}: {mu}")
 
     # Generate trajectories
     start_poses, trajectory = generate_from_distribution(
-        model, start_dist_params, args.num_samples, obs_params=obs_dist_params, num_steps=50,
+        model, start_dist_params, args.num_samples, obs=obs, num_steps=50,
         return_trajectory=True, device=device
     )
 
@@ -344,7 +305,7 @@ if __name__ == "__main__":
 
     # Visualize trajectories
     print("\nGenerating trajectory visualization...")
-    visualize_trajectory(trajectory, mean_goal_pose=goal_dist_params['mu'])
+    visualize_trajectory(trajectory, mean_goal_poses=goal_all_means)
 
     # Example 3: Batch inference
     print("\n" + "=" * 60)
@@ -353,8 +314,9 @@ if __name__ == "__main__":
 
     batch_size = 100
 
+    obs_batch = build_obs_from_actions(args.actions, batch_size, device) if args.conditional else None
     start_poses, goal_poses = generate_from_distribution(
-        model, start_dist_params, batch_size=batch_size, obs_params=obs_dist_params,
+        model, start_dist_params, batch_size=batch_size, obs=obs_batch,
         num_steps=args.num_steps, return_trajectory=False, device=device
     )
 
