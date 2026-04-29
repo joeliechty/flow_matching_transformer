@@ -1,4 +1,4 @@
-# pycache stuff
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -7,6 +7,12 @@ __pycache__/
 *.egg-info/
 *.egg
 *.eggs
+dist/
+build/
+.eggs/
+
+# pip editable install
+*.dist-info/
 
 # model checkpoints
 checkpoints/
@@ -17,5 +23,19 @@ checkpoints/
 *.jpeg
 *.gif
 
+# logs
 setup_log.txt
+*.log
+
+# environments
+.env
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
 

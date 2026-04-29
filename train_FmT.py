@@ -258,7 +258,7 @@ def parse_args():
     parser.add_argument('--conditional', '-C', action='store_true', help='Whether to train conditional model (with observations)')
     parser.add_argument('--n_steps', type=int, default=10, help='Number of interpolation steps per trajectory')
     parser.add_argument('--save_path', type=str, default='checkpoints/', help='Path to save model checkpoints')
-    parser.add_argument('--no_ot', action='store_true', help='Disable optimal transport pairing during training')
+    parser.add_argument('--no_ot', '-NOOT', action='store_true', help='Disable optimal transport pairing during training')
     args = parser.parse_args()
     return args
 
@@ -308,7 +308,7 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
     else:
         batch_size = args.batch_size
 
-    ot_suffix = '' if args.no_ot else '_OT'
+    ot_suffix = '_NOOT' if args.no_ot else '_OT'
     if args.conditional:
         save_path = os.path.join(args.save_path, f'cond_flow_matching_model{ot_suffix}')
         obs_dim = 6  # action representation (vx, vy, vz, wx, wy, wz)
@@ -387,7 +387,7 @@ if __name__ == "__main__":
 
     args = parse_args()
 
-    _ot_suffix = '' if args.no_ot else '_OT'
+    _ot_suffix = '_NOOT' if args.no_ot else '_OT'
     _model_name = 'cond_flow_matching_model' if args.conditional else 'flow_matching_model'
     _log_root = os.path.join(args.save_path, f'{_model_name}{_ot_suffix}')
     _tee = _Tee(_log_root + '_log.txt')

@@ -25,4 +25,5 @@ fi
 conda activate FmT
 
 pip install -r requirements.txt
+pip install -e .
 

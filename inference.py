@@ -142,7 +142,7 @@ def parse_args():
     parser.add_argument('--num_samples', '-N', type=int, default=10, help="Number of samples to generate")
     parser.add_argument('--num_steps', '-STEPS', type=int, default=100, help="Number of ODE integration steps")
     parser.add_argument('--return_trajectory', '-RT', action='store_true', help="Whether to return full trajectory")
-    parser.add_argument('--no_ot', action='store_true', help="Load a model trained without optimal transport pairing")
+    parser.add_argument('--no_ot', '-NOOT', action='store_true', help="Load a model trained without optimal transport pairing")
     return parser.parse_args()
 
 def get_config_and_checkpoint_paths(args):
@@ -154,7 +154,7 @@ def get_config_and_checkpoint_paths(args):
         checkpoint_path: path to model checkpoint
     """
     base_path = args.checkpoint_path if args.checkpoint_path else "checkpoints/"
-    ot_suffix = '' if args.no_ot else '_OT'
+    ot_suffix = '_NOOT' if args.no_ot else '_OT'
     model_name = 'cond_flow_matching_model' if args.conditional else 'flow_matching_model'
 
     config_path = f"{base_path}{model_name}{ot_suffix}_training_config.yaml"
