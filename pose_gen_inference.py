@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel
 from models.flow_matching_transformer import FlowMatchingTransformerModel
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, _quat_to_rot_mat
@@ -155,7 +154,7 @@ def get_config_and_checkpoint_paths(args):
     """
     base_path = args.checkpoint_path if args.checkpoint_path else "checkpoints/"
     ot_suffix = '_NOOT' if args.no_ot else '_OT'
-    model_name = 'cond_flow_matching_model' if args.conditional else 'flow_matching_model'
+    model_name = 'cond_pose_flow_matching_model' if args.conditional else 'pose_flow_matching_model'
 
     config_path = f"{base_path}{model_name}{ot_suffix}_training_config.yaml"
     checkpoint_path = f"{base_path}{model_name}{ot_suffix}_epoch_{args.checkpoint_epoch}.pt"

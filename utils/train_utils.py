@@ -4,7 +4,20 @@ from utils.tf_utils import sample_random_twist, convert_twist_to_pose, compute_t
 from scipy.optimize import linear_sum_assignment
 import numpy as np
 import torch
+from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel
 
+def sequence_ot_pairing(start_poses_seq, goal_poses_seq):
+    # start_poses_seq shape: [batch_size, chunk_size, 6]
+    chunk_size = start_poses_seq.shape[1]
+    paired_start = torch.zeros_like(start_poses_seq)
+    
+    for i in range(chunk_size):
+        # Independently pair Frame i's noise to Frame i's target across the batch
+        paired_start[:, i, :] = geodesic_optimal_transport_pairing(
+            start_poses_seq[:, i, :], 
+            goal_poses_seq[:, i, :]
+        )
+    return paired_start
 
 def geodesic_optimal_transport_pairing(start_poses, goal_poses):
     """
@@ -103,3 +116,231 @@ def generate_interpolated_poses(start_poses, goal_poses, n_steps=10):
     twist_start_to_goal = twist_start_to_goal.unsqueeze(1).repeat(1, n_steps, 1)  # [batch_size, n_steps, 6]
 
     return interpolated_poses, t, twist_start_to_goal
+
+def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params, goal_dist_params, action_dist_params, seq_len=1, use_ot=True, device='cpu'):
+    """
+    Train for one minibatch.
+    
+    Args:
+        model: FlowMatchingTransformerModel instance
+        optimizer: torch optimizer
+        batch_size: number of samples in minibatch
+        n_steps: number of interpolation steps per trajectory
+        start_dist_params: dict with 'mu' and 'sigma' for start pose distribution
+        goal_dist_params: dict with 'mu' and 'sigma' for goal pose distribution
+        device: device to run on
+        
+    Returns:
+        loss: scalar loss value
+    """
+    model.train()
+
+    if batch_size % len(goal_dist_params['mu']) != 0:
+        raise ValueError("Batch size must be divisible by the number of goal distribution modes.")
+
+    if action_dist_params is not None:
+        if batch_size % len(action_dist_params['mu']) != 0:
+            raise ValueError("Batch size must be divisible by the number of action distribution modes.")
+        if len(goal_dist_params['mu']) != len(action_dist_params['mu']):
+            raise ValueError("Number of goal and action distribution modes must match for conditional models.")
+    
+    # Sample start poses: seq_len independent draws → [batch_size, seq_len, 6]
+    start_poses = torch.stack([
+        sample_random_twist(
+            batch_size=batch_size,
+            mu=start_dist_params['mu'],
+            sigma=start_dist_params['sigma'],
+            device=device
+        )
+        for _ in range(seq_len)
+    ], dim=1)
+
+    # Sample goal poses: seq_len independent draws per mode → [batch_size, seq_len, 6]
+    goal_seqs = []
+    for _ in range(seq_len):
+        mode_samples = []
+        for i in range(len(goal_dist_params['mu'])):
+            mode_samples.append(sample_random_twist(
+                batch_size=batch_size // len(goal_dist_params['mu']),
+                mu=goal_dist_params['mu'][i],
+                sigma=goal_dist_params['sigma'][i],
+                device=device
+            ))
+        goal_seqs.append(torch.cat(mode_samples, dim=0))
+    goal_poses = torch.stack(goal_seqs, dim=1)  # [batch_size, seq_len, 6]
+
+    # Sample actions from action distributions (only for conditional models)
+    if action_dist_params is not None:
+        obs_list = []
+        num_modes = len(action_dist_params['mu'])
+        bs_per_mode = batch_size // num_modes
+
+        for i in range(num_modes):
+            # mu_tensor shape: [M, 6]
+            mu_tensor = torch.tensor(action_dist_params['mu'][i], dtype=torch.float32, device=device)
+            sigma_tensor = torch.tensor(action_dist_params['sigma'][i], dtype=torch.float32, device=device)
+
+            # Sample noise for [bs_per_mode, M, 6]
+            eps = torch.randn(bs_per_mode, mu_tensor.shape[0], mu_tensor.shape[1], device=device)
+            obs_i = mu_tensor.unsqueeze(0) + eps * sigma_tensor.unsqueeze(0)
+            obs_list.append(obs_i)
+        
+        obs = torch.cat(obs_list, dim=0) # [batch_size, M, 6]
+
+    else:
+        obs = None
+
+    # Get sequence length (S). Assume start/goal are [batch_size, S, 6]
+    B, S, _ = start_poses.shape
+
+    # optimal transport pairing
+    if use_ot:
+        start_poses = sequence_ot_pairing(start_poses, goal_poses)  # [batch_size, 6]
+
+    flat_start = start_poses.reshape(B * S, 6)
+    flat_goal = goal_poses.reshape(B * S, 6)
+
+    # Compute interpolated poses, time steps, and target vector fields (twists)
+    interp_flat, t_flat, twist_flat = generate_interpolated_poses(
+        flat_start, flat_goal, n_steps=n_steps
+    )
+    # interp_flat shape: [B * S, n_steps, 7]
+    # twist_flat shape: [B * S, n_steps, 6]
+
+    # Reshape and permute to [Batch * n_steps, SeqLen, Dim]
+    x_t = interp_flat.view(B, S, n_steps, 7).transpose(1, 2)       # [B, n_steps, S, 7]
+    v_target = twist_flat.view(B, S, n_steps, 6).transpose(1, 2)   # [B, n_steps, S, 6]
+    t = t_flat.view(B, S, n_steps).transpose(1, 2)                 # [B, n_steps, S]
+
+    # Flatten the Flow Time (n_steps) into the Batch dimension
+    x_t = x_t.reshape(B * n_steps, S, 7)         # The Transformer input
+    v_target = v_target.reshape(B * n_steps, S, 6) # The Twist targets
+
+    # Time 't' is identical across the sequence (S), so we just take index 0
+    t_input = t[:, :, 0].reshape(B * n_steps)    # [B * n_steps]
+
+    # For conditional models, repeat observations and flatten, add sequence dimension
+    if obs is not None:
+        # Expand [batch_size, M, 6] to [batch_size * n_steps, M, 6]
+        obs = obs.repeat_interleave(n_steps, dim=0)
+
+        # Independent conditioning mask
+        B_steps, M, _ = obs.shape
+
+        # Independent dropout (10% chance to drop each specific observation token)
+        indep_mask = torch.rand(B_steps, M, device=device) < 0.1  # [B_steps, M]
+
+        # Unconditional dropout (10% chance to drop ALL observation tokens in a batch)
+        uncond_mask = torch.rand(B_steps, device=device) < 0.1
+
+        # combine: Token is masked if individually dropped OR batch is fully dropped
+        cond_mask = indep_mask | uncond_mask.unsqueeze(-1)  # [B_steps, M]
+    else:
+        cond_mask = None
+
+    # Compute loss (conditional vs non-conditional)
+    if isinstance(model, ConditionalFlowMatchingTransformerModel):
+        loss = model.cfm_loss(x_t, t_input, v_target, obs, cond_mask=cond_mask, reduction='mean')
+    else:
+        loss = model.cfm_loss(x_t, t_input, v_target, reduction='mean')
+    
+    # Backpropagate and optimize
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    return loss.item()
+
+def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_dist_params, goal_dist_params, action_dist_params, seq_len=1, use_ot=True, device='cpu'):
+    """
+    Train for one epoch.
+    
+    Args:
+        model: FlowMatchingTransformerModel instance
+        optimizer: torch optimizer
+        num_batches: number of minibatches per epoch
+        batch_size: number of samples in minibatch
+        n_steps: number of interpolation steps per trajectory
+        start_dist_params: dict with 'mu' and 'sigma' for start pose distribution
+        goal_dist_params: dict with 'mu' and 'sigma' for goal pose distribution
+        action_dist_params: dict with 'mu' and 'sigma' for action distribution
+        device: device to run on
+        
+    Returns:
+        avg_loss: average loss over the epoch
+    """
+    total_loss = 0.0
+    
+    for batch_idx in range(num_batches):
+        loss = train_one_minibatch(
+            model, optimizer, batch_size, n_steps,
+            start_dist_params, goal_dist_params, action_dist_params, seq_len=seq_len, use_ot=use_ot, device=device
+        )
+        total_loss += loss
+        
+        if (batch_idx + 1) % 10 == 0:
+            print(f"  Batch {batch_idx + 1}/{num_batches}, Loss: {loss:.6f}")
+    
+    avg_loss = total_loss / num_batches
+    return avg_loss
+
+def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_steps,
+          start_dist_params, goal_dist_params, action_dist_params, seq_len=1, use_ot=True, device='cpu', save_path=None):
+    """
+    Full training loop.
+    
+    Args:
+        model: FlowMatchingTransformerModel instance
+        optimizer: torch optimizer
+        num_epochs: number of epochs to train
+        num_batches_per_epoch: number of minibatches per epoch
+        batch_size: number of samples in minibatch
+        n_steps: number of interpolation steps per trajectory
+        start_dist_params: dict with 'mu' and 'sigma' for start pose distribution
+        goal_dist_params: dict with 'mu' and 'sigma' for goal pose distribution
+        action_dist_params: dict with 'mu' and 'sigma' for action distribution
+        device: device to run on
+        save_path: path to save model checkpoints (optional)
+        
+    Returns:
+        loss_history: list of average losses per epoch
+    """
+    loss_history = []
+    
+    print(f"Starting training for {num_epochs} epochs...")
+    print(f"Batches per epoch: {num_batches_per_epoch}")
+    print(f"Batch size: {batch_size}")
+    print(f"Interpolation steps: {n_steps}")
+    print(f"Device: {device}")
+    print()
+    
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        
+        avg_loss = train_one_epoch(
+            model, optimizer, num_batches_per_epoch, batch_size, n_steps,
+            start_dist_params, goal_dist_params, action_dist_params, seq_len=seq_len, use_ot=use_ot, device=device
+        )
+        
+        loss_history.append(avg_loss)
+        print(f"Epoch {epoch + 1} completed. Average Loss: {avg_loss:.6f}\n")
+        
+        # Save checkpoint
+        if save_path and (epoch + 1) % 10 == 0:
+            # Create directory if it doesn't exist
+            checkpoint_dir = os.path.dirname(save_path)
+            if checkpoint_dir and not os.path.exists(checkpoint_dir):
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                print(f"Created checkpoint directory: {checkpoint_dir}")
+            
+            checkpoint_path = f"{save_path}_epoch_{epoch + 1}.pt"
+            model.save_checkpoint(
+                filepath=checkpoint_path,
+                optimizer=optimizer,
+                epoch=epoch + 1,
+                loss=avg_loss
+            )
+            print(f"Checkpoint saved to {checkpoint_path}\n")
+    
+    print("Training completed!")
+    return loss_history

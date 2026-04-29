@@ -107,6 +107,10 @@ def visualize_trajectory(trajectory, save_path=None, mean_goal_poses=None):
                 mean_pose_tensor = convert_twist_to_pose(mean_twist_tensor, dt=1.0, return_representation='quat')
                 mean_pose_np = mean_pose_tensor.cpu().numpy()
 
+            # collapse any leading batch/seq dim so indexing below is always on a 1-D array
+            if mean_pose_np.ndim == 2:
+                mean_pose_np = mean_pose_np.mean(axis=0)
+
             mean_pos = mean_pose_np[:3]
             mean_quat = mean_pose_np[3:7]
 

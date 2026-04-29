@@ -1,3 +1,4 @@
+
 # SE(3) Manifold Flow Matching Transformer
 
 This repository serves as a practical tutorial and reference implementation for Continuous-Time Generative Modeling on the SE(3) Manifold. It demonstrates how to train a Flow Matching model using a Transformer backbone to generate 3D poses (position and orientation) by learning and integrating spatial velocities (twists).
@@ -14,21 +15,26 @@ Standard flow matching learns a vector field that transports a simple base distr
 * Network Output: The network predicts Twists (v in R^6), representing linear and angular velocities.
 * Integration: ODE integration uses the twist exponential map (`add_twist_to_pose` in `utils/tf_utils.py`) to ensure the generated samples stay strictly on the SE(3) manifold.
 
-### 2. Geodesic Optimal Transport (OT)
-To make learning efficient, flow matching pairs noise samples with target data samples. Rather than pairing them randomly, this implementation uses Geodesic Optimal Transport (`geodesic_optimal_transport_pairing` in `utils/train_utils.py`). It computes the exact pairwise geodesic distances (the magnitude of the twist required to move between poses) and solves the linear sum assignment problem (Hungarian algorithm) to find the shortest paths on the manifold.
+### 2. Tokenized Flow Matching (Action Chunks)
+To support continuous trajectories or multi-joint systems, this repository natively supports Tokenized Flow Matching (inspired by architectures like pi0). Instead of flattening temporal or spatial dimensions, the model processes inputs as sequences `[batch_size, seq_len, dim]`. 
+* Joint Denoising: The joint distribution and kinematic constraints of the action chunk are learned implicitly via the Transformer's self-attention mechanism.
+* Independent Integration: ODE integration is applied to each token/slot independently using standard SE(3) algebra.
 
-### 3. Transformer Backbone and AdaLN
+### 3. Geodesic Optimal Transport (OT)
+To make learning efficient, flow matching pairs noise samples with target data samples. Rather than pairing them randomly, this implementation uses Geodesic Optimal Transport (`geodesic_optimal_transport_pairing` in `utils/train_utils.py`). It computes the exact pairwise geodesic distances (the magnitude of the twist required to move between poses) and solves the linear sum assignment problem (Hungarian algorithm) to find the shortest paths on the manifold. For sequence data, OT is applied independently per slot across the batch.
+
+### 4. Transformer Backbone and AdaLN
 The core architecture (`models/flow_matching_transformer.py`) relies on a sequence-to-sequence Transformer.
 * Timestep Conditioning: The continuous time variable t in [0, 1] is embedded using sinusoidal positional encodings and injected into every layer via Adaptive Layer Normalization (AdaLN). This modulates the scale and shift of the features based on the current integration phase.
 
-### 4. Cross-Attention for Multimodal Conditioning
+### 5. Cross-Attention for Multimodal Conditioning
 The `ConditionalFlowMatchingTransformerModel` extends the architecture to support goal-directed generation. Discrete actions or observations (e.g., "top", "left") are embedded and passed as context to a Cross-Attention mechanism, allowing the vector field to split into multimodal trajectories based on the specified condition.
 
 ## Installation
 
 The repository uses Conda to manage dependencies and isolate the environment.
 
-For Linux (CUDA):
+For Linux/Windows (CUDA):
 ```bash
 git clone <your-repo-url>
 cd flow_matching_transformer
@@ -88,11 +94,13 @@ When you run inference with the `--return_trajectory` flag, the script will auto
 
 * `models/`: Neural network architectures.
   * `support_models.py`: Core components (Multi-Head Attention, Cross-Attention, AdaLN, FeedForward).
-  * `flow_matching_transformer.py`: The unconditional base model.
-  * `conditional_flow_matching_transformer.py`: The action-conditioned model.
+  * `flow_matching_transformer.py`: The unconditional base model natively supporting temporal sequences.
+  * `conditional_flow_matching_transformer.py`: The action-conditioned sequence model.
 * `utils/`: Mathematical and operational utilities.
-  * `tf_utils.py`: High-performance, batched SE(3) operations. Handles conversions between quaternions, rotation matrices, Ortho6D, and computing/applying twists via exponential maps.
-  * `train_utils.py`: Data generation, geodesic interpolation, and Optimal Transport logic.
+  * `tf_utils.py`: High-performance, batched SE(3) operations. Handles conversions between quaternions, rotation matrices, Ortho6D, and computing or applying twists via exponential maps.
+  * `train_utils.py`: Data generation, geodesic interpolation, and slot-wise Optimal Transport logic.
   * `visualization_utils.py`: 3D plotting utilities for visualizing SE(3) pose trajectories over time.
-* `train_FmT.py`: The main training loop, loss computation, and checkpointing logic.
-* `inference.py`: ODE solver (Euler integration) for sampling from the trained vector field.
+  * `logging_utils.py`: Utilities for routing output streams, formatting console logs, and tracking metrics.
+* `pose_gen_trainer.py`: The main training loop, minibatch sequence formatting, loss computation, and checkpointing logic.
+* `pose_gen_inference.py`: ODE solver (Euler integration) for sampling from the trained vector field and generating action chunks.
+* `pyproject.toml`: Project metadata and build configuration, allowing the repository to be installed as a standard Python package.
