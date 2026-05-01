@@ -357,3 +357,8 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
                 # Remove seq_len dimension: [batch, 7]
                 x = x.squeeze(1)
             return x
+        
+
+
+
+        

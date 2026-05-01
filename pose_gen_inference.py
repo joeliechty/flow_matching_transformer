@@ -175,7 +175,9 @@ def get_goal_modes_for_actions(actions, goal_dist):
         'right':  lambda mu: mu[1] > 0,
         'left':   lambda mu: mu[1] < 0,
     }
-    return [mu for mu in goal_dist['mu']
+    # goal_dist['mu'] entries may be doubly-nested ([[x,y,z,...]]) from YAML parsing
+    mus = [m[0] if isinstance(m[0], list) else m for m in goal_dist['mu']]
+    return [mu for mu in mus
             if all(conditions[a](mu) for a in actions if a in conditions)]
 
 def build_obs_from_actions(actions, batch_size, device):
