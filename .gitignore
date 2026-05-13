@@ -38,4 +38,4 @@ env/
 
 # OS
 .DS_Store
-
+data/

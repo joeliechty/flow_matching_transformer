@@ -52,43 +52,106 @@ This will create and activate a conda environment named `FmT` with Python 3.12, 
 
 ## Usage
 
-### 1. Training the Model
+The repository ships two reference applications that exercise the same flow matching core:
 
-The `train_FmT.py` script contains a built-in toy dataset representing start poses at the origin and multimodal goal poses (rotated corners).
+* **Pose generation** (`pose_gen_trainer.py` / `pose_gen_inference.py`) — a built-in toy dataset of start poses at the origin and multimodal goal poses (rotated corners) on the SE(3) manifold.
+* **Image generation** (`image_gen_trainer.py` / `image_gen_inference.py`) — MNIST tokenized as a 7×7 grid of 4×4 patches (`seq_len=49`, `patch_dim=16`), demonstrating Euclidean flow matching with the same tokenized transformer backbone.
 
-Train an Unconditional Model (with Optimal Transport):
+### 1. Training a Pose Model
+
+`pose_gen_trainer.py` trains on the built-in multimodal goal distribution.
+
+Train an Unconditional Pose Model (with Optimal Transport and CFG):
 ```bash
-python train_FmT.py --num_epochs 50 --batch_size 128
+python pose_gen_trainer.py --num_epochs 50 --batch_size 128
 ```
 
-Train a Conditional Model (Action-Directed):
-This trains the model to associate specific target modes with specific conditioning tokens.
+Train a Conditional Pose Model (Action-Directed):
+This trains the model to associate specific target modes with specific conditioning tokens (e.g., `top`/`bottom`/`left`/`right`).
 ```bash
-python train_FmT.py --conditional --num_epochs 50
+python pose_gen_trainer.py --conditional --num_epochs 50
 ```
 
 Useful Flags:
-* `--no_ot`: Disables Optimal Transport pairing (useful for seeing how OT improves flow straightness).
+* `--conditional` / `-C`: Trains the conditional model variant with action-token cross-attention; omit for the unconditional model.
+* `--no_ot` / `-NOOT`: Disables Optimal Transport pairing (useful for seeing how OT improves flow straightness).
+* `--no_cfg` / `-NOCFG`: Disables classifier-free guidance (no unconditional dropout during training).
 * `--n_steps`: Number of interpolation steps per trajectory during training.
+* `--seq_len` / `-S`: Sequence length per trajectory (action chunk size).
 * `--save_path`: Directory to save `.pt` checkpoints and `.yaml` config files.
 
-### 2. Running Inference and Visualization
+Checkpoints and configs are saved under `--save_path` with a suffix encoding the training mode, e.g.
+`checkpoints/cond_pose_flow_matching_model_OT_CFG_epoch_10.pt` and the matching `_training_config.yaml`.
 
-The `inference.py` script loads a trained checkpoint, integrates the learned ODE vector field, and visualizes the resulting SE(3) trajectories using Matplotlib.
+### 2. Running Pose Inference and Visualization
+
+`pose_gen_inference.py` loads a trained checkpoint, integrates the learned ODE vector field, and visualizes the resulting SE(3) trajectories using Matplotlib.
 
 Unconditional Inference:
 ```bash
-python inference.py --checkpoint_epoch 50 --num_samples 10 --return_trajectory
+python pose_gen_inference.py --checkpoint_epoch 50 --num_samples 10 --return_trajectory
 ```
 
 Conditional Inference (Guiding the Flow):
 If you trained a conditional model, you can force the flow toward specific modes by combining action tokens.
 ```bash
 # Force the flow to the top-right mode
-python inference.py --conditional --actions top right --num_samples 5 --return_trajectory
+python pose_gen_inference.py --conditional --actions top right --num_samples 5 --return_trajectory
 ```
 
-When you run inference with the `--return_trajectory` flag, the script will automatically generate a 3D plot showing the positional paths and coordinate frame axes (RGB = XYZ) evolving over time.
+Additional Inference Flags:
+* `--conditional` / `-C`: Loads the conditional model variant; must match the trained checkpoint.
+* `--actions` / `-A`: One or more action tokens (`top`, `bottom`, `left`, `right`) to condition on. Omit on a conditional model to use the null token (unconditional path).
+* `--cfg_scale` / `-CFG`: Classifier-free guidance scale (default `3.0`; `1.0` disables CFG).
+* `--no_cfg` / `-NOCFG`: Forces `cfg_scale=1.0` (matches a model trained with `--no_cfg`).
+* `--no_ot` / `-NOOT`: Loads a checkpoint that was trained without OT pairing.
+* `--checkpoint_path` / `-CP`: Directory containing the checkpoint and config (defaults to `checkpoints/`).
+
+The inference script automatically generates a 3D plot showing positional paths and coordinate frame axes (RGB = XYZ) evolving over time.
+
+### 3. Training an Image (MNIST) Model
+
+`image_gen_trainer.py` trains a flow matching transformer on MNIST patches. The 28×28 images are split into 49 patches of dimension 16; flow matching runs in Euclidean space over those patch tokens.
+
+Train an Unconditional MNIST Model:
+```bash
+python image_gen_trainer.py --num_epochs 10 --batch_size 128
+```
+
+Train a Class-Conditional MNIST Model (digit labels 0–9):
+```bash
+python image_gen_trainer.py --conditional --num_epochs 10
+```
+
+Useful Flags:
+* `--conditional` / `-C`: Trains a class-conditional model on digit labels 0–9; omit for the unconditional model.
+* `--no_ot` / `-NOOT`, `--no_cfg` / `-NOCFG`, `--n_steps`, `--save_path`: Same semantics as the pose trainer.
+* `--num_batches_per_epoch` / `-BE`: Minibatches drawn per epoch.
+* `--data_root`: MNIST download/cache location (default `./data`).
+* `--num_workers`: DataLoader worker count.
+
+### 4. Running Image Inference and Visualization
+
+`image_gen_inference.py` integrates the learned vector field from Gaussian noise back to image patches, then decodes patches into 28×28 images.
+
+Unconditional Sampling:
+```bash
+python image_gen_inference.py --checkpoint_epoch 10 --num_samples 8 --return_trajectory
+```
+
+Class-Conditional Sampling (pick a digit 0–9):
+```bash
+python image_gen_inference.py --conditional --digit 7 --num_samples 8 --return_trajectory
+```
+
+Useful Inference Flags:
+* `--conditional` / `-C`: Loads the class-conditional model variant; must match the trained checkpoint.
+* `--digit` / `-D`: Digit class (0–9) for conditional sampling. Omit on a conditional model to fall back to the null token (unconditional path).
+* `--cfg_scale` / `-CFG`, `--no_cfg` / `-NOCFG`, `--no_ot` / `-NOOT`: Behave the same as in pose inference.
+* `--num_steps` / `-STEPS`: ODE integration steps (default 100).
+* `--save_path`: Optional path to save the trajectory tile figure (noise → denoised image grid).
+
+With `--return_trajectory`, the script tiles intermediate timesteps so you can see the noise denoise into MNIST digits.
 
 ## Code Structure
 
@@ -101,6 +164,8 @@ When you run inference with the `--return_trajectory` flag, the script will auto
   * `train_utils.py`: Data generation, geodesic interpolation, and slot-wise Optimal Transport logic.
   * `visualization_utils.py`: 3D plotting utilities for visualizing SE(3) pose trajectories over time.
   * `logging_utils.py`: Utilities for routing output streams, formatting console logs, and tracking metrics.
-* `pose_gen_trainer.py`: The main training loop, minibatch sequence formatting, loss computation, and checkpointing logic.
-* `pose_gen_inference.py`: ODE solver (Euler integration) for sampling from the trained vector field and generating action chunks.
+* `pose_gen_trainer.py`: SE(3) pose-generation training loop with the built-in multimodal goal distribution, minibatch sequence formatting, loss computation, and checkpointing.
+* `pose_gen_inference.py`: ODE solver (Euler integration) for sampling SE(3) pose action chunks from the trained vector field, plus 3D trajectory visualization.
+* `image_gen_trainer.py`: MNIST training entrypoint. Tokenizes images into 7×7 patch grids and reuses the shared training loop for Euclidean flow matching.
+* `image_gen_inference.py`: MNIST sampling entrypoint. Integrates patch-space noise back to images and tiles the noise → denoised trajectory.
 * `pyproject.toml`: Project metadata and build configuration, allowing the repository to be installed as a standard Python package.
