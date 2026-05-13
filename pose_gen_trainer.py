@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument('--save_path', type=str, default='checkpoints/', help='Path to save model checkpoints')
     parser.add_argument('--seq_len', '-S', type=int, default=1, help='Sequence length per trajectory')
     parser.add_argument('--no_ot', '-NOOT', action='store_true', help='Disable optimal transport pairing during training')
+    parser.add_argument('--no_cfg', '-NOCFG', action='store_true', help='Disable classifier-free guidance (no unconditional dropout during training)')
     args = parser.parse_args()
     return args
 
@@ -68,17 +69,19 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         batch_size = args.batch_size
 
     ot_suffix = '_NOOT' if args.no_ot else '_OT'
+    cfg_suffix = '_NOCFG' if args.no_cfg else '_CFG'
     if args.conditional:
-        save_path = os.path.join(args.save_path, f'cond_pose_flow_matching_model{ot_suffix}')
+        save_path = os.path.join(args.save_path, f'cond_pose_flow_matching_model{ot_suffix}{cfg_suffix}')
         obs_dim = 6  # action representation (vx, vy, vz, wx, wy, wz)
     else:
-        save_path = os.path.join(args.save_path, f'pose_flow_matching_model{ot_suffix}')
+        save_path = os.path.join(args.save_path, f'pose_flow_matching_model{ot_suffix}{cfg_suffix}')
         obs_dim = None
 
     # make a config object
     training_config = {
         'conditional': args.conditional,
         'use_ot': not args.no_ot,
+        'use_cfg': not args.no_cfg,
         'num_epochs': args.num_epochs,
         'num_batches_per_epoch': args.num_batches_per_epoch,
         'batch_size': batch_size,
@@ -148,8 +151,9 @@ if __name__ == "__main__":
     args = parse_args()
 
     _ot_suffix = '_NOOT' if args.no_ot else '_OT'
+    _cfg_suffix = '_NOCFG' if args.no_cfg else '_CFG'
     _model_name = 'cond_pose_flow_matching_model' if args.conditional else 'pose_flow_matching_model'
-    _log_root = os.path.join(args.save_path, f'{_model_name}{_ot_suffix}')
+    _log_root = os.path.join(args.save_path, f'{_model_name}{_ot_suffix}{_cfg_suffix}')
     _tee = _Tee(_log_root + '_log.txt')
 
     # Set device (cuda > mps > cpu)
@@ -217,6 +221,7 @@ if __name__ == "__main__":
         action_dist_params=config.training.action_dist_params,
         seq_len=config.training.seq_len,
         use_ot=config.training.use_ot,
+        use_cfg=config.training.use_cfg,
         device=device,
         save_path=config.training.save_path
     )

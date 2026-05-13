@@ -41,7 +41,7 @@ def load_model(checkpoint_path, device='cpu', model_config=None, conditional=Fal
 
     return model, checkpoint
 
-def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, return_trajectory=False, device='cpu'):
+def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, return_trajectory=False, cfg_scale=3.0, device='cpu'):
     """
     Generate goal poses from start poses using the trained model.
 
@@ -81,7 +81,7 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
         # Generate goal poses
         try:
             if is_conditional:
-                result = model.inference(x0, obs, num_steps=num_steps, return_trajectory=return_trajectory)
+                result = model.inference(x0, obs, num_steps=num_steps, return_trajectory=return_trajectory, cfg_scale=cfg_scale)
             else:
                 result = model.inference(x0, num_steps=num_steps, return_trajectory=return_trajectory)
         except Exception as e:
@@ -91,7 +91,7 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
     return result
 
 def generate_from_distribution(model, distribution_params, batch_size, obs=None, num_steps=100,
-                               return_trajectory=False, device='cpu'):
+                               return_trajectory=False, cfg_scale=3.0, device='cpu'):
     """
     Sample start poses from a distribution and generate goal poses.
 
@@ -123,7 +123,7 @@ def generate_from_distribution(model, distribution_params, batch_size, obs=None,
     # Generate goal poses
     result = generate_from_start_poses(
         model, start_poses, obs, num_steps=num_steps,
-        return_trajectory=return_trajectory, device=device
+        return_trajectory=return_trajectory, cfg_scale=cfg_scale, device=device
     )
 
     if return_trajectory:
@@ -142,6 +142,8 @@ def parse_args():
     parser.add_argument('--num_steps', '-STEPS', type=int, default=100, help="Number of ODE integration steps")
     parser.add_argument('--return_trajectory', '-RT', action='store_true', help="Whether to return full trajectory")
     parser.add_argument('--no_ot', '-NOOT', action='store_true', help="Load a model trained without optimal transport pairing")
+    parser.add_argument('--cfg_scale', '-CFG', type=float, default=3.0, help="Classifier-free guidance scale (1.0 disables CFG, >1.0 amplifies conditioning)")
+    parser.add_argument('--no_cfg', '-NOCFG', action='store_true', help="Disable classifier-free guidance at inference (equivalent to --cfg_scale 1.0)")
     return parser.parse_args()
 
 def get_config_and_checkpoint_paths(args):
@@ -154,10 +156,11 @@ def get_config_and_checkpoint_paths(args):
     """
     base_path = args.checkpoint_path if args.checkpoint_path else "checkpoints/"
     ot_suffix = '_NOOT' if args.no_ot else '_OT'
+    cfg_suffix = '_NOCFG' if args.no_cfg else '_CFG'
     model_name = 'cond_pose_flow_matching_model' if args.conditional else 'pose_flow_matching_model'
 
-    config_path = f"{base_path}{model_name}{ot_suffix}_training_config.yaml"
-    checkpoint_path = f"{base_path}{model_name}{ot_suffix}_epoch_{args.checkpoint_epoch}.pt"
+    config_path = f"{base_path}{model_name}{ot_suffix}{cfg_suffix}_training_config.yaml"
+    checkpoint_path = f"{base_path}{model_name}{ot_suffix}{cfg_suffix}_epoch_{args.checkpoint_epoch}.pt"
 
     return config_path, checkpoint_path
 
@@ -208,6 +211,10 @@ if __name__ == "__main__":
 
     args = parse_args()
 
+    # Resolve effective CFG scale (--no_cfg forces 1.0, otherwise honor --cfg_scale)
+    cfg_scale = 1.0 if args.no_cfg else args.cfg_scale
+    print(f"Using CFG scale: {cfg_scale}")
+
     # Get paths based on conditional flag
     config_path, checkpoint_path = get_config_and_checkpoint_paths(args)
 
@@ -255,7 +262,8 @@ if __name__ == "__main__":
 
         # Generate goal poses
         goal_poses = generate_from_start_poses(
-            model, start_poses, obs, num_steps=args.num_steps, return_trajectory=False, device=device
+            model, start_poses, obs, num_steps=args.num_steps, return_trajectory=False,
+            cfg_scale=cfg_scale, device=device
         )
         print_poses(goal_poses, "Generated Goal Poses")
 
@@ -295,7 +303,7 @@ if __name__ == "__main__":
     # Generate trajectories
     start_poses, trajectory = generate_from_distribution(
         model, start_dist_params, args.num_samples, obs=obs, num_steps=50,
-        return_trajectory=True, device=device
+        return_trajectory=True, cfg_scale=cfg_scale, device=device
     )
 
     print_poses(start_poses, "Sampled Start Poses")
@@ -320,7 +328,7 @@ if __name__ == "__main__":
     obs_batch = build_obs_from_actions(args.actions, batch_size, device) if (args.conditional and args.actions) else None
     start_poses, goal_poses = generate_from_distribution(
         model, start_dist_params, batch_size=batch_size, obs=obs_batch,
-        num_steps=args.num_steps, return_trajectory=False, device=device
+        num_steps=args.num_steps, return_trajectory=False, cfg_scale=cfg_scale, device=device
     )
 
     print_poses(start_poses, f"Batch of {batch_size} Start Poses")

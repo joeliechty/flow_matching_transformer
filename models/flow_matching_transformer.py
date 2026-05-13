@@ -3,7 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from utils.tf_utils import add_twist_to_pose
+from utils.euclid_utils import add_velocity_to_state
 from models.support_models import AdaptiveLayerNorm, SinusoidalPosEmb, TransformerBlock
+
+
+def _step_state(x, v, dt, manifold):
+    if manifold == 'se3':
+        return add_twist_to_pose(x, v, dt)
+    elif manifold == 'euclidean':
+        return add_velocity_to_state(x, v, dt)
+    else:
+        raise ValueError(f"Unknown manifold: {manifold!r}. Expected 'se3' or 'euclidean'.")
 
 # class GaussianFourierProjection(nn.Module):
 #     """
@@ -182,31 +192,32 @@ class FlowMatchingTransformerModel(nn.Module):
         return loss
     
     @torch.no_grad()
-    def sample(self, x0, num_steps=100, method='euler'):
+    def sample(self, x0, num_steps=100, method='euler', manifold='se3'):
         """
         Generate samples using ODE integration.
-        
+
         Args:
             x0: initial noise samples [batch, seq_len, input_dim]
             num_steps: number of integration steps
             method: integration method ('euler' or 'midpoint')
-            
+            manifold: 'se3' (default) or 'euclidean' — controls the integrator.
+
         Returns:
             x1: generated samples [batch, seq_len, input_dim]
         """
         device = x0.device
         B = x0.shape[0]
-        
+
         x = x0.clone()
         dt = torch.tensor(1.0 / num_steps, device=device)
-        
+
         for step in range(num_steps):
             t = torch.full((B,), step * dt.item(), device=device)
-            
+
             # Euler method
             v = self.forward(x, t)
-            x = add_twist_to_pose(x, v, dt)
-        
+            x = _step_state(x, v, dt, manifold)
+
         return x
     
     def save_checkpoint(self, filepath, optimizer=None, epoch=None, loss=None, **extra_info):
@@ -288,47 +299,49 @@ class FlowMatchingTransformerModel(nn.Module):
         return model, checkpoint
     
     @torch.no_grad()
-    def inference(self, start_poses, num_steps=100, return_trajectory=False):
+    def inference(self, start_poses, num_steps=100, return_trajectory=False, manifold='se3'):
         """
         Generate goal poses from start poses using the trained flow model.
-        
+
         Args:
-            start_poses: starting poses as tensors [batch, 7] in quaternion format
-                        (x, y, z, qw, qx, qy, qz) or [batch, seq_len, 7]
+            start_poses: starting states. For manifold='se3': poses in quaternion
+                format [batch, 7] or [batch, seq_len, 7]. For manifold='euclidean':
+                noise samples [batch, input_dim] or [batch, seq_len, input_dim].
             num_steps: number of ODE integration steps
-            return_trajectory: if True, return full trajectory; if False, only final poses
-            
+            return_trajectory: if True, return full trajectory; if False, only final state
+            manifold: 'se3' (default) or 'euclidean'.
+
         Returns:
             If return_trajectory=False:
-                goal_poses: final poses [batch, 7] or [batch, seq_len, 7]
+                final state [batch, D] or [batch, seq_len, D]
             If return_trajectory=True:
-                trajectory: all intermediate poses [batch, num_steps+1, 7] or [batch, num_steps+1, seq_len, 7]
+                trajectory: all intermediate states [batch, num_steps+1, D] or
+                [batch, num_steps+1, seq_len, D]
         """
         self.eval()
-        
+
         # Handle input shape
         if start_poses.dim() == 2:
-            # [batch, 7] -> [batch, 1, 7]
+            # [batch, D] -> [batch, 1, D]
             x = start_poses.unsqueeze(1)
             squeeze_output = True
         else:
-            # [batch, seq_len, 7]
             x = start_poses
             squeeze_output = False
-        
+
         device = x.device
         B = x.shape[0]
         dt = torch.tensor(1.0 / num_steps, device=device)
-        
+
         if return_trajectory:
             trajectory = [x.clone()]
-        
+
         # Integrate ODE from t=0 to t=1
         for step in range(num_steps):
             t = torch.full((B,), step * dt.item(), device=device)
             v = self.forward(x, t)
-            x = add_twist_to_pose(x, v, dt)
-            
+            x = _step_state(x, v, dt, manifold)
+
             if return_trajectory:
                 trajectory.append(x.clone())
         

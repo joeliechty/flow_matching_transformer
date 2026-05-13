@@ -2,7 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.tf_utils import add_twist_to_pose
+from utils.euclid_utils import add_velocity_to_state
 from models.support_models import AdaptiveLayerNorm, SinusoidalPosEmb, TransformerBlock
+
+
+def _step_state(x, v, dt, manifold):
+    if manifold == 'se3':
+        return add_twist_to_pose(x, v, dt)
+    elif manifold == 'euclidean':
+        return add_velocity_to_state(x, v, dt)
+    else:
+        raise ValueError(f"Unknown manifold: {manifold!r}. Expected 'se3' or 'euclidean'.")
 
 
 class ConditionalFlowMatchingTransformerModel(nn.Module):
@@ -180,31 +190,32 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         return loss
     
     @torch.no_grad()
-    def sample(self, x0, obs, num_steps=100, method='euler'):
+    def sample(self, x0, obs, num_steps=100, method='euler', manifold='se3'):
         """
         Generate samples using ODE integration.
-        
+
         Args:
             x0: initial noise samples [batch, seq_len, input_dim]
             num_steps: number of integration steps
             method: integration method ('euler' or 'midpoint')
-            
+            manifold: 'se3' (default) or 'euclidean'.
+
         Returns:
             x1: generated samples [batch, seq_len, input_dim]
         """
         device = x0.device
         B = x0.shape[0]
-        
+
         x = x0.clone()
         dt = torch.tensor(1.0 / num_steps, device=device)
-        
+
         for step in range(num_steps):
             t = torch.full((B,), step * dt.item(), device=device)
-            
+
             # Euler method
             v = self.forward(x, obs, t)
-            x = add_twist_to_pose(x, v, dt)
-        
+            x = _step_state(x, v, dt, manifold)
+
         return x
     
     def save_checkpoint(self, filepath, optimizer=None, epoch=None, loss=None, **extra_info):
@@ -287,23 +298,26 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         return model, checkpoint
     
     @torch.no_grad()
-    def inference(self, start_poses, obs=None, num_steps=100, return_trajectory=False, cfg_scale=3.0):
+    def inference(self, start_poses, obs=None, num_steps=100, return_trajectory=False, cfg_scale=3.0, manifold='se3'):
         """
-        Generate goal poses from start poses using the trained flow model.
+        Generate goal states from start states using the trained flow model.
 
         Args:
-            start_poses: starting poses as tensors [batch, 7] in quaternion format
-                        (x, y, z, qw, qx, qy, qz) or [batch, seq_len, 7]
+            start_poses: starting states. For manifold='se3': poses [batch, 7] or
+                [batch, seq_len, 7]. For manifold='euclidean': noise samples
+                [batch, input_dim] or [batch, seq_len, input_dim].
             obs: observation tensor [batch, M, obs_dim]; if None, all tokens replaced with null
             num_steps: number of ODE integration steps
-            return_trajectory: if True, return full trajectory; if False, only final poses
+            return_trajectory: if True, return full trajectory; if False, only final state
             cfg_scale: classifier-free guidance scale (if >1.0, amplifies the predicted vector field for more aggressive generation)
+            manifold: 'se3' (default) or 'euclidean'.
 
         Returns:
             If return_trajectory=False:
-                goal_poses: final poses [batch, 7] or [batch, seq_len, 7]
+                final state [batch, D] or [batch, seq_len, D]
             If return_trajectory=True:
-                trajectory: all intermediate poses [batch, num_steps+1, 7] or [batch, num_steps+1, seq_len, 7]
+                trajectory: all intermediate states [batch, num_steps+1, D] or
+                [batch, num_steps+1, seq_len, D]
         """
         self.eval()
 
@@ -341,7 +355,7 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
             else:
                 v = self.forward(x, obs, t, cond_mask=cond_mask)  # [batch, seq_len, 7]
             
-            x = add_twist_to_pose(x, v, dt)  # Integrate ODE step
+            x = _step_state(x, v, dt, manifold)  # Integrate ODE step
 
             if return_trajectory: trajectory.append(x.clone())
         

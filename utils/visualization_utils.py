@@ -169,3 +169,70 @@ def print_poses(poses, name="Poses"):
         if poses.shape[0] > 5:
             print(f"  ... ({poses.shape[0] - 5} more)")
 
+
+def visualize_image_trajectory(trajectory, num_samples=8, num_timesteps=10, save_path=None,
+                               grid_hw=(28, 28), title=None):
+    """
+    Plot a tiled grid showing the denoising trajectory of image samples.
+
+    Rows = different samples; Columns = evenly spaced timesteps from pure noise (left)
+    to the final denoised image (right).
+
+    Args:
+        trajectory: tensor of shape [batch, T, 1, H, W] OR [batch, T, H*W] (any flat-image form).
+        num_samples: number of rows (samples) to display.
+        num_timesteps: number of columns (timesteps) to display, evenly spaced over T.
+        save_path: optional path to save figure.
+        grid_hw: (H, W) used to reshape flat trajectories.
+        title: optional figure suptitle.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not installed. Install with: pip install matplotlib")
+        return
+
+    traj = trajectory.detach().cpu()
+    if traj.dim() == 3:
+        # [B, T, H*W] -> [B, T, H, W]
+        B, T, _ = traj.shape
+        H, W = grid_hw
+        traj = traj.view(B, T, H, W)
+    elif traj.dim() == 5:
+        # [B, T, 1, H, W] -> [B, T, H, W]
+        traj = traj.squeeze(2)
+
+    B, T, H, W = traj.shape
+    num_samples = min(num_samples, B)
+    num_timesteps = min(num_timesteps, T)
+
+    # Pick evenly spaced timesteps, inclusive of first and last
+    if num_timesteps == 1:
+        t_idx = [T - 1]
+    else:
+        t_idx = np.linspace(0, T - 1, num_timesteps).round().astype(int).tolist()
+
+    fig, axes = plt.subplots(
+        num_samples, num_timesteps,
+        figsize=(num_timesteps * 1.1, num_samples * 1.1),
+        squeeze=False,
+    )
+
+    for r in range(num_samples):
+        for c, ti in enumerate(t_idx):
+            ax = axes[r][c]
+            ax.imshow(traj[r, ti].numpy(), cmap='gray', vmin=traj[r].min(), vmax=traj[r].max())
+            ax.set_xticks([]); ax.set_yticks([])
+            if r == 0:
+                ax.set_title(f"t={ti}", fontsize=8)
+
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=120)
+        print(f"Image trajectory saved to {save_path}")
+    else:
+        plt.show()
+    plt.close(fig)
