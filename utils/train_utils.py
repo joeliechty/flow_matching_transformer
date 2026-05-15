@@ -17,7 +17,13 @@ from models.conditional_flow_matching_transformer import ConditionalFlowMatching
 # minibatch driver.
 
 def sequence_ot_pairing(start_seq, goal_seq, manifold='se3'):
-    """Apply OT pairing independently per sequence frame."""
+    """Apply OT pairing independently per sequence frame.
+
+    For SE(3) pose flows this is correct: each frame is its own geodesic problem.
+    For image (Euclidean) flows, prefer `flat_ot_pairing` so spatial coherence of
+    the noise image is preserved across patches (otherwise each patch is paired
+    against a different target image and the field becomes a tangle).
+    """
     chunk_size = start_seq.shape[1]
     paired_start = torch.zeros_like(start_seq)
 
@@ -28,6 +34,20 @@ def sequence_ot_pairing(start_seq, goal_seq, manifold='se3'):
             manifold=manifold,
         )
     return paired_start
+
+
+def flat_ot_pairing(start_seq, goal_seq, manifold='euclidean'):
+    """OT pairing on flattened sequences: [B, S, D] -> single permutation across the whole [B, S*D] vector.
+
+    Used for image flows so all patches of a single noise sample are reordered together.
+    """
+    if manifold != 'euclidean':
+        raise ValueError("flat_ot_pairing currently only supports manifold='euclidean'.")
+    B, S, D = start_seq.shape
+    start_flat = start_seq.reshape(B, S * D)
+    goal_flat = goal_seq.reshape(B, S * D)
+    paired_flat = optimal_transport_pairing(start_flat, goal_flat, manifold='euclidean')
+    return paired_flat.reshape(B, S, D)
 
 
 def optimal_transport_pairing(start, goal, manifold='se3'):
@@ -123,47 +143,85 @@ def generate_interpolated_poses(start_poses, goal_poses, n_steps=10):
 
 
 def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
-                            state_dim, vel_dim, manifold, use_ot, use_cfg, device):
+                            state_dim, vel_dim, manifold, use_ot, use_cfg, device,
+                            time_sampling='grid', ot_mode='per_frame', scheduler=None):
     """
-    Shared core: interpolate -> reshape -> forward+loss -> backprop.
+    Shared core: interpolate -> forward+loss -> backprop.
 
     start/goal: [B, S, D_start] where D_start matches the manifold's natural input
                 (6 for SE(3) twists, vel_dim==state_dim for Euclidean).
     obs:        [B, M, obs_dim] or None.
+
+    time_sampling:
+        'grid'       — legacy: builds n_steps interpolated states per sample,
+                       fans the batch out to [B*n_steps, S, D] for one forward pass
+                       per minibatch. Used by the SE(3) pose trainer.
+        'continuous' — Rectified Flow / I-CFM standard: sample one t ~ U(0,1) per
+                       image and only evaluate the loss there. Euclidean only.
+    ot_mode:
+        'per_frame' — independent OT permutation per sequence index (SE(3) trainer).
+        'flat'      — single permutation across the flattened [B, S*D] sample
+                      so spatial coherence is preserved (image trainer).
     """
     B, S, _ = start.shape
 
     if use_ot:
-        start = sequence_ot_pairing(start, goal, manifold=manifold)
-
-    flat_start = start.reshape(B * S, start.shape[-1])
-    flat_goal = goal.reshape(B * S, goal.shape[-1])
-
-    interp_flat, t_flat, v_flat = generate_interpolated_states(
-        flat_start, flat_goal, n_steps=n_steps, manifold=manifold
-    )
-    # interp_flat: [B*S, n_steps, state_dim]
-    # v_flat:      [B*S, n_steps, vel_dim]
-
-    x_t = interp_flat.view(B, S, n_steps, state_dim).transpose(1, 2)   # [B, n_steps, S, state_dim]
-    v_target = v_flat.view(B, S, n_steps, vel_dim).transpose(1, 2)     # [B, n_steps, S, vel_dim]
-    t = t_flat.view(B, S, n_steps).transpose(1, 2)                     # [B, n_steps, S]
-
-    x_t = x_t.reshape(B * n_steps, S, state_dim)
-    v_target = v_target.reshape(B * n_steps, S, vel_dim)
-    t_input = t[:, :, 0].reshape(B * n_steps)
-
-    if obs is not None:
-        obs = obs.repeat_interleave(n_steps, dim=0)
-        B_steps, M, _ = obs.shape
-        indep_mask = torch.rand(B_steps, M, device=device) < 0.1
-        if use_cfg:
-            uncond_mask = torch.rand(B_steps, device=device) < 0.1
-            cond_mask = indep_mask | uncond_mask.unsqueeze(-1)
+        if ot_mode == 'flat':
+            start = flat_ot_pairing(start, goal, manifold=manifold)
+        elif ot_mode == 'per_frame':
+            start = sequence_ot_pairing(start, goal, manifold=manifold)
         else:
-            cond_mask = indep_mask
+            raise ValueError(f"Unknown ot_mode: {ot_mode!r}")
+
+    if time_sampling == 'continuous':
+        if manifold != 'euclidean':
+            raise ValueError("time_sampling='continuous' currently requires manifold='euclidean'.")
+        t_input = torch.rand(B, device=device, dtype=start.dtype)        # [B]
+        diff = goal - start                                              # [B, S, D]
+        x_t = start + t_input.view(B, 1, 1) * diff                        # [B, S, D]
+        v_target = diff                                                   # [B, S, D]
+
+        if obs is not None:
+            M = obs.shape[1]
+            indep_mask = torch.rand(B, M, device=device) < 0.1
+            if use_cfg:
+                uncond_mask = torch.rand(B, device=device) < 0.1
+                cond_mask = indep_mask | uncond_mask.unsqueeze(-1)
+            else:
+                cond_mask = indep_mask
+        else:
+            cond_mask = None
+    elif time_sampling == 'grid':
+        flat_start = start.reshape(B * S, start.shape[-1])
+        flat_goal = goal.reshape(B * S, goal.shape[-1])
+
+        interp_flat, t_flat, v_flat = generate_interpolated_states(
+            flat_start, flat_goal, n_steps=n_steps, manifold=manifold
+        )
+        # interp_flat: [B*S, n_steps, state_dim]
+        # v_flat:      [B*S, n_steps, vel_dim]
+
+        x_t = interp_flat.view(B, S, n_steps, state_dim).transpose(1, 2)   # [B, n_steps, S, state_dim]
+        v_target = v_flat.view(B, S, n_steps, vel_dim).transpose(1, 2)     # [B, n_steps, S, vel_dim]
+        t = t_flat.view(B, S, n_steps).transpose(1, 2)                     # [B, n_steps, S]
+
+        x_t = x_t.reshape(B * n_steps, S, state_dim)
+        v_target = v_target.reshape(B * n_steps, S, vel_dim)
+        t_input = t[:, :, 0].reshape(B * n_steps)
+
+        if obs is not None:
+            obs = obs.repeat_interleave(n_steps, dim=0)
+            B_steps, M, _ = obs.shape
+            indep_mask = torch.rand(B_steps, M, device=device) < 0.1
+            if use_cfg:
+                uncond_mask = torch.rand(B_steps, device=device) < 0.1
+                cond_mask = indep_mask | uncond_mask.unsqueeze(-1)
+            else:
+                cond_mask = indep_mask
+        else:
+            cond_mask = None
     else:
-        cond_mask = None
+        raise ValueError(f"Unknown time_sampling: {time_sampling!r}")
 
     if isinstance(model, ConditionalFlowMatchingTransformerModel):
         loss = model.cfm_loss(x_t, t_input, v_target, obs, cond_mask=cond_mask, reduction='mean')
@@ -173,12 +231,15 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
 
     return loss.item()
 
 
 def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params, goal_dist_params,
-                        action_dist_params, seq_len=1, use_ot=True, use_cfg=True, device='cpu'):
+                        action_dist_params, seq_len=1, use_ot=True, use_cfg=True, device='cpu',
+                        scheduler=None):
     """Pose-flow minibatch: samples start/goal twists from mode distributions (manifold='se3')."""
     model.train()
 
@@ -238,12 +299,14 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
         n_steps=n_steps,
         state_dim=7, vel_dim=6,
         manifold='se3', use_ot=use_ot, use_cfg=use_cfg, device=device,
+        time_sampling='grid', ot_mode='per_frame', scheduler=scheduler,
     )
 
 
 def train_one_minibatch_image(model, optimizer, dataloader_iter, n_steps,
                               num_classes=10, use_ot=True, use_cfg=True, device='cpu',
-                              patch_encode=None):
+                              patch_encode=None, time_sampling='continuous', ot_mode='flat',
+                              scheduler=None):
     """
     Image-flow minibatch: pulls a batch from `dataloader_iter`, builds Gaussian noise as
     the start, and runs the shared training step on the Euclidean manifold.
@@ -290,6 +353,7 @@ def train_one_minibatch_image(model, optimizer, dataloader_iter, n_steps,
         n_steps=n_steps,
         state_dim=D, vel_dim=D,
         manifold='euclidean', use_ot=use_ot, use_cfg=use_cfg, device=device,
+        time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler,
     )
     return loss, dataloader_iter
 
@@ -297,7 +361,8 @@ def train_one_minibatch_image(model, optimizer, dataloader_iter, n_steps,
 def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_dist_params,
                     goal_dist_params, action_dist_params, seq_len=1, use_ot=True, use_cfg=True,
                     device='cpu', manifold='se3', dataloader=None, num_classes=10,
-                    patch_encode=None):
+                    patch_encode=None, time_sampling='continuous', ot_mode='flat',
+                    scheduler=None):
     total_loss = 0.0
     completed = 0
 
@@ -310,6 +375,7 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
                 model, optimizer, data_iter, n_steps,
                 num_classes=num_classes, use_ot=use_ot, use_cfg=use_cfg,
                 device=device, patch_encode=patch_encode,
+                time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler,
             )
             if loss is None:
                 # Iterator exhausted — restart and retry this batch index
@@ -318,17 +384,22 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
                     model, optimizer, data_iter, n_steps,
                     num_classes=num_classes, use_ot=use_ot, use_cfg=use_cfg,
                     device=device, patch_encode=patch_encode,
+                    time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler,
                 )
             total_loss += loss
             completed += 1
             if (batch_idx + 1) % 10 == 0:
-                print(f"  Batch {batch_idx + 1}/{num_batches}, Loss: {loss:.6f}")
+                lr_str = ''
+                if scheduler is not None:
+                    lr_str = f", LR: {optimizer.param_groups[0]['lr']:.2e}"
+                print(f"  Batch {batch_idx + 1}/{num_batches}, Loss: {loss:.6f}{lr_str}")
     else:
         for batch_idx in range(num_batches):
             loss = train_one_minibatch(
                 model, optimizer, batch_size, n_steps,
                 start_dist_params, goal_dist_params, action_dist_params,
                 seq_len=seq_len, use_ot=use_ot, use_cfg=use_cfg, device=device,
+                scheduler=scheduler,
             )
             total_loss += loss
             completed += 1
@@ -341,7 +412,8 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
 def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_steps,
           start_dist_params=None, goal_dist_params=None, action_dist_params=None,
           seq_len=1, use_ot=True, use_cfg=True, device='cpu', save_path=None,
-          manifold='se3', dataloader=None, num_classes=10, patch_encode=None):
+          manifold='se3', dataloader=None, num_classes=10, patch_encode=None,
+          time_sampling='continuous', ot_mode='flat', scheduler=None):
     """
     Full training loop. SE(3) (default) trains from distribution params; 'euclidean' trains
     from a torch DataLoader yielding (images, labels).
@@ -364,6 +436,7 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
             seq_len=seq_len, use_ot=use_ot, use_cfg=use_cfg, device=device,
             manifold=manifold, dataloader=dataloader, num_classes=num_classes,
             patch_encode=patch_encode,
+            time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler,
         )
 
         loss_history.append(avg_loss)

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from utils.tf_utils import add_twist_to_pose
 from utils.euclid_utils import add_velocity_to_state
-from models.support_models import AdaptiveLayerNorm, SinusoidalPosEmb, TransformerBlock
+from models.support_models import AdaptiveLayerNorm, SinusoidalPosEmb, TransformerBlock, get_2d_sincos_pos_embed
 
 
 def _step_state(x, v, dt, manifold):
@@ -34,7 +34,9 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         mlp_ratio=4.0,
         dropout=0.0,
         phase_dim=256,
-        max_seq_len=1024
+        max_seq_len=1024,
+        pos_emb_type='1d_learned',
+        pos_emb_grid=None,
     ):
         """
         Initialize the Flow Matching Transformer model.
@@ -64,12 +66,24 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         self.phase_dim = phase_dim
         self.max_seq_len = max_seq_len
         self.obs_dim = obs_dim
-        
+        self.pos_emb_type = pos_emb_type
+        self.pos_emb_grid = tuple(pos_emb_grid) if pos_emb_grid is not None else None
+
         # Input projection
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        
+
         # Positional embeddings
-        self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, hidden_dim))
+        if pos_emb_type == '1d_learned':
+            self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, hidden_dim))
+        elif pos_emb_type == '2d_sincos':
+            if self.pos_emb_grid is None:
+                raise ValueError("pos_emb_grid=(H, W) is required when pos_emb_type='2d_sincos'")
+            gh, gw = self.pos_emb_grid
+            if gh * gw != max_seq_len:
+                raise ValueError(f"pos_emb_grid {gh}x{gw} must match max_seq_len={max_seq_len}")
+            self.register_buffer('pos_emb', get_2d_sincos_pos_embed(hidden_dim, gh, gw))
+        else:
+            raise ValueError(f"Unknown pos_emb_type: {pos_emb_type!r}")
         
         # Phase embedding (converts scalar phase to embedding)
         self.phase_emb = nn.Sequential(
@@ -118,8 +132,9 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
                     nn.init.zeros_(module.bias)
         
         self.apply(_basic_init)
-        nn.init.normal_(self.pos_emb, std=0.02)
-        
+        if self.pos_emb_type == '1d_learned':
+            nn.init.normal_(self.pos_emb, std=0.02)
+
         # Zero-initialize output projection for better training stability
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
@@ -241,7 +256,9 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
                 'dropout': self.dropout,
                 'phase_dim': self.phase_dim,
                 'max_seq_len': self.max_seq_len,
-                'obs_dim': self.obs_dim
+                'obs_dim': self.obs_dim,
+                'pos_emb_type': self.pos_emb_type,
+                'pos_emb_grid': list(self.pos_emb_grid) if self.pos_emb_grid is not None else None,
             }
         }
         

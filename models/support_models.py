@@ -147,11 +147,11 @@ class TransformerBlock(nn.Module):
 
 class SinusoidalPosEmb(nn.Module):
     """Sinusoidal positional embeddings for phase/time."""
-    
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        
+
     def forward(self, t):
         """
         Args:
@@ -164,3 +164,32 @@ class SinusoidalPosEmb(nn.Module):
         emb = t[:, None] * emb[None, :]
         emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
         return emb
+
+
+def _sincos_1d(embed_dim, positions):
+    """1D sin/cos embedding from a 1D float tensor of positions -> [N, embed_dim]."""
+    assert embed_dim % 2 == 0
+    half = embed_dim // 2
+    omega = torch.arange(half, dtype=torch.float32) / float(half)
+    omega = 1.0 / (10000.0 ** omega)                       # [half]
+    out = positions.float().reshape(-1, 1) * omega.reshape(1, -1)  # [N, half]
+    return torch.cat([torch.sin(out), torch.cos(out)], dim=1)      # [N, embed_dim]
+
+
+def get_2d_sincos_pos_embed(embed_dim, grid_h, grid_w):
+    """Fixed 2D sin/cos positional embedding -> [1, grid_h*grid_w, embed_dim].
+
+    Half of the channels encode the row index, the other half the column index.
+    Row-major ordering matches the patch_encode flatten in image_gen_trainer.
+    """
+    assert embed_dim % 4 == 0, "embed_dim must be divisible by 4 for 2D sincos"
+    rows = torch.arange(grid_h, dtype=torch.float32)
+    cols = torch.arange(grid_w, dtype=torch.float32)
+    # row-major: outer = row, inner = col
+    row_idx = rows.repeat_interleave(grid_w)   # [H*W]
+    col_idx = cols.repeat(grid_h)              # [H*W]
+
+    emb_h = _sincos_1d(embed_dim // 2, row_idx)   # [H*W, embed_dim/2]
+    emb_w = _sincos_1d(embed_dim // 2, col_idx)   # [H*W, embed_dim/2]
+    emb = torch.cat([emb_h, emb_w], dim=1)        # [H*W, embed_dim]
+    return emb.unsqueeze(0)                        # [1, H*W, embed_dim]
