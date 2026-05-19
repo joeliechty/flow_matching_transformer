@@ -13,22 +13,47 @@ This repository is designed to teach several advanced concepts in generative mod
 Standard flow matching learns a vector field that transports a simple base distribution (e.g., a standard Gaussian) to a complex data distribution. In this repository, our "data" consists of 3D poses.
 * State Representation: The network state is tracked as poses (represented using quaternions or Ortho6D).
 * Network Output: The network predicts Twists (v in R^6), representing linear and angular velocities.
-* Integration: ODE integration uses the twist exponential map (`add_twist_to_pose` in `utils/tf_utils.py`) to ensure the generated samples stay strictly on the SE(3) manifold.
+* Integration: ODE integration uses the twist exponential map (`add_twist_to_pose` in [utils/tf_utils.py](utils/tf_utils.py)) to ensure the generated samples stay strictly on the SE(3) manifold.
 
-### 2. Tokenized Flow Matching (Action Chunks)
+### 2. SE(3) Lie Algebra: Ortho6D and the Twist Exponential Map
+The SE(3) flow relies on two interlocking representation choices that decouple network output from manifold state.
+* Network output uses **Ortho6D** (the first two columns of the rotation matrix, re-orthogonalized via Gram-Schmidt). It avoids the antipodal ambiguity of quaternions and is differentiable everywhere, which makes it a more stable regression target than raw quaternions. Conversions live in [utils/tf_utils.py](utils/tf_utils.py) (`_ortho6d_to_quat`, `_quat_to_ortho6d`).
+* Manifold state stays as **quaternions + position** (7D). Integration uses the axis-angle exponential map: the angular velocity ω is converted to a quaternion via `[cos(½‖ω‖dt), (ω/‖ω‖) sin(½‖ω‖dt)]` and composed with the current orientation, while linear velocity integrates additively (`add_twist_to_pose` in [utils/tf_utils.py](utils/tf_utils.py)).
+
+### 3. Tokenized Flow Matching (Action Chunks)
 To support continuous trajectories or multi-joint systems, this repository natively supports Tokenized Flow Matching (inspired by architectures like pi0). Instead of flattening temporal or spatial dimensions, the model processes inputs as sequences `[batch_size, seq_len, dim]`. 
 * Joint Denoising: The joint distribution and kinematic constraints of the action chunk are learned implicitly via the Transformer's self-attention mechanism.
 * Independent Integration: ODE integration is applied to each token/slot independently using standard SE(3) algebra.
 
-### 3. Geodesic Optimal Transport (OT)
-To make learning efficient, flow matching pairs noise samples with target data samples. Rather than pairing them randomly, this implementation uses Geodesic Optimal Transport (`geodesic_optimal_transport_pairing` in `utils/train_utils.py`). It computes the exact pairwise geodesic distances (the magnitude of the twist required to move between poses) and solves the linear sum assignment problem (Hungarian algorithm) to find the shortest paths on the manifold. For sequence data, OT is applied independently per slot across the batch.
+### 4. Geodesic Optimal Transport (OT)
+To make learning efficient, flow matching pairs noise samples with target data samples. Rather than pairing them randomly, this implementation uses Geodesic Optimal Transport (`geodesic_optimal_transport_pairing` in [utils/train_utils.py](utils/train_utils.py)). It computes the exact pairwise geodesic distances (the magnitude of the twist required to move between poses) and solves the linear sum assignment problem (Hungarian algorithm) to find the shortest paths on the manifold. For sequence data, OT is applied independently per slot across the batch.
 
-### 4. Transformer Backbone and AdaLN
-The core architecture (`models/flow_matching_transformer.py`) relies on a sequence-to-sequence Transformer.
+### 5. OT Pairing Modes: Per-Frame vs Flat
+Geodesic OT can be applied at different granularities depending on whether the sequence dimension carries spatial structure.
+* **Per-frame** (`sequence_ot_pairing` in [utils/train_utils.py](utils/train_utils.py)) computes an independent Hungarian assignment for each slot in the action chunk. Used by the SE(3) pose trainer, where each slot is a separate pose with no spatial neighbor relationship.
+* **Flat** (`flat_ot_pairing` in [utils/train_utils.py](utils/train_utils.py)) flattens `[B, S*D]` and computes a single permutation across the whole image. Used by the MNIST trainer, because independent per-patch OT would scramble spatial coherence and break the image structure of the noise samples.
+
+### 6. Time Sampling: Grid vs Continuous (Rectified Flow)
+Flow matching has freedom in how the time variable `t ∈ [0, 1]` is sampled during training; both regimes are implemented in `_run_flow_matching_step` ([utils/train_utils.py](utils/train_utils.py)).
+* **Grid sampling** pre-computes `n_steps` interpolated states per sample and fans the batch out to `[B*n_steps, S, D]` for one minibatch. This is the SE(3) trainer's default — it amortizes the cost of geodesic interpolation across many `t` values per pose pair.
+* **Continuous sampling** (Rectified Flow / I-CFM standard) samples a single `t ~ U(0, 1)` per example and evaluates the loss only there. This is the image trainer's default — it scales better to large batches and avoids overcommitting compute to redundant `t` values when the manifold is Euclidean.
+
+### 7. Transformer Backbone and AdaLN
+The core architecture ([models/flow_matching_transformer.py](models/flow_matching_transformer.py)) relies on a sequence-to-sequence Transformer.
 * Timestep Conditioning: The continuous time variable t in [0, 1] is embedded using sinusoidal positional encodings and injected into every layer via Adaptive Layer Normalization (AdaLN). This modulates the scale and shift of the features based on the current integration phase.
 
-### 5. Cross-Attention for Multimodal Conditioning
+### 8. 2D Sin-Cos Positional Embeddings and Learned Null Tokens
+Two small architectural details are worth calling out because they materially affect conditional image generation.
+* **2D sin-cos positional embeddings** (`get_2d_sincos_pos_embed` in [models/support_models.py](models/support_models.py)) give each of the 49 MNIST patches a position encoding that splits row and column into separate sinusoidal halves. This DiT-style spatial inductive bias outperforms a single learned 1D embedding when the token grid has a known 2D layout.
+* **Learned null token** ([models/conditional_flow_matching_transformer.py:121](models/conditional_flow_matching_transformer.py#L121)) is a trainable `[1, 1, hidden_dim]` parameter that replaces observation embeddings on the unconditional path (training dropout and CFG inference). Unlike zero-masking, the network learns an explicit representation of "no condition," which is what makes the double-pass CFG extrapolation in section 10 numerically well-behaved.
+
+### 9. Cross-Attention for Multimodal Conditioning
 The `ConditionalFlowMatchingTransformerModel` extends the architecture to support goal-directed generation. Discrete actions or observations (e.g., "top", "left") are embedded and passed as context to a Cross-Attention mechanism, allowing the vector field to split into multimodal trajectories based on the specified condition.
+
+### 10. Classifier-Free Guidance (CFG)
+Classifier-free guidance lets a single conditional model trade off sample diversity for stronger adherence to its conditioning at inference time, without training a separate classifier.
+* Training: With probability ~10% (see `_run_flow_matching_step` in [utils/train_utils.py](utils/train_utils.py)), conditioning tokens are replaced with a learned null embedding. The model therefore learns both the conditional vector field v(x, t | c) and the unconditional vector field v(x, t | ∅) simultaneously.
+* Inference: At each ODE step, two forward passes are run — one with the real condition, one with the null condition — and the result is extrapolated as `v = v_uncond + cfg_scale * (v_cond - v_uncond)` (see `inference` in [models/conditional_flow_matching_transformer.py](models/conditional_flow_matching_transformer.py)). `cfg_scale = 1.0` recovers the standard conditional flow; higher values push the trajectory more aggressively toward the conditioned mode at the cost of diversity.
 
 ## Installation
 
