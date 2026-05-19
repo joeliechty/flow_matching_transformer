@@ -1,4 +1,5 @@
 import torch
+import math
 import os
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
@@ -13,9 +14,25 @@ from utils.logging_utils import _Tee
 # MNIST tokenization: 28x28 -> 7x7 grid of 4x4 patches -> seq_len=49, patch_dim=16
 PATCH_SIZE = 4
 IMG_HW = 28
-SEQ_LEN = (IMG_HW // PATCH_SIZE) ** 2  # 49
+GRID_HW = IMG_HW // PATCH_SIZE          # 7
+SEQ_LEN = GRID_HW * GRID_HW             # 49
 PATCH_DIM = PATCH_SIZE * PATCH_SIZE     # 16
 NUM_CLASSES = 10
+
+
+def build_warmup_cosine_scheduler(optimizer, total_steps, warmup_ratio=0.05, min_lr_ratio=0.1):
+    """Linear warmup over warmup_ratio of total_steps, then cosine decay to min_lr_ratio * base_lr."""
+    warmup_steps = max(1, int(total_steps * warmup_ratio))
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step + 1) / float(warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(1.0, progress)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def patch_encode(images):
@@ -95,6 +112,9 @@ def build_config(args):
         'dropout': 0.1,
         'phase_dim': 128,
         'max_seq_len': SEQ_LEN,
+        # SOTA DiT-style spatial embedding: 2D sin/cos over a (7,7) patch grid.
+        'pos_emb_type': '2d_sincos',
+        'pos_emb_grid': [GRID_HW, GRID_HW],
     }
     config = OmegaConf.create({'training': training_config, 'model': model_config})
 
@@ -149,6 +169,8 @@ if __name__ == "__main__":
             dropout=config.model.dropout,
             phase_dim=config.model.phase_dim,
             max_seq_len=config.model.max_seq_len,
+            pos_emb_type=config.model.pos_emb_type,
+            pos_emb_grid=list(config.model.pos_emb_grid),
         ).to(device)
     else:
         model = FlowMatchingTransformerModel(
@@ -161,6 +183,8 @@ if __name__ == "__main__":
             dropout=config.model.dropout,
             phase_dim=config.model.phase_dim,
             max_seq_len=config.model.max_seq_len,
+            pos_emb_type=config.model.pos_emb_type,
+            pos_emb_grid=list(config.model.pos_emb_grid),
         ).to(device)
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
@@ -170,6 +194,11 @@ if __name__ == "__main__":
         lr=config.training.lr,
         weight_decay=config.training.weight_decay,
     )
+
+    total_steps = config.training.num_epochs * config.training.num_batches_per_epoch
+    scheduler = build_warmup_cosine_scheduler(optimizer, total_steps=total_steps,
+                                              warmup_ratio=0.05, min_lr_ratio=0.1)
+    print(f"LR schedule: linear warmup 5% then cosine decay over {total_steps} steps.\n")
 
     loss_history = train(
         model=model,
@@ -186,6 +215,9 @@ if __name__ == "__main__":
         dataloader=dataloader,
         num_classes=NUM_CLASSES,
         patch_encode=patch_encode,
+        time_sampling='continuous',
+        ot_mode='flat',
+        scheduler=scheduler,
     )
 
     print("\nLoss history:")
