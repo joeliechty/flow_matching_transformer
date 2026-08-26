@@ -1,56 +1,56 @@
 
-# SE(3) Manifold Flow Matching Transformer
+# On-Manifold Flow-Matching Transformers for Generative Modeling
 
-This repository serves as a practical tutorial and reference implementation for Continuous-Time Generative Modeling on the SE(3) Manifold. It demonstrates how to train a Flow Matching model using a Transformer backbone to generate 3D poses (position and orientation) by learning and integrating spatial velocities (twists).
+This repository serves as a practical tutorial and reference implementation for Continuous-Time Generative Modeling on the different manifolds. It demonstrates how to train a Flow Matching model using a Transformer backbone to generate samples from different goal distributions (3D poses on the SE(3) manifold, images on the Euclidean manifold, etc.).
 
-Unlike standard diffusion or flow matching models that operate in flat Euclidean space, this codebase is built from the ground up to respect the geometry of 3D rotations, making it ideal for advanced robotics applications like behavior cloning, state estimation, and motion planning.
+Standard diffusion or flow matching models operate in flat Euclidean space for tasks like image generation. For robotics, flow matching can be done in either a latent Eucldean space or on the SE(3) manifold. This repo explains how to do the latter. It covers how to implement the transformer architecture in a flow matching model as well as some tips and tricks that researchers have discovered make these models perform better including optimal transport, classifier free guidance, and using adaptive layer norms.
 
 ## Core Concepts and Tutorial Overview
 
 This repository is designed to teach several advanced concepts in generative modeling and manifold mathematics.
 
-### 1. Flow Matching on SE(3)
+### 1. Flow Matching on SE(3) [1,4]
 Standard flow matching learns a vector field that transports a simple base distribution (e.g., a standard Gaussian) to a complex data distribution. In this repository, our "data" consists of 3D poses.
 * State Representation: The network state is tracked as poses (represented using quaternions or Ortho6D).
 * Network Output: The network predicts Twists (v in R^6), representing linear and angular velocities.
 * Integration: ODE integration uses the twist exponential map (`add_twist_to_pose` in [utils/tf_utils.py](utils/tf_utils.py)) to ensure the generated samples stay strictly on the SE(3) manifold.
 
-### 2. SE(3) Lie Algebra: Ortho6D and the Twist Exponential Map
+### 2. SE(3) Lie Algebra: Ortho6D and the Twist Exponential Map [8]
 The SE(3) flow relies on two interlocking representation choices that decouple network output from manifold state.
 * Network output uses **Ortho6D** (the first two columns of the rotation matrix, re-orthogonalized via Gram-Schmidt). It avoids the antipodal ambiguity of quaternions and is differentiable everywhere, which makes it a more stable regression target than raw quaternions. Conversions live in [utils/tf_utils.py](utils/tf_utils.py) (`_ortho6d_to_quat`, `_quat_to_ortho6d`).
 * Manifold state stays as **quaternions + position** (7D). Integration uses the axis-angle exponential map: the angular velocity ω is converted to a quaternion via `[cos(½‖ω‖dt), (ω/‖ω‖) sin(½‖ω‖dt)]` and composed with the current orientation, while linear velocity integrates additively (`add_twist_to_pose` in [utils/tf_utils.py](utils/tf_utils.py)).
 
-### 3. Tokenized Flow Matching (Action Chunks)
+### 3. Tokenized Flow Matching (Action Chunks) [7]
 To support continuous trajectories or multi-joint systems, this repository natively supports Tokenized Flow Matching (inspired by architectures like pi0). Instead of flattening temporal or spatial dimensions, the model processes inputs as sequences `[batch_size, seq_len, dim]`. 
 * Joint Denoising: The joint distribution and kinematic constraints of the action chunk are learned implicitly via the Transformer's self-attention mechanism.
 * Independent Integration: ODE integration is applied to each token/slot independently using standard SE(3) algebra.
 
-### 4. Geodesic Optimal Transport (OT)
+### 4. Geodesic Optimal Transport (OT) [6]
 To make learning efficient, flow matching pairs noise samples with target data samples. Rather than pairing them randomly, this implementation uses Geodesic Optimal Transport (`geodesic_optimal_transport_pairing` in [utils/train_utils.py](utils/train_utils.py)). It computes the exact pairwise geodesic distances (the magnitude of the twist required to move between poses) and solves the linear sum assignment problem (Hungarian algorithm) to find the shortest paths on the manifold. For sequence data, OT is applied independently per slot across the batch.
 
-### 5. OT Pairing Modes: Per-Frame vs Flat
+### 5. OT Pairing Modes: Per-Frame vs Flat [6]
 Geodesic OT can be applied at different granularities depending on whether the sequence dimension carries spatial structure.
 * **Per-frame** (`sequence_ot_pairing` in [utils/train_utils.py](utils/train_utils.py)) computes an independent Hungarian assignment for each slot in the action chunk. Used by the SE(3) pose trainer, where each slot is a separate pose with no spatial neighbor relationship.
 * **Flat** (`flat_ot_pairing` in [utils/train_utils.py](utils/train_utils.py)) flattens `[B, S*D]` and computes a single permutation across the whole image. Used by the MNIST trainer, because independent per-patch OT would scramble spatial coherence and break the image structure of the noise samples.
 
-### 6. Time Sampling: Grid vs Continuous (Rectified Flow)
+### 6. Time Sampling: Grid vs Continuous (Rectified Flow) [4]
 Flow matching has freedom in how the time variable `t ∈ [0, 1]` is sampled during training; both regimes are implemented in `_run_flow_matching_step` ([utils/train_utils.py](utils/train_utils.py)).
 * **Grid sampling** pre-computes `n_steps` interpolated states per sample and fans the batch out to `[B*n_steps, S, D]` for one minibatch. This is the SE(3) trainer's default — it amortizes the cost of geodesic interpolation across many `t` values per pose pair.
 * **Continuous sampling** (Rectified Flow / I-CFM standard) samples a single `t ~ U(0, 1)` per example and evaluates the loss only there. This is the image trainer's default — it scales better to large batches and avoids overcommitting compute to redundant `t` values when the manifold is Euclidean.
 
-### 7. Transformer Backbone and AdaLN
+### 7. Transformer Backbone and AdaLN [5]
 The core architecture ([models/flow_matching_transformer.py](models/flow_matching_transformer.py)) relies on a sequence-to-sequence Transformer.
 * Timestep Conditioning: The continuous time variable t in [0, 1] is embedded using sinusoidal positional encodings and injected into every layer via Adaptive Layer Normalization (AdaLN). This modulates the scale and shift of the features based on the current integration phase.
 
-### 8. 2D Sin-Cos Positional Embeddings and Learned Null Tokens
+### 8. 2D Sin-Cos Positional Embeddings and Learned Null Tokens [2]
 Two small architectural details are worth calling out because they materially affect conditional image generation.
 * **2D sin-cos positional embeddings** (`get_2d_sincos_pos_embed` in [models/support_models.py](models/support_models.py)) give each of the 49 MNIST patches a position encoding that splits row and column into separate sinusoidal halves. This DiT-style spatial inductive bias outperforms a single learned 1D embedding when the token grid has a known 2D layout.
 * **Learned null token** ([models/conditional_flow_matching_transformer.py:121](models/conditional_flow_matching_transformer.py#L121)) is a trainable `[1, 1, hidden_dim]` parameter that replaces observation embeddings on the unconditional path (training dropout and CFG inference). Unlike zero-masking, the network learns an explicit representation of "no condition," which is what makes the double-pass CFG extrapolation in section 10 numerically well-behaved.
 
-### 9. Cross-Attention for Multimodal Conditioning
+### 9. Cross-Attention for Multimodal Conditioning [9]
 The `ConditionalFlowMatchingTransformerModel` extends the architecture to support goal-directed generation. Discrete actions or observations (e.g., "top", "left") are embedded and passed as context to a Cross-Attention mechanism, allowing the vector field to split into multimodal trajectories based on the specified condition.
 
-### 10. Classifier-Free Guidance (CFG)
+### 10. Classifier-Free Guidance (CFG) [3]
 Classifier-free guidance lets a single conditional model trade off sample diversity for stronger adherence to its conditioning at inference time, without training a separate classifier.
 * Training: With probability ~10% (see `_run_flow_matching_step` in [utils/train_utils.py](utils/train_utils.py)), conditioning tokens are replaced with a learned null embedding. The model therefore learns both the conditional vector field v(x, t | c) and the unconditional vector field v(x, t | ∅) simultaneously.
 * Inference: At each ODE step, two forward passes are run — one with the real condition, one with the null condition — and the result is extrapolated as `v = v_uncond + cfg_scale * (v_cond - v_uncond)` (see `inference` in [models/conditional_flow_matching_transformer.py](models/conditional_flow_matching_transformer.py)). `cfg_scale = 1.0` recovers the standard conditional flow; higher values push the trajectory more aggressively toward the conditioned mode at the cost of diversity.
@@ -194,3 +194,23 @@ With `--return_trajectory`, the script tiles intermediate timesteps so you can s
 * `image_gen_trainer.py`: MNIST training entrypoint. Tokenizes images into 7×7 patch grids and reuses the shared training loop for Euclidean flow matching.
 * `image_gen_inference.py`: MNIST sampling entrypoint. Integrates patch-space noise back to images and tiles the noise → denoised trajectory.
 * `pyproject.toml`: Project metadata and build configuration, allowing the repository to be installed as a standard Python package.
+
+
+## References
+[1] Chen, R. T. Q., & Lipman, Y. (2023). Flow Matching on General Geometries. ICLR 2024. https://doi.org/10.48550/arxiv.2302.03660
+
+[2] Dosovitskiy, A., Beyer, L., Kolesnikov, A., Weissenborn, D., Zhai, X., Unterthiner, T., Dehghani, M., Minderer, M., Heigold, G., Gelly, S., Uszkoreit, J., & Houlsby, N. (2020). An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale. arXiv. https://doi.org/10.48550/arxiv.2010.11929
+
+[3] Ho, J., & Salimans, T. (2022). Classifier-Free Diffusion Guidance. arXiv. https://doi.org/10.48550/arxiv.2207.12598
+
+[4] Lipman, Y., Chen, R. T. Q., Ben-Hamu, H., Nickel, M., & Le, M. (2022). Flow Matching for Generative Modeling. arXiv. https://doi.org/10.48550/arxiv.2210.02747
+
+[5] Peebles, W., & Xie, S. (2023). Scalable Diffusion Models with Transformers. 2023 IEEE/CVF International Conference on Computer Vision (ICCV), 4172-4182. https://doi.org/10.1109/iccv51070.2023.00387
+
+[6] Tong, A., Fatras, K., Malkin, N., Huguet, G., Zhang, Y., Rector-Brooks, J., Wolf, G., & Bengio, Y. (2023). Improving and generalizing flow-based generative models with minibatch optimal transport. arXiv. https://doi.org/10.48550/arxiv.2302.00482
+
+[7] Zhao, T., Kumar, V., Levine, S., & Finn, C. (2023). Learning Fine-Grained Bimanual Manipulation with Low-Cost Hardware. Robotics: Science and Systems XIX. https://doi.org/10.15607/rss.2023.xix.016
+
+[8] Zhou, Y., Barnes, C., Lu, J., Yang, J., & Li, H. (2018). On the Continuity of Rotation Representations in Neural Networks. arXiv. https://doi.org/10.48550/arxiv.1812.07035
+
+[9] Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., & Polosukhin, I. (2017). Attention Is All You Need. Advances in Neural Information Processing Systems. https://arxiv.org/abs/1706.03762
