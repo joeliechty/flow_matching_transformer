@@ -1,6 +1,8 @@
 import torch
 import math
 import os
+import random
+import numpy as np
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 
@@ -71,7 +73,16 @@ def parse_args():
     parser.add_argument('--no_ot', '-NOOT', action='store_true')
     parser.add_argument('--no_cfg', '-NOCFG', action='store_true')
     parser.add_argument('--num_workers', type=int, default=2)
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for torch/numpy/random (for reproducible ablations)')
     return parser.parse_args()
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def build_config(args):
@@ -89,6 +100,7 @@ def build_config(args):
         'manifold': 'euclidean',
         'use_ot': not args.no_ot,
         'use_cfg': not args.no_cfg,
+        'seed': args.seed,
         'num_epochs': args.num_epochs,
         'num_batches_per_epoch': args.num_batches_per_epoch,
         'batch_size': args.batch_size,
@@ -141,6 +153,8 @@ def build_dataloader(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    set_seed(args.seed)
+    print(f"Seed: {args.seed}")
 
     _ot = '_NOOT' if args.no_ot else '_OT'
     _cfg = '_NOCFG' if args.no_cfg else '_CFG'

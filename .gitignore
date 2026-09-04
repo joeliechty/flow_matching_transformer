@@ -17,6 +17,10 @@ build/
 # model checkpoints
 checkpoints/
 
+# experiment outputs and eval artifacts
+experiments/results/
+eval_assets/
+
 # images
 *.png
 *.jpg

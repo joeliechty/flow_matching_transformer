@@ -1,5 +1,7 @@
 import torch
 import os
+import random
+import numpy as np
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, compute_twist_between_poses, add_twist_to_pose
 from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel
 from models.flow_matching_transformer import FlowMatchingTransformerModel
@@ -19,8 +21,17 @@ def parse_args():
     parser.add_argument('--seq_len', '-S', type=int, default=1, help='Sequence length per trajectory')
     parser.add_argument('--no_ot', '-NOOT', action='store_true', help='Disable optimal transport pairing during training')
     parser.add_argument('--no_cfg', '-NOCFG', action='store_true', help='Disable classifier-free guidance (no unconditional dropout during training)')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for torch/numpy/random (for reproducible ablations)')
     args = parser.parse_args()
     return args
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def generate_training_and_model_config(args, start_dist_params=None, goal_dist_params=None, action_dist_params=None):
     # Define distribution parameters (twist representation)
@@ -82,6 +93,7 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         'conditional': args.conditional,
         'use_ot': not args.no_ot,
         'use_cfg': not args.no_cfg,
+        'seed': args.seed,
         'num_epochs': args.num_epochs,
         'num_batches_per_epoch': args.num_batches_per_epoch,
         'batch_size': batch_size,
@@ -93,7 +105,7 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         'action_dist_params': action_dist_params if args.conditional else None,
         'lr': 1e-4,
         'weight_decay': 1e-5
-    }    
+    }
     model_config = {
         'input_dim': 7,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
         'output_dim': 6,  # twist representation (vx, vy, vz, wx, wy, wz)
@@ -149,6 +161,8 @@ def test_data_generation(device):
 if __name__ == "__main__":
 
     args = parse_args()
+    set_seed(args.seed)
+    print(f"Seed: {args.seed}")
 
     _ot_suffix = '_NOOT' if args.no_ot else '_OT'
     _cfg_suffix = '_NOCFG' if args.no_cfg else '_CFG'
