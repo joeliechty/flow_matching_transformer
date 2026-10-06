@@ -6,11 +6,12 @@
 #   ./pose_ablations.sh [train|eval|all]        (default: all)
 #
 # Layout:
-#   checkpoints/pose/seed_<N>/               checkpoints, configs, training logs
-#   experiments/results/pose/seed_<N>/       metrics, CFG + sampling-steps sweeps, grids
-#   experiments/results/pose/                *_summary.csv + plots, mean ± std over seeds
+#   checkpoints/pose/seed_<N>/                     checkpoints (every 10 epochs), configs, logs
+#   experiments/results/pose/epoch_<E>/seed_<N>/   metrics, CFG + sampling-steps sweeps, grids
+#   experiments/results/pose/epoch_<E>/            *_summary.csv + plots, mean ± std over seeds
 #
 # Env overrides: SEEDS="1 2 3 4 5" JOBS=6 EPOCHS=100 PYTHON=python
+#                EVAL_EPOCH=<EPOCHS>  evaluate the checkpoints saved at this epoch
 #                CKPT_ROOT, RESULTS_ROOT (relative to the repo root), FMT_REPO_ROOT
 # JOBS=6 measured best on an RTX 4090 (~2.7x sequential throughput; 12 barely helps).
 # Runs whose final-epoch checkpoint already exists are skipped, so re-running resumes.
@@ -21,6 +22,7 @@ STAGE="${1:-all}"
 SEEDS="${SEEDS:-1 2 3 4 5}"
 JOBS="${JOBS:-6}"
 EPOCHS="${EPOCHS:-100}"
+EVAL_EPOCH="${EVAL_EPOCH:-$EPOCHS}"
 BATCH=128
 PYTHON="${PYTHON:-python}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
@@ -28,12 +30,17 @@ export MPLBACKEND="${MPLBACKEND:-Agg}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${FMT_REPO_ROOT:-$SCRIPT_DIR}"
 CKPT_ROOT="${CKPT_ROOT:-checkpoints/pose}"
-RESULTS_ROOT="${RESULTS_ROOT:-experiments/results/pose}"
+RESULTS_ROOT="${RESULTS_ROOT:-experiments/results/pose/epoch_$EVAL_EPOCH}"
 
 case "$STAGE" in
   train|eval|all) ;;
   *) echo "usage: $0 [train|eval|all]" >&2; exit 2 ;;
 esac
+
+if (( EVAL_EPOCH % 10 != 0 )); then
+  echo "ERROR: EVAL_EPOCH=$EVAL_EPOCH — checkpoints are only saved every 10 epochs" >&2
+  exit 2
+fi
 
 if [[ ! -f "$REPO_ROOT/pose_gen_trainer.py" ]]; then
   echo "ERROR: no flow_matching_transformer checkout at $REPO_ROOT" >&2
@@ -102,7 +109,7 @@ train_stage() {
 }
 
 eval_stage() {
-  echo "=== Evaluating pose ablations: seeds [$SEEDS] ==="
+  echo "=== Evaluating pose ablations: seeds [$SEEDS], epoch-$EVAL_EPOCH checkpoints ==="
   local seed ckpt out
   for seed in $SEEDS; do
     ckpt="$CKPT_ROOT/seed_$seed"; out="$RESULTS_ROOT/seed_$seed"
@@ -111,10 +118,10 @@ eval_stage() {
       exit 1
     fi
     echo "--- seed $seed ---"
-    "$PYTHON" experiments/evaluate_all.py --checkpoint_dir "$ckpt" --output "$out/metrics.csv"
-    "$PYTHON" experiments/cfg_sweep.py    --checkpoint_dir "$ckpt" --output "$out/cfg_sweep.csv"
-    "$PYTHON" experiments/steps_sweep.py  --checkpoint_dir "$ckpt" --output "$out/steps_sweep.csv"
-    "$PYTHON" experiments/make_grids.py   --checkpoint_dir "$ckpt" --results_dir "$out" --skip_image
+    "$PYTHON" experiments/evaluate_all.py --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --output "$out/metrics.csv"
+    "$PYTHON" experiments/cfg_sweep.py    --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --output "$out/cfg_sweep.csv"
+    "$PYTHON" experiments/steps_sweep.py  --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --output "$out/steps_sweep.csv"
+    "$PYTHON" experiments/make_grids.py   --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --results_dir "$out" --skip_image
   done
   "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT"
 }

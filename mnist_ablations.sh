@@ -6,12 +6,13 @@
 #   ./mnist_ablations.sh [train|eval|all]       (default: all)
 #
 # Layout:
-#   eval_assets/mnist_cnn.pt                 classifier oracle (shared by all seeds)
-#   checkpoints/mnist/seed_<N>/              checkpoints, configs, training logs
-#   experiments/results/mnist/seed_<N>/      metrics, CFG + sampling-steps sweeps, grids
-#   experiments/results/mnist/               *_summary.csv + plots, mean ± std over seeds
+#   eval_assets/mnist_cnn.pt                        classifier oracle (shared by all seeds)
+#   checkpoints/mnist/seed_<N>/                     checkpoints (every 10 epochs), configs, logs
+#   experiments/results/mnist/epoch_<E>/seed_<N>/   metrics, CFG + sampling-steps sweeps, grids
+#   experiments/results/mnist/epoch_<E>/            *_summary.csv + plots, mean ± std over seeds
 #
 # Env overrides: SEEDS="1 2 3 4 5" JOBS=1 EPOCHS=400 PYTHON=python CLASSIFIER=...
+#                EVAL_EPOCH=<EPOCHS>  evaluate the checkpoints saved at this epoch
 #                CKPT_ROOT, RESULTS_ROOT (relative to the repo root), FMT_REPO_ROOT
 # Cost: one 400-epoch run is ~26 min on an RTX 4090, so the default 5 seeds x 6
 # variants is ~13 h at JOBS=1 (parallel speedup for MNIST hasn't been measured).
@@ -23,6 +24,7 @@ STAGE="${1:-all}"
 SEEDS="${SEEDS:-1 2 3 4 5}"
 JOBS="${JOBS:-1}"
 EPOCHS="${EPOCHS:-400}"
+EVAL_EPOCH="${EVAL_EPOCH:-$EPOCHS}"
 BATCH=128
 PYTHON="${PYTHON:-python}"
 export MPLBACKEND="${MPLBACKEND:-Agg}"
@@ -30,13 +32,18 @@ export MPLBACKEND="${MPLBACKEND:-Agg}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${FMT_REPO_ROOT:-$SCRIPT_DIR}"
 CKPT_ROOT="${CKPT_ROOT:-checkpoints/mnist}"
-RESULTS_ROOT="${RESULTS_ROOT:-experiments/results/mnist}"
+RESULTS_ROOT="${RESULTS_ROOT:-experiments/results/mnist/epoch_$EVAL_EPOCH}"
 CLASSIFIER="${CLASSIFIER:-eval_assets/mnist_cnn.pt}"
 
 case "$STAGE" in
   train|eval|all) ;;
   *) echo "usage: $0 [train|eval|all]" >&2; exit 2 ;;
 esac
+
+if (( EVAL_EPOCH % 10 != 0 )); then
+  echo "ERROR: EVAL_EPOCH=$EVAL_EPOCH — checkpoints are only saved every 10 epochs" >&2
+  exit 2
+fi
 
 if [[ ! -f "$REPO_ROOT/image_gen_trainer.py" ]]; then
   echo "ERROR: no flow_matching_transformer checkout at $REPO_ROOT" >&2
@@ -116,7 +123,7 @@ eval_stage() {
     echo "ERROR: no MNIST classifier at $CLASSIFIER — run '$0 train' first" >&2
     exit 1
   fi
-  echo "=== Evaluating MNIST ablations: seeds [$SEEDS] ==="
+  echo "=== Evaluating MNIST ablations: seeds [$SEEDS], epoch-$EVAL_EPOCH checkpoints ==="
   local seed ckpt out
   for seed in $SEEDS; do
     ckpt="$CKPT_ROOT/seed_$seed"; out="$RESULTS_ROOT/seed_$seed"
@@ -125,10 +132,10 @@ eval_stage() {
       exit 1
     fi
     echo "--- seed $seed ---"
-    "$PYTHON" experiments/evaluate_all.py --checkpoint_dir "$ckpt" --classifier_path "$CLASSIFIER" --output "$out/metrics.csv"
-    "$PYTHON" experiments/cfg_sweep.py    --checkpoint_dir "$ckpt" --classifier_path "$CLASSIFIER" --output "$out/cfg_sweep.csv"
-    "$PYTHON" experiments/steps_sweep.py  --checkpoint_dir "$ckpt" --classifier_path "$CLASSIFIER" --output "$out/steps_sweep.csv"
-    "$PYTHON" experiments/make_grids.py   --checkpoint_dir "$ckpt" --results_dir "$out" --skip_pose
+    "$PYTHON" experiments/evaluate_all.py --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --classifier_path "$CLASSIFIER" --output "$out/metrics.csv"
+    "$PYTHON" experiments/cfg_sweep.py    --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --classifier_path "$CLASSIFIER" --output "$out/cfg_sweep.csv"
+    "$PYTHON" experiments/steps_sweep.py  --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --classifier_path "$CLASSIFIER" --output "$out/steps_sweep.csv"
+    "$PYTHON" experiments/make_grids.py   --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --results_dir "$out" --skip_pose
   done
   "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT"
 }

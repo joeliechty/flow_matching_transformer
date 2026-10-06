@@ -24,6 +24,8 @@ DEFAULT_SWEEP = (1.0, 1.5, 2.0, 3.0, 5.0, 7.0)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/')
+    parser.add_argument('--epoch', type=int, default=None,
+                        help='Evaluate the checkpoints saved at this epoch (default: latest)')
     parser.add_argument('--classifier_path', type=str, default='eval_assets/mnist_cnn.pt')
     parser.add_argument('--num_samples', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=100)
@@ -37,7 +39,7 @@ def main():
     print(f"Using device: {device}")
 
     # CFG sweep only meaningful for conditional CFG-trained models.
-    metas = [m for m in discover_checkpoints(Path(args.checkpoint_dir))
+    metas = [m for m in discover_checkpoints(Path(args.checkpoint_dir), args.epoch)
              if m['prefix'] == 'cond_' and m['cfg'] == '_CFG']
     classifier = load_classifier_if_needed(metas, args.classifier_path, device)
 

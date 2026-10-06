@@ -63,17 +63,20 @@ _CKPT_RE = re.compile(
 )
 
 
-def discover_checkpoints(ckpt_dir: Path):
-    """Yield (path, meta_dict) for the latest-epoch checkpoint of each ablation variant."""
+def discover_checkpoints(ckpt_dir: Path, epoch=None):
+    """Yield (path, meta_dict) for each ablation variant's checkpoint: the latest epoch,
+    or exactly `epoch` when given (variants without that epoch are skipped)."""
     by_variant = {}
     for path in sorted(ckpt_dir.glob("*.pt")):
         m = _CKPT_RE.match(path.name)
         if not m:
             continue
+        ckpt_epoch = int(m["epoch"])
+        if epoch is not None and ckpt_epoch != epoch:
+            continue
         key = (m["prefix"], m["task"], m["ot"], m["cfg"])
-        epoch = int(m["epoch"])
-        if key not in by_variant or epoch > by_variant[key][1]:
-            by_variant[key] = (path, epoch, m.groupdict())
+        if key not in by_variant or ckpt_epoch > by_variant[key][1]:
+            by_variant[key] = (path, ckpt_epoch, m.groupdict())
     for (path, epoch, meta) in by_variant.values():
         meta["epoch"] = epoch
         meta["path"] = path
@@ -248,6 +251,8 @@ def write_csv(rows, output, fieldnames=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/')
+    parser.add_argument('--epoch', type=int, default=None,
+                        help='Evaluate the checkpoints saved at this epoch (default: latest)')
     parser.add_argument('--classifier_path', type=str, default='eval_assets/mnist_cnn.pt')
     parser.add_argument('--num_samples', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=100)
@@ -265,7 +270,7 @@ def main():
     if not ckpt_dir.exists():
         raise SystemExit(f"No checkpoint directory at {ckpt_dir}")
 
-    metas = list(discover_checkpoints(ckpt_dir))
+    metas = list(discover_checkpoints(ckpt_dir, args.epoch))
     classifier = load_classifier_if_needed(metas, args.classifier_path, device)
 
     rows = []

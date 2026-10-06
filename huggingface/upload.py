@@ -5,9 +5,9 @@ Layout pushed to the hub:
   /pose/seed_<N>/*.pt + *.yaml     (6 pose checkpoints + configs per seed)
   /mnist/seed_<N>/*.pt + *.yaml    (6 MNIST checkpoints + configs per seed)
   /classifier/mnist_cnn.pt         (evaluation oracle)
-  /results/<task>/*_summary.csv    (mean ± std over seeds: metrics, CFG + steps sweeps)
-  /results/<task>/*.png            (sweep plots)
-  /results/<task>/seed_<N>/        (per-seed CSVs and sample grids)
+  /results/<task>/epoch_<E>/*_summary.csv   (mean ± std over seeds: metrics, sweeps)
+  /results/<task>/epoch_<E>/*.png           (sweep plots)
+  /results/<task>/epoch_<E>/seed_<N>/       (per-seed CSVs and sample grids)
   README.md                        (rendered model card)
 
 Authentication: run `huggingface-cli login` first, or pass --token. Use
@@ -79,19 +79,20 @@ def stage_artifacts(checkpoint_dir: Path, results_dir: Path,
 def _render_metrics_table(results_dir: Path):
     rows = []
     for task in ('pose', 'mnist'):
-        summary = results_dir / task / 'metrics_summary.csv'
-        if summary.exists():
+        summaries = sorted((results_dir / task).glob('epoch_*/metrics_summary.csv'),
+                           key=lambda p: int(p.parent.name.split('_')[1]))
+        for summary in summaries:
             with open(summary) as f:
                 rows.extend(csv.DictReader(f))
     if not rows:
         return ("(no metrics_summary.csv found — run ./pose_ablations.sh eval and "
                 "./mnist_ablations.sh eval first)\n")
     metrics = [m for m in METRICS if any(r.get(f'{m}_mean') for r in rows)]
-    headers = ['task', 'variant', 'n_seeds'] + metrics
+    headers = ['task', 'epoch', 'variant', 'n_seeds'] + metrics
     lines = ['| ' + ' | '.join(headers) + ' |',
              '| ' + ' | '.join(['---'] * len(headers)) + ' |']
     for r in rows:
-        cells = [r['task'], r['variant'], r['n_seeds']]
+        cells = [r['task'], r['epoch'], r['variant'], r['n_seeds']]
         for m in metrics:
             mean, std = r.get(f'{m}_mean'), r.get(f'{m}_std')
             cells.append(f"{float(mean):.4f} ± {float(std):.4f}" if mean else '')

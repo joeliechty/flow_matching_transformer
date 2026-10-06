@@ -79,7 +79,8 @@ def summarize(rows, keys):
     def sort_key(s):
         v = s.get('variant')
         rank = _VARIANT_ORDER.index(v) if v in _VARIANT_ORDER else len(_VARIANT_ORDER)
-        return (s.get('task', ''), rank, *(float(s[k]) for k in keys[2:]))
+        sweep_x = (float(s[k]) for k in keys if k not in ('task', 'epoch', 'variant'))
+        return (s.get('task', ''), float(s.get('epoch') or 0), rank, *sweep_x)
     return sorted(out, key=sort_key)
 
 
@@ -95,6 +96,9 @@ def plot_sweep(summary, x_key, xlabel, title, output, log_x=False):
         return
     n_seeds = max(s['n_seeds'] for s in summary)
     task = summary[0].get('task', '')
+    epochs = sorted({s['epoch'] for s in summary if s.get('epoch')}, key=float)
+    if epochs:
+        task = f"{task}, epoch {'/'.join(epochs)}"
 
     fig, axes = plt.subplots(1, len(metrics), figsize=(4.4 * len(metrics), 3.8), squeeze=False)
     handles = {}
@@ -146,15 +150,15 @@ def print_summary(summary):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--results_dir', type=str, default='experiments/results/pose/',
-                        help='Directory holding seed_*/ result folders for one task')
+    parser.add_argument('--results_dir', type=str, default='experiments/results/pose/epoch_100/',
+                        help='Directory holding seed_*/ result folders for one task and epoch')
     args = parser.parse_args()
     results_dir = Path(args.results_dir)
 
     metrics_rows = load_rows(results_dir, 'metrics.csv')
     if not metrics_rows:
         raise SystemExit(f"No seed_*/metrics.csv under {results_dir}")
-    keys = ('task', 'variant')
+    keys = ('task', 'epoch', 'variant')
     summary = summarize(metrics_rows, keys)
     write_csv(summary, results_dir / 'metrics_summary.csv', summary_fieldnames(summary, keys))
     print_summary(summary)
@@ -163,7 +167,7 @@ def main():
         ('cfg_sweep', 'cfg_scale_at_inference', 'cfg_scale', 'CFG sweep', False),
         ('steps_sweep', 'num_steps', 'integration steps (log scale)', 'sampling-steps sweep', True),
     ):
-        keys = ('task', 'variant', x_key)
+        keys = ('task', 'epoch', 'variant', x_key)
         sweep = summarize(load_rows(results_dir, f'{name}.csv'), keys)
         if not sweep:
             continue

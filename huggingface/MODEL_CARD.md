@@ -31,7 +31,8 @@ Source code: {{GITHUB_URL}}
 ## Ablation results
 
 Metrics computed by `experiments/evaluate_all.py` on 256 samples per model
-(100 integration steps), reported as mean ± std over seeds. Pose metrics are computed in **SE(3) Lie-algebra (twist) space** — a
+(100 integration steps), reported as mean ± std over seeds for each evaluated
+training epoch (the `epoch` column). Pose metrics are computed in **SE(3) Lie-algebra (twist) space** — a
 sample is assigned to the mode whose pose is closest to it under
 `compute_twist_between_poses`. MNIST metrics use a small CNN classifier
 (`classifier/mnist_cnn.pt`) as an oracle. CFG-trained conditional variants are
@@ -57,14 +58,16 @@ guidance does not apply.
 
 ## Figures
 
-- `results/<task>/steps_sweep.png` — every metric vs the number of ODE
-  integration steps used at sampling time (1–100), mean ± std over seeds.
-- `results/<task>/cfg_sweep.png` — every metric vs `cfg_scale` for the
-  CFG-trained conditional variants, mean ± std over seeds.
-- `results/pose/seed_<N>/pose_grid.png` — 2×2 trajectory plot, one panel per
-  conditional pose ablation variant.
-- `results/mnist/seed_<N>/mnist_grid.png` — 4×10 image grid, rows = ablation
-  variants, columns = digits 0-9.
+Each evaluated training epoch has its own `results/<task>/epoch_<E>/` folder:
+
+- `steps_sweep.png` — every metric vs the number of ODE integration steps
+  used at sampling time (1–100), mean ± std over seeds.
+- `cfg_sweep.png` — every metric vs `cfg_scale` for the CFG-trained
+  conditional variants, mean ± std over seeds.
+- `seed_<N>/pose_grid.png` — 2×2 trajectory plot, one panel per conditional
+  pose ablation variant.
+- `seed_<N>/mnist_grid.png` — 4×10 image grid, rows = ablation variants,
+  columns = digits 0-9.
 
 ## Loading a checkpoint
 
@@ -92,6 +95,8 @@ model.eval()
 # sampling-steps sweep, sample grids, mean ± std summaries).
 ./pose_ablations.sh
 ./mnist_ablations.sh
+# Re-evaluate an intermediate checkpoint (saved every 10 epochs), e.g.:
+EVAL_EPOCH=50 ./pose_ablations.sh eval
 
 # Upload (after huggingface-cli login).
 python huggingface/upload.py --repo_id {{REPO_ID}}

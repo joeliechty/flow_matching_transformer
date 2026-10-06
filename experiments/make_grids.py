@@ -36,10 +36,10 @@ def _config_path_for(ckpt_path: Path):
     return ckpt_path.parent / f"{stem}_training_config.yaml"
 
 
-def _pose_variants(ckpt_dir):
+def _pose_variants(ckpt_dir, epoch=None):
     """Return the 4 conditional pose ablation checkpoints, keyed by 'OT_CFG' etc."""
     out = {}
-    for meta in discover_checkpoints(ckpt_dir):
+    for meta in discover_checkpoints(ckpt_dir, epoch):
         if meta['task'] != 'pose' or meta['prefix'] != 'cond_':
             continue
         key = f"{meta['ot'].lstrip('_')}_{meta['cfg'].lstrip('_')}"
@@ -47,9 +47,9 @@ def _pose_variants(ckpt_dir):
     return out
 
 
-def _image_variants(ckpt_dir):
+def _image_variants(ckpt_dir, epoch=None):
     out = {}
-    for meta in discover_checkpoints(ckpt_dir):
+    for meta in discover_checkpoints(ckpt_dir, epoch):
         if meta['task'] != 'image' or meta['prefix'] != 'cond_':
             continue
         key = f"{meta['ot'].lstrip('_')}_{meta['cfg'].lstrip('_')}"
@@ -58,10 +58,10 @@ def _image_variants(ckpt_dir):
 
 
 def make_pose_grid(ckpt_dir: Path, output: Path, device, num_samples=5,
-                   num_steps=50, cfg_scale=3.0):
+                   num_steps=50, cfg_scale=3.0, epoch=None):
     """For each of the 4 conditional-pose variants, sample one trajectory per mode
     and stitch into a 2x2 figure of 3D trajectory plots."""
-    variants = _pose_variants(ckpt_dir)
+    variants = _pose_variants(ckpt_dir, epoch)
     ordered = [('OT_CFG', 'Full (OT + CFG)'), ('OT_NOCFG', 'No CFG'),
                ('NOOT_CFG', 'No OT'), ('NOOT_NOCFG', 'Baseline (no OT, no CFG)')]
 
@@ -107,10 +107,11 @@ def make_pose_grid(ckpt_dir: Path, output: Path, device, num_samples=5,
     print(f"Saved {output}")
 
 
-def make_mnist_grid(ckpt_dir: Path, output: Path, device, num_steps=100, cfg_scale=3.0):
+def make_mnist_grid(ckpt_dir: Path, output: Path, device, num_steps=100, cfg_scale=3.0,
+                    epoch=None):
     """For each of the 4 conditional-MNIST variants, sample digits 0-9 (one each)
     and stitch into a 2x2 figure of 1x10 sample strips."""
-    variants = _image_variants(ckpt_dir)
+    variants = _image_variants(ckpt_dir, epoch)
     ordered = [('OT_CFG', 'Full (OT + CFG)'), ('OT_NOCFG', 'No CFG'),
                ('NOOT_CFG', 'No OT'), ('NOOT_NOCFG', 'Baseline (no OT, no CFG)')]
 
@@ -191,6 +192,8 @@ def make_cfg_sweep_plot(csv_path: Path, output: Path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/')
+    parser.add_argument('--epoch', type=int, default=None,
+                        help='Use the checkpoints saved at this epoch (default: latest)')
     parser.add_argument('--results_dir', type=str, default='experiments/results/')
     parser.add_argument('--cfg_scale', type=float, default=3.0)
     parser.add_argument('--num_steps_pose', type=int, default=50)
@@ -209,10 +212,12 @@ def main():
 
     if not args.skip_pose:
         make_pose_grid(ckpt_dir, results_dir / 'pose_grid.png', device,
-                       num_steps=args.num_steps_pose, cfg_scale=args.cfg_scale)
+                       num_steps=args.num_steps_pose, cfg_scale=args.cfg_scale,
+                       epoch=args.epoch)
     if not args.skip_image:
         make_mnist_grid(ckpt_dir, results_dir / 'mnist_grid.png', device,
-                        num_steps=args.num_steps_image, cfg_scale=args.cfg_scale)
+                        num_steps=args.num_steps_image, cfg_scale=args.cfg_scale,
+                        epoch=args.epoch)
     if not args.skip_cfg_sweep:
         make_cfg_sweep_plot(results_dir / 'cfg_sweep.csv',
                             results_dir / 'cfg_sweep.png')
