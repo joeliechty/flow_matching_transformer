@@ -91,6 +91,20 @@ def geodesic_optimal_transport_pairing(start_poses, goal_poses):
     return optimal_transport_pairing(start_poses, goal_poses, manifold='se3')
 
 
+def _pair_within_conditions(start, goal, cond_ids, pair_fn):
+    """OT-pair `start` to `goal` separately within each condition.
+
+    Pairing across the whole batch would hand each condition only the noise samples
+    nearest its own goals, so a conditional model would never see the rest of the noise
+    distribution for that condition, while sampling draws from all of it.
+    """
+    paired = torch.empty_like(start)
+    for c in torch.unique(cond_ids):
+        idx = (cond_ids == c).nonzero(as_tuple=True)[0]
+        paired[idx] = pair_fn(start[idx], goal[idx])
+    return paired
+
+
 def generate_interpolated_states(start, goal, n_steps=10, manifold='se3'):
     """
     Build an interpolation between start and goal samples, plus a per-step target velocity.
@@ -160,13 +174,16 @@ def _build_cond_mask(batch_size, num_tokens, use_cfg, device):
 
 def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
                             state_dim, vel_dim, manifold, use_ot, use_cfg, device,
-                            time_sampling='grid', ot_mode='per_frame', scheduler=None):
+                            time_sampling='grid', ot_mode='per_frame', scheduler=None,
+                            cond_ids=None):
     """
     Shared core: interpolate -> forward+loss -> backprop.
 
     start/goal: [B, S, D_start] where D_start matches the manifold's natural input
                 (6 for SE(3) twists, vel_dim==state_dim for Euclidean).
     obs:        [B, M, obs_dim] or None.
+    cond_ids:   [B] condition index per sample (conditional models), or None. With OT,
+                pairing then stays within each condition.
 
     time_sampling:
         'grid'       — legacy: builds n_steps interpolated states per sample,
@@ -183,11 +200,15 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
 
     if use_ot:
         if ot_mode == 'flat':
-            start = flat_ot_pairing(start, goal, manifold=manifold)
+            pair_fn = lambda s, g: flat_ot_pairing(s, g, manifold=manifold)
         elif ot_mode == 'per_frame':
-            start = sequence_ot_pairing(start, goal, manifold=manifold)
+            pair_fn = lambda s, g: sequence_ot_pairing(s, g, manifold=manifold)
         else:
             raise ValueError(f"Unknown ot_mode: {ot_mode!r}")
+        if cond_ids is None:
+            start = pair_fn(start, goal)
+        else:
+            start = _pair_within_conditions(start, goal, cond_ids, pair_fn)
 
     if time_sampling == 'continuous':
         if manifold != 'euclidean':
@@ -294,8 +315,11 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
             obs_i = mu_tensor.unsqueeze(0) + eps * sigma_tensor.unsqueeze(0)
             obs_list.append(obs_i)
         obs = torch.cat(obs_list, dim=0)
+        # Goals and obs are both laid out mode by mode, so row i belongs to mode i // bs_per_mode.
+        cond_ids = torch.arange(num_modes, device=device).repeat_interleave(bs_per_mode)
     else:
         obs = None
+        cond_ids = None
 
     return _run_flow_matching_step(
         model, optimizer,
@@ -304,6 +328,7 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
         state_dim=7, vel_dim=6,
         manifold='se3', use_ot=use_ot, use_cfg=use_cfg, device=device,
         time_sampling='grid', ot_mode='per_frame', scheduler=scheduler,
+        cond_ids=cond_ids,
     )
 
 
@@ -358,6 +383,7 @@ def train_one_minibatch_image(model, optimizer, dataloader_iter, n_steps,
         state_dim=D, vel_dim=D,
         manifold='euclidean', use_ot=use_ot, use_cfg=use_cfg, device=device,
         time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler,
+        cond_ids=labels if is_conditional else None,
     )
     return loss, dataloader_iter
 
