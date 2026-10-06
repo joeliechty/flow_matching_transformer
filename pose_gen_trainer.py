@@ -7,7 +7,7 @@ from models.conditional_flow_matching_transformer import ConditionalFlowMatching
 from models.flow_matching_transformer import FlowMatchingTransformerModel
 from utils.train_utils import generate_interpolated_poses, train
 from omegaconf import OmegaConf
-from utils.logging_utils import _Tee
+from utils.logging_utils import _Tee, git_commit
 
 def parse_args():
     import argparse
@@ -94,6 +94,7 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         'use_ot': not args.no_ot,
         'use_cfg': not args.no_cfg,
         'seed': args.seed,
+        'git_commit': git_commit(),
         'num_epochs': args.num_epochs,
         'num_batches_per_epoch': args.num_batches_per_epoch,
         'batch_size': batch_size,

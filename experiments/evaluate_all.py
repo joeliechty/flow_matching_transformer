@@ -9,9 +9,11 @@ Output: experiments/results/metrics.csv
 """
 import argparse
 import csv
+import functools
 import glob
 import os
 import re
+import statistics
 import sys
 from pathlib import Path
 
@@ -22,14 +24,22 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from utils.eval_utils import (
+    ACTION_TO_MODE,
     actions_to_mode_indices,
     goal_mode_poses_from_config,
     mnist_class_accuracy,
     mnist_class_marginal_kl,
+    mode_balance_kl,
+    nearest_mode_indices,
+    path_straightness,
+    per_mode_energy_distance,
+    pose_bias_spread,
     pose_mode_accuracy,
     pose_mode_coverage_kl,
     pose_mode_distance,
+    sample_goal_poses,
 )
+from utils.logging_utils import git_commit
 from utils.mnist_classifier import load_classifier
 from pose_gen_inference import (
     build_obs_from_actions,
@@ -51,6 +61,20 @@ ACTION_PAIRS = [
     ("top", "left"),     # mode 2
     ("bottom", "left"),  # mode 3
 ]
+
+# One-token conditions: (action pair, index of the token replaced by the null token).
+# The visible token alone matches two modes, so the correct output is bimodal.
+PARTIAL_CONDITIONS = [
+    (("top", "right"), 1),     # "top" only    -> top-right, top-left
+    (("bottom", "right"), 1),  # "bottom" only -> bottom-right, bottom-left
+    (("top", "right"), 0),     # "right" only  -> top-right, bottom-right
+    (("top", "left"), 0),      # "left" only   -> top-left, bottom-left
+]
+
+# Real goal samples for the distribution-level metrics. They have their own seeds, so the
+# model-sampling noise (and with it every older metric) is unchanged.
+REF_SEED, REF_PER_MODE = 1234, 1024
+DATA_SEED = 4321  # independent draws scored as if from a perfect sampler (the 'data' row)
 
 
 # Filename schema:
@@ -104,6 +128,40 @@ def variant_name(meta):
     return f"uncond{meta['ot']}"
 
 
+def _partial_valid_modes(action_pair, masked):
+    """Modes consistent with the visible token of a one-token condition."""
+    visible = 1 - masked
+    return sorted(m for pair, m in ACTION_TO_MODE.items() if pair[visible] == action_pair[visible])
+
+
+def _distribution_metrics(samples, assigned, mode_poses, ref, ref_idx):
+    out = pose_bias_spread(samples, assigned, mode_poses, ref, ref_idx)
+    out['energy_distance'] = per_mode_energy_distance(samples, assigned, ref, ref_idx)
+    return out
+
+
+def _partial_metrics(sample_sets, mode_poses, ref, ref_idx):
+    """Metrics for one-token conditioning; `sample_sets[i]` are samples for PARTIAL_CONDITIONS[i].
+
+    validity = share of samples nearest one of the two valid modes; balance KL = how unevenly
+    those split between the two (0 = 50/50); energy distance = within-mode quality.
+    """
+    validity, balance, energy = [], [], []
+    for (pair, masked), samples in zip(PARTIAL_CONDITIONS, sample_sets):
+        valid = _partial_valid_modes(pair, masked)
+        nearest = nearest_mode_indices(samples, mode_poses)
+        in_valid = torch.isin(nearest, torch.tensor(valid, device=nearest.device))
+        validity.append(in_valid.float().mean().item())
+        balance.append(mode_balance_kl(nearest, valid))
+        energy.append(per_mode_energy_distance(samples[in_valid], nearest[in_valid], ref, ref_idx))
+    energy = [e for e in energy if e is not None]
+    return {
+        'partial_validity': statistics.fmean(validity),
+        'partial_balance_kl': statistics.fmean(balance),
+        'partial_energy_distance': statistics.fmean(energy) if energy else None,
+    }
+
+
 def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, eval_seed=0):
     conditional = meta["prefix"] == "cond_"
     cfg_scale = effective_cfg_scale(meta, cfg_scale)
@@ -119,6 +177,7 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
     start_dist = OmegaConf.to_container(config.training.start_dist_params, resolve=True)
     start_dist_flat = {'mu': start_dist['mu'][0], 'sigma': start_dist['sigma'][0]}
     mode_poses = goal_mode_poses_from_config(goal_dist, device=device)  # [K, 7]
+    ref, ref_idx = sample_goal_poses(goal_dist, REF_PER_MODE, REF_SEED, device)
 
     # CFG has no effect without conditioning, so leave it blank for unconditional rows.
     row = {
@@ -132,17 +191,18 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
 
     if conditional:
         per_mode = num_samples // 4
-        all_samples, all_targets = [], []
+        all_traj, all_targets = [], []
         for mode_idx, action_pair in enumerate(ACTION_PAIRS):
             obs = build_obs_from_actions(list(action_pair), per_mode, device)
-            _, samples = generate_from_distribution(
+            _, traj = generate_from_distribution(
                 model, start_dist_flat, batch_size=per_mode, obs=obs,
-                num_steps=num_steps, return_trajectory=False,
+                num_steps=num_steps, return_trajectory=True,
                 cfg_scale=cfg_scale, device=device,
             )
-            all_samples.append(samples)
+            all_traj.append(traj)
             all_targets.append(torch.full((per_mode,), mode_idx, dtype=torch.long))
-        samples = torch.cat(all_samples, dim=0)
+        trajectory = torch.cat(all_traj, dim=0)
+        samples = trajectory[:, -1]
         targets = torch.cat(all_targets, dim=0)
 
         row['mode_accuracy'] = pose_mode_accuracy(samples, targets, mode_poses)
@@ -150,17 +210,65 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
         kl, counts = pose_mode_coverage_kl(samples, mode_poses)
         row['mode_coverage_kl'] = kl
         row['per_mode_counts'] = dict(counts)
+        assigned = targets.to(samples.device)
     else:
-        _, samples = generate_from_distribution(
+        _, trajectory = generate_from_distribution(
             model, start_dist_flat, batch_size=num_samples, obs=None,
-            num_steps=num_steps, return_trajectory=False, device=device,
+            num_steps=num_steps, return_trajectory=True, device=device,
         )
+        samples = trajectory[:, -1]
         row['mode_distance'] = pose_mode_distance(samples, mode_poses)
         kl, counts = pose_mode_coverage_kl(samples, mode_poses)
         row['mode_coverage_kl'] = kl
         row['per_mode_counts'] = dict(counts)
+        assigned = nearest_mode_indices(samples, mode_poses)
+
+    row.update(_distribution_metrics(samples, assigned, mode_poses, ref, ref_idx))
+    row['path_straightness'], row['transport_cost'] = path_straightness(trajectory)
+
+    if conditional:
+        # Drawn after the full-condition samples, so those keep their noise.
+        partial = []
+        for action_pair, masked in PARTIAL_CONDITIONS:
+            obs = build_obs_from_actions(list(action_pair), per_mode, device)
+            obs_mask = torch.zeros(per_mode, obs.shape[1], dtype=torch.bool, device=device)
+            obs_mask[:, masked] = True
+            _, partial_samples = generate_from_distribution(
+                model, start_dist_flat, batch_size=per_mode, obs=obs, obs_mask=obs_mask,
+                num_steps=num_steps, return_trajectory=False, cfg_scale=cfg_scale, device=device,
+            )
+            partial.append(partial_samples)
+        row.update(_partial_metrics(partial, mode_poses, ref, ref_idx))
 
     row['num_samples'] = samples.shape[0]  # per-mode split can round down
+    return row
+
+
+def evaluate_pose_reference(config_path, epoch, device, num_samples=256):
+    """Score real goal samples with the pose metrics: what a perfect sampler gets."""
+    config = OmegaConf.load(config_path)
+    goal_dist = OmegaConf.to_container(config.training.goal_dist_params, resolve=True)
+    mode_poses = goal_mode_poses_from_config(goal_dist, device=device)
+    K = mode_poses.shape[0]
+    ref, ref_idx = sample_goal_poses(goal_dist, REF_PER_MODE, REF_SEED, device)
+    samples, targets = sample_goal_poses(goal_dist, num_samples // K, DATA_SEED, device)
+
+    kl, counts = pose_mode_coverage_kl(samples, mode_poses)
+    row = {
+        'task': 'pose', 'variant': 'data', 'epoch': epoch, 'num_samples': samples.shape[0],
+        'mode_accuracy': pose_mode_accuracy(samples, targets, mode_poses),
+        'mode_distance': pose_mode_distance(samples, mode_poses, targets),
+        'mode_coverage_kl': kl, 'per_mode_counts': dict(counts), 'git_commit': _commit(),
+    }
+    row.update(_distribution_metrics(samples, targets, mode_poses, ref, ref_idx))
+    # One-token conditions: a perfect sampler splits evenly between the two valid modes.
+    partial = []
+    for i, (pair, masked) in enumerate(PARTIAL_CONDITIONS):
+        valid = torch.tensor(_partial_valid_modes(pair, masked), device=device)
+        pool, pool_idx = sample_goal_poses(goal_dist, num_samples // K // len(valid),
+                                           DATA_SEED + 1 + i, device)
+        partial.append(pool[torch.isin(pool_idx, valid)])
+    row.update(_partial_metrics(partial, mode_poses, ref, ref_idx))
     return row
 
 
@@ -213,13 +321,21 @@ def evaluate_image(meta, device, classifier, num_samples=256, num_steps=100, cfg
     return row
 
 
+@functools.lru_cache(maxsize=None)
+def _commit():
+    return git_commit()
+
+
 def evaluate(meta, device, classifier, **kwargs):
     """Run the task's evaluator. Returns None for MNIST when no classifier is loaded."""
     if meta['task'] == 'pose':
-        return evaluate_pose(meta, device, **kwargs)
-    if classifier is None:
+        row = evaluate_pose(meta, device, **kwargs)
+    elif classifier is None:
         return None
-    return evaluate_image(meta, device, classifier, **kwargs)
+    else:
+        row = evaluate_image(meta, device, classifier, **kwargs)
+    row['git_commit'] = _commit()
+    return row
 
 
 def load_classifier_if_needed(metas, classifier_path, device):
@@ -289,6 +405,13 @@ def main():
             continue
         rows.append(row)
         print({k: v for k, v in row.items() if v is not None})
+
+    pose_metas = [m for m in metas if m['task'] == 'pose']
+    if pose_metas:
+        print("\n=== Scoring real goal samples (the 'data' reference row) ===")
+        rows.append(evaluate_pose_reference(_config_path_for(pose_metas[0]['path']),
+                                            max(m['epoch'] for m in pose_metas), device,
+                                            num_samples=args.num_samples))
 
     write_csv(rows, args.output)
 

@@ -8,6 +8,7 @@ evaluate_all.py, cfg_sweep.py and steps_sweep.py) and writes into <results_dir>:
 """
 import argparse
 import csv
+import math
 import statistics
 import sys
 from pathlib import Path
@@ -28,9 +29,24 @@ METRICS = {
     'mode_accuracy': ('Mode accuracy', 'higher is better'),
     'mode_distance': ('Twist distance to target mode', "lower is better, down to the data's spread"),
     'mode_coverage_kl': ('Mode coverage KL', 'lower is better'),
+    'energy_distance': ('Energy distance to data (per mode)', 'lower is better; data ≈ 0'),
+    'bias_trans': ('Translation bias', 'lower is better; data ≈ 0'),
+    'bias_rot': ('Rotation bias (rad)', 'lower is better; data ≈ 0'),
+    'spread_ratio_trans': ('Translation spread ÷ data', '1 = data; < 1 = collapsed'),
+    'spread_ratio_rot': ('Rotation spread ÷ data', '1 = data; < 1 = collapsed'),
+    'path_straightness': ('Path length ÷ start-to-end distance', '1 = straight'),
+    'transport_cost': ('Start-to-end distance', 'lower = shorter paths'),
+    'partial_validity': ('One-token condition: valid-mode rate', 'higher is better'),
+    'partial_balance_kl': ('One-token condition: imbalance KL', 'lower is better; 0 = 50/50'),
+    'partial_energy_distance': ('One-token condition: energy distance', 'lower is better'),
     'class_accuracy': ('Class accuracy', 'higher is better'),
     'class_marginal_kl': ('Class marginal KL', 'lower is better'),
 }
+# Columns for the console summary (all metrics still go to the CSVs and plots).
+PRINT_METRICS = ('mode_accuracy', 'energy_distance', 'spread_ratio_trans', 'spread_ratio_rot',
+                 'path_straightness', 'partial_validity', 'partial_balance_kl',
+                 'class_accuracy', 'class_marginal_kl')
+REFERENCE_COLOR = '#8a8a85'  # recessive grey for the real-data reference line
 
 # variant -> (legend label, colour, linestyle). Colour follows the variant across every
 # panel and figure; linestyle repeats the OT split (solid = OT, dashed = no OT) so that
@@ -90,19 +106,28 @@ def summary_fieldnames(summary, keys):
     return list(keys) + ['n_seeds'] + stats
 
 
-def plot_sweep(summary, x_key, xlabel, title, output, log_x=False):
+def plot_sweep(summary, x_key, xlabel, title, output, log_x=False, reference=None):
+    """One panel per metric; `reference` maps metric -> real-data value (dotted grey line)."""
     metrics = [m for m in METRICS if any(f'{m}_mean' in s for s in summary)]
     if not metrics:
         return
+    reference = reference or {}
     n_seeds = max(s['n_seeds'] for s in summary)
     task = summary[0].get('task', '')
     epochs = sorted({s['epoch'] for s in summary if s.get('epoch')}, key=float)
     if epochs:
         task = f"{task}, epoch {'/'.join(epochs)}"
 
-    fig, axes = plt.subplots(1, len(metrics), figsize=(4.4 * len(metrics), 3.8), squeeze=False)
+    ncols = min(4, len(metrics))
+    nrows = math.ceil(len(metrics) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.4 * ncols, 3.8 * nrows), squeeze=False)
+    for ax in axes.flat[len(metrics):]:
+        ax.axis('off')
     handles = {}
-    for ax, metric in zip(axes[0], metrics):
+    for ax, metric in zip(axes.flat, metrics):
+        if metric in reference:
+            handles.setdefault('data', ax.axhline(reference[metric], color=REFERENCE_COLOR,
+                                                  linestyle=':', linewidth=1.5, label='real data'))
         for variant, (label, color, linestyle) in VARIANT_STYLE.items():
             pts = sorted((float(s[x_key]), s[f'{metric}_mean'], s[f'{metric}_std'])
                          for s in summary
@@ -127,7 +152,7 @@ def plot_sweep(summary, x_key, xlabel, title, output, log_x=False):
         for side in ('top', 'right'):
             ax.spines[side].set_visible(False)
 
-    ordered = [handles[v] for v in _VARIANT_ORDER if v in handles]
+    ordered = [handles[v] for v in _VARIANT_ORDER + ['data'] if v in handles]
     fig.legend(ordered, [h.get_label() for h in ordered],
                loc='center left', bbox_to_anchor=(1.0, 0.5), frameon=False)
     fig.suptitle(f"{task} — {title} (mean ± 1 std over {n_seeds} "
@@ -139,13 +164,13 @@ def plot_sweep(summary, x_key, xlabel, title, output, log_x=False):
 
 
 def print_summary(summary):
-    metrics = [m for m in METRICS if any(f'{m}_mean' in s for s in summary)]
-    print(f"\n{'variant':<18}{'n':>3}  " + ''.join(f"{m:>22}" for m in metrics))
+    metrics = [m for m in PRINT_METRICS if any(f'{m}_mean' in s for s in summary)]
+    print(f"\n{'variant':<16}{'n':>2}" + ''.join(f"{m[:17]:>19}" for m in metrics))
     for s in summary:
         cells = ''.join(
-            f"{s[f'{m}_mean']:>13.4f} ± {s[f'{m}_std']:<6.4f}" if f'{m}_mean' in s else f"{'-':>22}"
+            f"{s[f'{m}_mean']:>11.3f}±{s[f'{m}_std']:<7.3f}" if f'{m}_mean' in s else f"{'-':>19}"
             for m in metrics)
-        print(f"{s['variant']:<18}{s['n_seeds']:>3}  {cells}")
+        print(f"{s['variant']:<16}{s['n_seeds']:>2}{cells}")
 
 
 def main():
@@ -162,6 +187,8 @@ def main():
     summary = summarize(metrics_rows, keys)
     write_csv(summary, results_dir / 'metrics_summary.csv', summary_fieldnames(summary, keys))
     print_summary(summary)
+    data_row = next((s for s in summary if s.get('variant') == 'data'), {})
+    reference = {m: data_row[f'{m}_mean'] for m in METRICS if f'{m}_mean' in data_row}
 
     for name, x_key, xlabel, title, log_x in (
         ('cfg_sweep', 'cfg_scale_at_inference', 'cfg_scale', 'CFG sweep', False),
@@ -172,7 +199,8 @@ def main():
         if not sweep:
             continue
         write_csv(sweep, results_dir / f'{name}_summary.csv', summary_fieldnames(sweep, keys))
-        plot_sweep(sweep, x_key, xlabel, title, results_dir / f'{name}.png', log_x=log_x)
+        plot_sweep(sweep, x_key, xlabel, title, results_dir / f'{name}.png', log_x=log_x,
+                   reference=reference)
 
 
 if __name__ == '__main__':
