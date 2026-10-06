@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from experiments.evaluate_all import ACTION_PAIRS, discover_checkpoints
+from experiments.evaluate_all import ACTION_PAIRS, discover_checkpoints, effective_cfg_scale
 from pose_gen_inference import (
     build_obs_from_actions, generate_from_distribution, load_model as load_pose_model,
 )
@@ -86,7 +86,7 @@ def make_pose_grid(ckpt_dir: Path, output: Path, device, num_samples=5,
             _, traj = generate_from_distribution(
                 model, start_dist_flat, batch_size=num_samples, obs=obs,
                 num_steps=num_steps, return_trajectory=True,
-                cfg_scale=cfg_scale, device=device,
+                cfg_scale=effective_cfg_scale(meta, cfg_scale), device=device,
             )
             all_traj.append(traj)
         trajectory = torch.cat(all_traj, dim=0).cpu()
@@ -130,7 +130,8 @@ def make_mnist_grid(ckpt_dir: Path, output: Path, device, num_steps=100, cfg_sca
             obs = build_obs_from_digit(digit, 1, device)
             img = generate_from_noise(model, 1, obs=obs, num_steps=num_steps,
                                       return_trajectory=False,
-                                      cfg_scale=cfg_scale, device=device)
+                                      cfg_scale=effective_cfg_scale(meta, cfg_scale),
+                                      device=device)
             arr = img[0, 0].cpu().numpy()
             axes[row, digit].imshow(arr, cmap='gray', vmin=-1, vmax=1)
             axes[row, digit].axis('off')

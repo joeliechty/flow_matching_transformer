@@ -1,5 +1,6 @@
-"""Evaluate every checkpoint in `checkpoints/` and write a single metrics CSV.
+"""Evaluate every checkpoint in one checkpoint directory and write a single metrics CSV.
 
+Point --checkpoint_dir at one seed's directory (e.g. checkpoints/pose/seed_1/).
 For each (task, ablation) combination we generate a fresh batch of samples and compute
 the metrics in `utils.eval_utils`. Pose models are evaluated in twist-space; MNIST
 models are scored by the small CNN oracle at `eval_assets/mnist_cnn.pt`.
@@ -27,6 +28,7 @@ from utils.eval_utils import (
     mnist_class_marginal_kl,
     pose_mode_accuracy,
     pose_mode_coverage_kl,
+    pose_mode_distance,
 )
 from utils.mnist_classifier import load_classifier
 from pose_gen_inference import (
@@ -84,25 +86,44 @@ def _config_path_for(ckpt_path: Path):
     return ckpt_path.parent / f"{stem}_training_config.yaml"
 
 
-def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0):
+def effective_cfg_scale(meta, cfg_scale):
+    """Guidance scale to sample a variant at. NOCFG variants weren't trained with
+    unconditional dropout, so guiding them would test an untrained null branch —
+    sample them unguided (1.0) instead."""
+    return cfg_scale if meta["cfg"] == "_CFG" else 1.0
+
+
+def variant_name(meta):
+    """Task-agnostic variant label, e.g. 'cond_OT_CFG' or 'uncond_NOOT'. Unconditional
+    labels omit CFG, which has no effect without conditioning."""
+    if meta["prefix"] == "cond_":
+        return f"cond{meta['ot']}{meta['cfg']}"
+    return f"uncond{meta['ot']}"
+
+
+def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, eval_seed=0):
     conditional = meta["prefix"] == "cond_"
+    cfg_scale = effective_cfg_scale(meta, cfg_scale)
     config = OmegaConf.load(_config_path_for(meta["path"]))
     model_config = OmegaConf.to_container(config.model, resolve=True)
     model, _ = load_pose_model(
         str(meta["path"]), device=device, model_config=model_config, conditional=conditional,
     )
+    # Same start noise for every variant and sweep point, so differences come from the model.
+    torch.manual_seed(eval_seed)
 
     goal_dist = OmegaConf.to_container(config.training.goal_dist_params, resolve=True)
     start_dist = OmegaConf.to_container(config.training.start_dist_params, resolve=True)
     start_dist_flat = {'mu': start_dist['mu'][0], 'sigma': start_dist['sigma'][0]}
     mode_poses = goal_mode_poses_from_config(goal_dist, device=device)  # [K, 7]
 
+    # CFG has no effect without conditioning, so leave it blank for unconditional rows.
     row = {
-        'task': 'pose', 'conditional': conditional,
-        'ot': meta['ot'] == '_OT', 'cfg': meta['cfg'] == '_CFG',
+        'task': 'pose', 'variant': variant_name(meta), 'conditional': conditional,
+        'ot': meta['ot'] == '_OT', 'cfg': meta['cfg'] == '_CFG' if conditional else None,
         'cfg_scale_at_inference': cfg_scale if conditional else None,
-        'num_samples': num_samples, 'epoch': meta['epoch'],
-        'mode_accuracy': None, 'mode_coverage_kl': None,
+        'num_steps': num_steps, 'num_samples': num_samples, 'epoch': meta['epoch'],
+        'mode_accuracy': None, 'mode_distance': None, 'mode_coverage_kl': None,
         'class_accuracy': None, 'class_marginal_kl': None,
     }
 
@@ -122,6 +143,7 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0):
         targets = torch.cat(all_targets, dim=0)
 
         row['mode_accuracy'] = pose_mode_accuracy(samples, targets, mode_poses)
+        row['mode_distance'] = pose_mode_distance(samples, mode_poses, targets)
         kl, counts = pose_mode_coverage_kl(samples, mode_poses)
         row['mode_coverage_kl'] = kl
         row['per_mode_counts'] = dict(counts)
@@ -130,27 +152,32 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0):
             model, start_dist_flat, batch_size=num_samples, obs=None,
             num_steps=num_steps, return_trajectory=False, device=device,
         )
+        row['mode_distance'] = pose_mode_distance(samples, mode_poses)
         kl, counts = pose_mode_coverage_kl(samples, mode_poses)
         row['mode_coverage_kl'] = kl
         row['per_mode_counts'] = dict(counts)
 
+    row['num_samples'] = samples.shape[0]  # per-mode split can round down
     return row
 
 
-def evaluate_image(meta, device, classifier, num_samples=256, num_steps=100, cfg_scale=3.0):
+def evaluate_image(meta, device, classifier, num_samples=256, num_steps=100, cfg_scale=3.0,
+                   eval_seed=0):
     conditional = meta["prefix"] == "cond_"
+    cfg_scale = effective_cfg_scale(meta, cfg_scale)
     config = OmegaConf.load(_config_path_for(meta["path"]))
     model_config = OmegaConf.to_container(config.model, resolve=True)
     model, _ = load_image_model(
         str(meta["path"]), device=device, model_config=model_config, conditional=conditional,
     )
+    torch.manual_seed(eval_seed)
 
     row = {
-        'task': 'mnist', 'conditional': conditional,
-        'ot': meta['ot'] == '_OT', 'cfg': meta['cfg'] == '_CFG',
+        'task': 'mnist', 'variant': variant_name(meta), 'conditional': conditional,
+        'ot': meta['ot'] == '_OT', 'cfg': meta['cfg'] == '_CFG' if conditional else None,
         'cfg_scale_at_inference': cfg_scale if conditional else None,
-        'num_samples': num_samples, 'epoch': meta['epoch'],
-        'mode_accuracy': None, 'mode_coverage_kl': None,
+        'num_steps': num_steps, 'num_samples': num_samples, 'epoch': meta['epoch'],
+        'mode_accuracy': None, 'mode_distance': None, 'mode_coverage_kl': None,
         'class_accuracy': None, 'class_marginal_kl': None,
     }
 
@@ -179,7 +206,43 @@ def evaluate_image(meta, device, classifier, num_samples=256, num_steps=100, cfg
         kl, _ = mnist_class_marginal_kl(imgs, classifier)
         row['class_marginal_kl'] = kl
 
+    row['num_samples'] = imgs.shape[0]  # per-class split can round down
     return row
+
+
+def evaluate(meta, device, classifier, **kwargs):
+    """Run the task's evaluator. Returns None for MNIST when no classifier is loaded."""
+    if meta['task'] == 'pose':
+        return evaluate_pose(meta, device, **kwargs)
+    if classifier is None:
+        return None
+    return evaluate_image(meta, device, classifier, **kwargs)
+
+
+def load_classifier_if_needed(metas, classifier_path, device):
+    """Load the MNIST oracle only when an MNIST checkpoint is among `metas`."""
+    if not any(m['task'] == 'image' for m in metas):
+        return None
+    if not Path(classifier_path).exists():
+        print(f"WARNING: no classifier at {classifier_path} — MNIST metrics will be skipped. "
+              f"Train one with: python -m utils.mnist_classifier")
+        return None
+    print(f"Loaded MNIST classifier from {classifier_path}")
+    return load_classifier(classifier_path, device=device)
+
+
+def write_csv(rows, output, fieldnames=None):
+    if not rows:
+        print("No rows produced.")
+        return
+    os.makedirs(os.path.dirname(str(output)) or '.', exist_ok=True)
+    if fieldnames is None:
+        fieldnames = sorted({k for r in rows for k in r.keys()})
+    with open(output, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\nWrote {len(rows)} rows to {output}")
 
 
 def main():
@@ -189,6 +252,8 @@ def main():
     parser.add_argument('--num_samples', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=100)
     parser.add_argument('--cfg_scale', type=float, default=3.0)
+    parser.add_argument('--eval_seed', type=int, default=0,
+                        help='Seed for the sampling noise, shared across all variants')
     parser.add_argument('--output', type=str, default='experiments/results/metrics.csv')
     args = parser.parse_args()
 
@@ -200,50 +265,27 @@ def main():
     if not ckpt_dir.exists():
         raise SystemExit(f"No checkpoint directory at {ckpt_dir}")
 
-    classifier = None
-    if Path(args.classifier_path).exists():
-        classifier = load_classifier(args.classifier_path, device=device)
-        print(f"Loaded MNIST classifier from {args.classifier_path}")
-    else:
-        print(f"WARNING: no classifier at {args.classifier_path} — MNIST metrics will be skipped. "
-              f"Train one with: python -m utils.mnist_classifier")
+    metas = list(discover_checkpoints(ckpt_dir))
+    classifier = load_classifier_if_needed(metas, args.classifier_path, device)
 
     rows = []
-    for meta in discover_checkpoints(ckpt_dir):
-        tag = (f"{'cond_' if meta['prefix'] else ''}{meta['task']}"
-               f"{meta['ot']}{meta['cfg']} (epoch {meta['epoch']})")
+    for meta in metas:
+        tag = f"{meta['task']} {variant_name(meta)} (epoch {meta['epoch']})"
         print(f"\n=== Evaluating {tag} ===")
         try:
-            if meta['task'] == 'pose':
-                row = evaluate_pose(meta, device,
-                                    num_samples=args.num_samples,
-                                    num_steps=args.num_steps,
-                                    cfg_scale=args.cfg_scale)
-            else:
-                if classifier is None:
-                    print("Skipping MNIST eval — no classifier available.")
-                    continue
-                row = evaluate_image(meta, device, classifier,
-                                     num_samples=args.num_samples,
-                                     num_steps=args.num_steps,
-                                     cfg_scale=args.cfg_scale)
+            row = evaluate(meta, device, classifier,
+                           num_samples=args.num_samples, num_steps=args.num_steps,
+                           cfg_scale=args.cfg_scale, eval_seed=args.eval_seed)
         except Exception as e:
             print(f"ERROR evaluating {tag}: {e}")
+            continue
+        if row is None:
+            print("Skipping MNIST eval — no classifier available.")
             continue
         rows.append(row)
         print({k: v for k, v in row.items() if v is not None})
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
-    if not rows:
-        print("No rows produced.")
-        return
-    fieldnames = sorted({k for r in rows for k in r.keys()})
-    with open(args.output, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-    print(f"\nWrote {len(rows)} rows to {args.output}")
+    write_csv(rows, args.output)
 
 
 if __name__ == '__main__':

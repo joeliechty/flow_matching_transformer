@@ -142,6 +142,22 @@ def generate_interpolated_poses(start_poses, goal_poses, n_steps=10):
     return generate_interpolated_states(start_poses, goal_poses, n_steps=n_steps, manifold='se3')
 
 
+def _build_cond_mask(batch_size, num_tokens, use_cfg, device):
+    """[batch, M] bool mask; True = replace that obs token with the null token.
+
+    Each token is dropped independently with p=0.1; with CFG, whole samples are also
+    dropped (unconditional) with p=0.1.
+    """
+    indep_mask = torch.rand(batch_size, num_tokens, device=device) < 0.1
+    if use_cfg:
+        uncond_mask = torch.rand(batch_size, device=device) < 0.1
+        return indep_mask | uncond_mask.unsqueeze(-1)
+    # Without CFG, per-token dropout must never blank a whole sample: with a single obs
+    # token (MNIST) it otherwise *is* unconditional dropout, and NOCFG would still learn
+    # the null branch.
+    return indep_mask & ~indep_mask.all(dim=-1, keepdim=True)
+
+
 def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
                             state_dim, vel_dim, manifold, use_ot, use_cfg, device,
                             time_sampling='grid', ot_mode='per_frame', scheduler=None):
@@ -182,13 +198,7 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
         v_target = diff                                                   # [B, S, D]
 
         if obs is not None:
-            M = obs.shape[1]
-            indep_mask = torch.rand(B, M, device=device) < 0.1
-            if use_cfg:
-                uncond_mask = torch.rand(B, device=device) < 0.1
-                cond_mask = indep_mask | uncond_mask.unsqueeze(-1)
-            else:
-                cond_mask = indep_mask
+            cond_mask = _build_cond_mask(B, obs.shape[1], use_cfg, device)
         else:
             cond_mask = None
     elif time_sampling == 'grid':
@@ -211,13 +221,7 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
 
         if obs is not None:
             obs = obs.repeat_interleave(n_steps, dim=0)
-            B_steps, M, _ = obs.shape
-            indep_mask = torch.rand(B_steps, M, device=device) < 0.1
-            if use_cfg:
-                uncond_mask = torch.rand(B_steps, device=device) < 0.1
-                cond_mask = indep_mask | uncond_mask.unsqueeze(-1)
-            else:
-                cond_mask = indep_mask
+            cond_mask = _build_cond_mask(obs.shape[0], obs.shape[1], use_cfg, device)
         else:
             cond_mask = None
     else:

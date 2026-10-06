@@ -2,13 +2,13 @@
 
 Layout pushed to the hub:
 
-  /pose/*.pt + *.yaml        (6 pose checkpoints + configs)
-  /mnist/*.pt + *.yaml       (6 MNIST checkpoints + configs)
-  /classifier/mnist_cnn.pt   (evaluation oracle)
-  /results/metrics.csv       (main ablation table)
-  /results/cfg_sweep.csv     (CFG-scale sweep)
-  /results/*.png             (sample grids, sweep plot)
-  README.md                  (rendered model card)
+  /pose/seed_<N>/*.pt + *.yaml     (6 pose checkpoints + configs per seed)
+  /mnist/seed_<N>/*.pt + *.yaml    (6 MNIST checkpoints + configs per seed)
+  /classifier/mnist_cnn.pt         (evaluation oracle)
+  /results/<task>/*_summary.csv    (mean ± std over seeds: metrics, CFG + steps sweeps)
+  /results/<task>/*.png            (sweep plots)
+  /results/<task>/seed_<N>/        (per-seed CSVs and sample grids)
+  README.md                        (rendered model card)
 
 Authentication: run `huggingface-cli login` first, or pass --token. Use
 --dry-run to print the staged tree without uploading.
@@ -25,6 +25,8 @@ import csv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from experiments.aggregate_seeds import METRICS
+
 
 # Mirror the ckpt-name regex from experiments/evaluate_all.py.
 _CKPT_RE = re.compile(
@@ -35,81 +37,75 @@ _CKPT_RE = re.compile(
 
 def stage_artifacts(checkpoint_dir: Path, results_dir: Path,
                     classifier_path: Path, stage_dir: Path):
-    """Copy the latest-epoch checkpoint of each variant + supporting files into stage_dir."""
+    """Copy the latest-epoch checkpoint of each variant, for every seed, plus supporting
+    files into stage_dir, mirroring the local checkpoints/<task>/seed_<N>/ layout."""
     if stage_dir.exists():
         shutil.rmtree(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
-    (stage_dir / 'pose').mkdir()
-    (stage_dir / 'mnist').mkdir()
     (stage_dir / 'classifier').mkdir()
-    (stage_dir / 'results').mkdir()
 
-    # Group by ablation key, keep latest epoch.
-    latest = {}
-    for path in sorted(checkpoint_dir.glob("*.pt")):
-        m = _CKPT_RE.match(path.name)
-        if not m:
-            continue
-        key = (m['prefix'], m['task'], m['ot'], m['cfg'])
-        epoch = int(m['epoch'])
-        if key not in latest or epoch > latest[key][1]:
-            latest[key] = (path, epoch)
+    for task in ('pose', 'mnist'):
+        for seed_dir in sorted((checkpoint_dir / task).glob('seed_*')):
+            # Group by ablation key, keep latest epoch.
+            latest = {}
+            for path in sorted(seed_dir.glob("*.pt")):
+                m = _CKPT_RE.match(path.name)
+                if not m:
+                    continue
+                key = (m['prefix'], m['task'], m['ot'], m['cfg'])
+                epoch = int(m['epoch'])
+                if key not in latest or epoch > latest[key][1]:
+                    latest[key] = (path, epoch)
 
-    for (path, _epoch) in latest.values():
-        m = _CKPT_RE.match(path.name)
-        subdir = 'mnist' if m['task'] == 'image' else 'pose'
-        dst = stage_dir / subdir / path.name
-        shutil.copy2(path, dst)
-        # Pair the .yaml config (filename has no _epoch suffix).
-        stem = path.name.split("_epoch_")[0]
-        config_src = path.parent / f"{stem}_training_config.yaml"
-        if config_src.exists():
-            shutil.copy2(config_src, stage_dir / subdir / config_src.name)
+            dst_dir = stage_dir / task / seed_dir.name
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            for (path, _epoch) in latest.values():
+                shutil.copy2(path, dst_dir / path.name)
+                # Pair the .yaml config (filename has no _epoch suffix).
+                stem = path.name.split("_epoch_")[0]
+                config_src = path.parent / f"{stem}_training_config.yaml"
+                if config_src.exists():
+                    shutil.copy2(config_src, dst_dir / config_src.name)
 
     if classifier_path.exists():
         shutil.copy2(classifier_path, stage_dir / 'classifier' / classifier_path.name)
 
     if results_dir.exists():
-        for item in results_dir.iterdir():
-            if item.is_file():
-                shutil.copy2(item, stage_dir / 'results' / item.name)
+        shutil.copytree(results_dir, stage_dir / 'results', dirs_exist_ok=True)
 
     return stage_dir
 
 
-def _format_metric(v):
-    if v is None or v == '':
-        return ''
-    try:
-        return f"{float(v):.4f}"
-    except (TypeError, ValueError):
-        return str(v)
-
-
-def _render_metrics_table(metrics_csv: Path):
-    if not metrics_csv.exists():
-        return "(metrics.csv not found — run experiments/evaluate_all.py first)\n"
-    with open(metrics_csv) as f:
-        rows = list(csv.DictReader(f))
+def _render_metrics_table(results_dir: Path):
+    rows = []
+    for task in ('pose', 'mnist'):
+        summary = results_dir / task / 'metrics_summary.csv'
+        if summary.exists():
+            with open(summary) as f:
+                rows.extend(csv.DictReader(f))
     if not rows:
-        return "(metrics.csv is empty)\n"
-    headers = ['task', 'conditional', 'ot', 'cfg', 'epoch',
-               'mode_accuracy', 'mode_coverage_kl',
-               'class_accuracy', 'class_marginal_kl']
+        return ("(no metrics_summary.csv found — run ./pose_ablations.sh eval and "
+                "./mnist_ablations.sh eval first)\n")
+    metrics = [m for m in METRICS if any(r.get(f'{m}_mean') for r in rows)]
+    headers = ['task', 'variant', 'n_seeds'] + metrics
     lines = ['| ' + ' | '.join(headers) + ' |',
              '| ' + ' | '.join(['---'] * len(headers)) + ' |']
     for r in rows:
-        lines.append('| ' + ' | '.join(_format_metric(r.get(h, '')) for h in headers) + ' |')
+        cells = [r['task'], r['variant'], r['n_seeds']]
+        for m in metrics:
+            mean, std = r.get(f'{m}_mean'), r.get(f'{m}_std')
+            cells.append(f"{float(mean):.4f} ± {float(std):.4f}" if mean else '')
+        lines.append('| ' + ' | '.join(cells) + ' |')
     return '\n'.join(lines) + '\n'
 
 
-def render_model_card(template_path: Path, metrics_csv: Path, output: Path,
+def render_model_card(template_path: Path, results_dir: Path, output: Path,
                       repo_id: str, github_url: str):
     template = template_path.read_text()
     rendered = (template
                 .replace('{{REPO_ID}}', repo_id)
                 .replace('{{GITHUB_URL}}', github_url)
-                .replace('{{METRICS_TABLE}}', _render_metrics_table(metrics_csv)))
+                .replace('{{METRICS_TABLE}}', _render_metrics_table(results_dir)))
     output.write_text(rendered)
     print(f"Rendered model card to {output}")
 
@@ -149,7 +145,7 @@ def main():
         Path(args.classifier_path), stage_dir,
     )
     render_model_card(
-        Path(args.template), Path(args.results_dir) / 'metrics.csv',
+        Path(args.template), Path(args.results_dir),
         stage_dir / 'README.md',
         repo_id=args.repo_id, github_url=args.github_url,
     )

@@ -91,6 +91,20 @@ def pose_mode_coverage_kl(sample_poses: torch.Tensor,
     return kl, counts
 
 
+def pose_mode_distance(sample_poses: torch.Tensor,
+                       mode_poses: torch.Tensor,
+                       target_mode_idx: torch.Tensor = None) -> float:
+    """Mean twist-space distance from each sample to its target mode (or to its nearest
+    mode when no target is given). Lower is better. Unlike mode accuracy it keeps
+    resolving differences once every sample lands in the right basin.
+    """
+    dist = _twist_distance_matrix(sample_poses, mode_poses)  # [N, K]
+    if target_mode_idx is None:
+        return dist.min(dim=-1).values.mean().item()
+    idx = target_mode_idx.to(dist.device).view(-1, 1)
+    return dist.gather(1, idx).mean().item()
+
+
 # -- MNIST metrics ------------------------------------------------------------
 
 @torch.no_grad()

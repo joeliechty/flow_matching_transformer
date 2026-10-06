@@ -1,8 +1,10 @@
-"""Sweep `cfg_scale` at inference time for every CFG-trained conditional model.
+"""Sweep the number of ODE integration steps used at sampling time.
 
-Produces the classic CFG quality/diversity tradeoff curve. Reuses the metric
-functions from `utils.eval_utils` and the per-task evaluators from
-`experiments.evaluate_all`. Output: experiments/results/cfg_sweep.csv
+Fewer steps = a coarser Euler discretisation of each sampling path. OT pairing is
+meant to straighten the learned paths, so OT variants should lose less quality as
+the step count shrinks. Every model in the directory is swept; CFG variants are
+sampled at --cfg_scale and NOCFG variants unguided (see `effective_cfg_scale`).
+Output: experiments/results/steps_sweep.csv
 """
 import argparse
 import sys
@@ -18,7 +20,9 @@ from experiments.evaluate_all import (
 )
 
 
-DEFAULT_SWEEP = (1.0, 1.5, 2.0, 3.0, 5.0, 7.0)
+# Pose training only ever shows the model t = k/9 (a 10-point linspace grid), so 1, 3
+# and 9 steps query trained time values only; the other counts interpolate in t.
+DEFAULT_STEPS = (1, 2, 3, 5, 9, 20, 50, 100)
 
 
 def main():
@@ -26,30 +30,28 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints/')
     parser.add_argument('--classifier_path', type=str, default='eval_assets/mnist_cnn.pt')
     parser.add_argument('--num_samples', type=int, default=256)
-    parser.add_argument('--num_steps', type=int, default=100)
-    parser.add_argument('--scales', type=float, nargs='+', default=list(DEFAULT_SWEEP))
+    parser.add_argument('--cfg_scale', type=float, default=3.0)
+    parser.add_argument('--steps', type=int, nargs='+', default=list(DEFAULT_STEPS))
     parser.add_argument('--eval_seed', type=int, default=0)
-    parser.add_argument('--output', type=str, default='experiments/results/cfg_sweep.csv')
+    parser.add_argument('--output', type=str, default='experiments/results/steps_sweep.csv')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available()
                           else 'mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # CFG sweep only meaningful for conditional CFG-trained models.
-    metas = [m for m in discover_checkpoints(Path(args.checkpoint_dir))
-             if m['prefix'] == 'cond_' and m['cfg'] == '_CFG']
+    metas = list(discover_checkpoints(Path(args.checkpoint_dir)))
     classifier = load_classifier_if_needed(metas, args.classifier_path, device)
 
     rows = []
     for meta in metas:
-        for scale in args.scales:
-            tag = f"{meta['task']} {variant_name(meta)} @ cfg_scale={scale}"
+        for steps in args.steps:
+            tag = f"{meta['task']} {variant_name(meta)} @ num_steps={steps}"
             print(f"\n=== {tag} ===")
             try:
                 row = evaluate(meta, device, classifier,
-                               num_samples=args.num_samples, num_steps=args.num_steps,
-                               cfg_scale=scale, eval_seed=args.eval_seed)
+                               num_samples=args.num_samples, num_steps=steps,
+                               cfg_scale=args.cfg_scale, eval_seed=args.eval_seed)
             except Exception as e:
                 print(f"ERROR evaluating {tag}: {e}")
                 continue

@@ -20,6 +20,7 @@ checkpoints/
 # experiment outputs and eval artifacts
 experiments/results/
 eval_assets/
+huggingface/_stage/
 
 # images
 *.png
