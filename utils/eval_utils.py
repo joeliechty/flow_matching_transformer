@@ -20,19 +20,8 @@ from utils.tf_utils import (_quat_to_rot_mat, _rot_mat_to_quat, compute_twist_be
 
 
 # -- pose mode bookkeeping ----------------------------------------------------
-
-# Index → name. Must match the goal_dist_params order in pose_gen_trainer.py:34-48.
-MODE_NAMES = ("top_right", "bottom_right", "top_left", "bottom_left")
-
-# (top/bottom, left/right) → mode index, matching the action_dist_params layout
-# in pose_gen_trainer.py:56-64.
-ACTION_TO_MODE = {
-    ("top", "right"): 0,
-    ("bottom", "right"): 1,
-    ("top", "left"): 2,
-    ("bottom", "left"): 3,
-}
-
+# Modes and the conditions that name them come from the task (`utils.pose_task`); here a
+# mode is just its index into the training config's goal_dist_params.
 
 def goal_mode_poses_from_config(goal_dist_params, device='cpu') -> torch.Tensor:
     """Convert the K goal modes (stored as twist means in the config) to quaternion poses [K, 7].
@@ -42,14 +31,6 @@ def goal_mode_poses_from_config(goal_dist_params, device='cpu') -> torch.Tensor:
     mus = torch.tensor(goal_dist_params['mu'], device=device, dtype=torch.float32)
     mode_twists = mus.squeeze(1) if mus.dim() == 3 else mus  # [K, 6]
     return convert_twist_to_pose(mode_twists, dt=1.0, return_representation='quat')  # [K, 7]
-
-
-def actions_to_mode_indices(action_pairs) -> torch.Tensor:
-    """Map a list of (vertical, horizontal) action token pairs to mode indices.
-
-    `action_pairs`: iterable of 2-tuples like ('top', 'right'). Returns a LongTensor [N].
-    """
-    return torch.tensor([ACTION_TO_MODE[tuple(p)] for p in action_pairs], dtype=torch.long)
 
 
 # -- core twist-space distance ------------------------------------------------

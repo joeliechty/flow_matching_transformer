@@ -5,12 +5,17 @@
 #
 #   ./pose_ablations.sh [train|eval|all]        (default: all)
 #
+# The task (goal modes and conditioning tokens) comes from TASK_CONFIG, a file in
+# configs/pose_tasks/. Each task gets its own folders, <dir> below: the original
+# four_corners task keeps the historical "pose"; any other task <name> uses "pose_<name>".
+#
 # Layout:
-#   checkpoints/pose/seed_<N>/                     checkpoints (every 10 epochs), configs, logs
-#   experiments/results/pose/epoch_<E>/seed_<N>/   metrics, CFG + sampling-steps sweeps, grids
-#   experiments/results/pose/epoch_<E>/            *_summary.csv + plots, mean ± std over seeds
+#   checkpoints/<dir>/seed_<N>/                     checkpoints (every 10 epochs), configs, logs
+#   experiments/results/<dir>/epoch_<E>/seed_<N>/   metrics, CFG + sampling-steps sweeps, grids
+#   experiments/results/<dir>/epoch_<E>/            *_summary.csv + plots, mean ± std over seeds
 #
 # Env overrides: SEEDS="1 2 3 4 5" JOBS=6 EPOCHS=100 PYTHON=python
+#                TASK_CONFIG=configs/pose_tasks/four_corners.yaml
 #                EVAL_EPOCH=<EPOCHS>  evaluate the checkpoints saved at this epoch
 #                CKPT_ROOT, RESULTS_ROOT (relative to the repo root), FMT_REPO_ROOT
 # JOBS=6 measured best on an RTX 4090 (~2.7x sequential throughput; 12 barely helps).
@@ -29,8 +34,11 @@ export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${FMT_REPO_ROOT:-$SCRIPT_DIR}"
-CKPT_ROOT="${CKPT_ROOT:-checkpoints/pose}"
-RESULTS_ROOT="${RESULTS_ROOT:-experiments/results/pose/epoch_$EVAL_EPOCH}"
+TASK_CONFIG="${TASK_CONFIG:-configs/pose_tasks/four_corners.yaml}"
+TASK="$(basename "$TASK_CONFIG" .yaml)"
+if [[ "$TASK" == four_corners ]]; then TASK_DIR=pose; else TASK_DIR="pose_$TASK"; fi
+CKPT_ROOT="${CKPT_ROOT:-checkpoints/$TASK_DIR}"
+RESULTS_ROOT="${RESULTS_ROOT:-experiments/results/$TASK_DIR/epoch_$EVAL_EPOCH}"
 
 case "$STAGE" in
   train|eval|all) ;;
@@ -48,6 +56,11 @@ if [[ ! -f "$REPO_ROOT/pose_gen_trainer.py" ]]; then
   exit 1
 fi
 cd "$REPO_ROOT"
+
+if [[ ! -f "$TASK_CONFIG" ]]; then
+  echo "ERROR: no task file at $TASK_CONFIG" >&2
+  exit 1
+fi
 
 if ! "$PYTHON" -c 'import torch' 2>/dev/null; then
   echo "ERROR: '$PYTHON' can't import torch — run 'conda activate FmT' or set PYTHON=" >&2
@@ -70,7 +83,8 @@ train_one() {  # <seed> <checkpoint name> [trainer flags...]
   local seed=$1 name=$2; shift 2
   local dir="$CKPT_ROOT/seed_$seed" start=$SECONDS
   if "$PYTHON" pose_gen_trainer.py "$@" --num_epochs "$EPOCHS" --batch_size "$BATCH" \
-       --seed "$seed" --save_path "$dir/" > "$dir/${name}_console.txt" 2>&1; then
+       --seed "$seed" --task_config "$TASK_CONFIG" --save_path "$dir/" \
+       > "$dir/${name}_console.txt" 2>&1; then
     echo "  done    seed $seed  $name  ($(( SECONDS - start ))s)"
   else
     echo "  FAILED  seed $seed  $name — see $dir/${name}_console.txt" >&2
@@ -79,7 +93,7 @@ train_one() {  # <seed> <checkpoint name> [trainer flags...]
 }
 
 train_stage() {
-  echo "=== Training pose ablations: seeds [$SEEDS], $EPOCHS epochs, $JOBS at a time ==="
+  echo "=== Training pose ablations ($TASK): seeds [$SEEDS], $EPOCHS epochs, $JOBS at a time ==="
   local running=0 failed=0 seed entry name flags
   for seed in $SEEDS; do
     mkdir -p "$CKPT_ROOT/seed_$seed"
@@ -109,7 +123,7 @@ train_stage() {
 }
 
 eval_stage() {
-  echo "=== Evaluating pose ablations: seeds [$SEEDS], epoch-$EVAL_EPOCH checkpoints ==="
+  echo "=== Evaluating pose ablations ($TASK): seeds [$SEEDS], epoch-$EVAL_EPOCH checkpoints ==="
   local seed ckpt out
   for seed in $SEEDS; do
     ckpt="$CKPT_ROOT/seed_$seed"; out="$RESULTS_ROOT/seed_$seed"

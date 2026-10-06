@@ -21,10 +21,8 @@ import matplotlib.pyplot as plt
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from experiments.evaluate_all import ACTION_PAIRS, discover_checkpoints, effective_cfg_scale
-from pose_gen_inference import (
-    build_obs_from_actions, generate_from_distribution, load_model as load_pose_model,
-)
+from experiments.evaluate_all import discover_checkpoints, effective_cfg_scale, task_conditions_for
+from pose_gen_inference import generate_from_distribution, load_model as load_pose_model
 from image_gen_inference import (
     build_obs_from_digit, generate_from_noise, load_model as load_image_model,
 )
@@ -59,8 +57,8 @@ def _image_variants(ckpt_dir, epoch=None):
 
 def make_pose_grid(ckpt_dir: Path, output: Path, device, num_samples=5,
                    num_steps=50, cfg_scale=3.0, epoch=None):
-    """For each of the 4 conditional-pose variants, sample one trajectory per mode
-    and stitch into a 2x2 figure of 3D trajectory plots."""
+    """For each of the 4 conditional-pose variants, sample trajectories for every condition
+    of the task and stitch into a 2x2 figure of 3D trajectory plots."""
     variants = _pose_variants(ckpt_dir, epoch)
     ordered = [('OT_CFG', 'Full (OT + CFG)'), ('OT_NOCFG', 'No CFG'),
                ('NOOT_CFG', 'No OT'), ('NOOT_NOCFG', 'Baseline (no OT, no CFG)')]
@@ -81,10 +79,10 @@ def make_pose_grid(ckpt_dir: Path, output: Path, device, num_samples=5,
         start_dist_flat = {'mu': start_dist['mu'][0], 'sigma': start_dist['sigma'][0]}
 
         all_traj = []
-        for action_pair in ACTION_PAIRS:
-            obs = build_obs_from_actions(list(action_pair), num_samples, device)
+        full_conditions, _ = task_conditions_for(config)
+        for cond in full_conditions:
             _, traj = generate_from_distribution(
-                model, start_dist_flat, batch_size=num_samples, obs=obs,
+                model, start_dist_flat, batch_size=num_samples, obs=cond.obs(num_samples, device),
                 num_steps=num_steps, return_trajectory=True,
                 cfg_scale=effective_cfg_scale(meta, cfg_scale), device=device,
             )

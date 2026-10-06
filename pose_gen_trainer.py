@@ -8,6 +8,10 @@ from models.flow_matching_transformer import FlowMatchingTransformerModel
 from utils.train_utils import generate_interpolated_poses, train
 from omegaconf import OmegaConf
 from utils.logging_utils import _Tee, git_commit
+from utils.pose_task import load_pose_task
+
+DEFAULT_TASK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'configs', 'pose_tasks', 'four_corners.yaml')
 
 def parse_args():
     import argparse
@@ -22,6 +26,8 @@ def parse_args():
     parser.add_argument('--no_ot', '-NOOT', action='store_true', help='Disable optimal transport pairing during training')
     parser.add_argument('--no_cfg', '-NOCFG', action='store_true', help='Disable classifier-free guidance (no unconditional dropout during training)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for torch/numpy/random (for reproducible ablations)')
+    parser.add_argument('--task_config', type=str, default=DEFAULT_TASK,
+                        help='Pose task file: start/goal distributions and conditioning tokens')
     args = parser.parse_args()
     return args
 
@@ -34,45 +40,16 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 def generate_training_and_model_config(args, start_dist_params=None, goal_dist_params=None, action_dist_params=None):
-    # Define distribution parameters (twist representation)
+    # Distribution parameters (twist representation) come from the task file unless given.
+    task = load_pose_task(args.task_config)
+    task_name, mode_names = ((task['name'], task['mode_names']) if goal_dist_params is None
+                             else ('custom', None))
     if start_dist_params is None:
-        start_dist_params = {
-            'mu': [[0, 0, 0, 0, 0, 0]],
-            'sigma': [[1, 1, 1, 1, 1, 1]]
-        }
-    
-    # goal pos at (5,5,5) with 90 deg rotation around z axis (twist representation)
+        start_dist_params = task['start_dist_params']
     if goal_dist_params is None:
-        goal_dist_params = {
-            'mu': [
-                [[5, 5, 5, 0, 0, 1.5708]],    # Top-right with 90 deg rotation
-                [[5, 5, -5, 0, 0, -1.5708]],  # Bottom-right with -90 deg rotation
-                [[5, -5, 5, 0, 0, 3.14159]],  # Top-left with 180 deg rotation
-                [[5, -5, -5, 0, 0, 3.14159]]  # Bottom-left with 180 deg rotation
-                   ],
-            'sigma': [
-                [[0.1, 0.1, 0.1, 0.1, 0.1, 0.1]],
-                [[0.1, 0.1, 0.1, 0.1, 0.1, 0.1]],
-                [[0.1, 0.1, 0.1, 0.1, 0.1, 0.1]],
-                [[0.1, 0.1, 0.1, 0.1, 0.1, 0.1]]
-                      ]
-        }
-
-    if args.conditional:
-        if action_dist_params is None:
-            # the "go up" twist and the "go down" twist
-            t_v, b_v = [0, 0, 1, 0, 0, 0], [0, 0, -1, 0, 0, 0]
-            r_v, l_v = [0, 1, 0, 0, 0, 0], [0, -1, 0, 0, 0, 0]
-
-            action_dist_params = {
-                'mu': [
-                    [t_v, r_v], # TR matches goal index 0 (Top-right)
-                    [b_v, r_v], # BR matches goal index 1 (Bottom-right)
-                    [t_v, l_v], # TL matches goal index 2 (Top-left)
-                    [b_v, l_v]  # BL matches goal index 3 (Bottom-left)
-                ],
-                'sigma': [[[0.0]*6, [0.0]*6]] * 4
-            }
+        goal_dist_params = task['goal_dist_params']
+    if args.conditional and action_dist_params is None:
+        action_dist_params = task['action_dist_params']
 
     if args.batch_size is None:
         batch_size = len(goal_dist_params['mu'])*32
@@ -83,7 +60,7 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
     cfg_suffix = '_NOCFG' if args.no_cfg else '_CFG'
     if args.conditional:
         save_path = os.path.join(args.save_path, f'cond_pose_flow_matching_model{ot_suffix}{cfg_suffix}')
-        obs_dim = 6  # action representation (vx, vy, vz, wx, wy, wz)
+        obs_dim = len(action_dist_params['mu'][0][0])  # action token size (6 for twist actions)
     else:
         save_path = os.path.join(args.save_path, f'pose_flow_matching_model{ot_suffix}{cfg_suffix}')
         obs_dim = None
@@ -95,6 +72,8 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         'use_cfg': not args.no_cfg,
         'seed': args.seed,
         'git_commit': git_commit(),
+        'task': task_name,
+        'mode_names': mode_names,
         'num_epochs': args.num_epochs,
         'num_batches_per_epoch': args.num_batches_per_epoch,
         'batch_size': batch_size,

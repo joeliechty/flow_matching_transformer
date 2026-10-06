@@ -1,0 +1,39 @@
+# The original 4-mode pose task (the "easy" baseline): goal poses at the four corners
+# (5, ±5, ±5), 10 units apart with sigma = 0.1, each named by a (vertical, horizontal)
+# pair of action tokens. All vectors are twists (vx, vy, vz, wx, wy, wz).
+#
+# Format (see utils/pose_task.py):
+#   start:  Gaussian start distribution {mu, sigma} (sigma may be a scalar)
+#   tokens: conditioning vocabulary, name -> action twist
+#   modes:  goal modes; each a Gaussian {mu, sigma} named by a list of tokens. Modes that
+#           share a token list form one multimodal condition.
+#   token_sigma: optional noise on the action tokens during training (default 0)
+name: four_corners
+
+start:
+  mu: [0, 0, 0, 0, 0, 0]
+  sigma: [1, 1, 1, 1, 1, 1]
+
+tokens:
+  top:    [0, 0, 1, 0, 0, 0]
+  bottom: [0, 0, -1, 0, 0, 0]
+  right:  [0, 1, 0, 0, 0, 0]
+  left:   [0, -1, 0, 0, 0, 0]
+
+modes:
+  - name: top_right       # 90 deg about z
+    tokens: [top, right]
+    mu: [5, 5, 5, 0, 0, 1.5708]
+    sigma: 0.1
+  - name: bottom_right    # -90 deg about z
+    tokens: [bottom, right]
+    mu: [5, 5, -5, 0, 0, -1.5708]
+    sigma: 0.1
+  - name: top_left        # 180 deg about z
+    tokens: [top, left]
+    mu: [5, -5, 5, 0, 0, 3.14159]
+    sigma: 0.1
+  - name: bottom_left     # 180 deg about z
+    tokens: [bottom, left]
+    mu: [5, -5, -5, 0, 0, 3.14159]
+    sigma: 0.1

@@ -39,6 +39,7 @@ METRICS = {
     'partial_validity': ('One-token condition: valid-mode rate', 'higher is better'),
     'partial_balance_kl': ('One-token condition: imbalance KL', 'lower is better; 0 = 50/50'),
     'partial_energy_distance': ('One-token condition: energy distance', 'lower is better'),
+    'condition_balance_kl': ('Multimodal condition: imbalance KL', 'lower is better; 0 = even'),
     'class_accuracy': ('Class accuracy', 'higher is better'),
     'class_marginal_kl': ('Class marginal KL', 'lower is better'),
 }
