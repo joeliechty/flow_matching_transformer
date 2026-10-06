@@ -130,13 +130,35 @@ def sample_goal_poses(goal_dist_params, n_per_mode, seed, device='cpu'):
     Uses its own generator, so the global RNG (and with it the model-sampling noise) is
     untouched. Returns poses [K * n_per_mode, 7] and their mode indices [K * n_per_mode].
     """
-    mu = torch.tensor(goal_dist_params['mu'], dtype=torch.float32).reshape(-1, 6)
-    sigma = torch.tensor(goal_dist_params['sigma'], dtype=torch.float32).reshape(-1, 6)
+    mu, sigma = _goal_params(goal_dist_params)
     K = mu.shape[0]
     eps = torch.randn(K, n_per_mode, 6, generator=torch.Generator().manual_seed(seed))
     twists = (mu[:, None] + sigma[:, None] * eps).reshape(-1, 6)
     poses = convert_twist_to_pose(twists, dt=1.0, return_representation='quat')
     return poses.to(device), torch.arange(K).repeat_interleave(n_per_mode).to(device)
+
+
+def sample_goal_mixture(goal_dist_params, n, seed, modes=None, device='cpu'):
+    """`n` real goal poses, each from a mode drawn uniformly from `modes` (default: all).
+
+    The split across modes is random, as from a perfect sampler, rather than exactly
+    balanced, so balance/coverage KLs get their true sampling-noise floor. Own generator,
+    as in `sample_goal_poses`. Returns poses [n, 7] and mode indices [n].
+    """
+    mu, sigma = _goal_params(goal_dist_params)
+    gen = torch.Generator().manual_seed(seed)
+    modes = torch.arange(mu.shape[0]) if modes is None else torch.as_tensor(modes).cpu()
+    idx = modes[torch.randint(len(modes), (n,), generator=gen)]
+    twists = mu[idx] + sigma[idx] * torch.randn(n, 6, generator=gen)
+    poses = convert_twist_to_pose(twists, dt=1.0, return_representation='quat')
+    return poses.to(device), idx.to(device)
+
+
+def _goal_params(goal_dist_params):
+    """Per-mode twist mean and std, [K, 6] each (seq_len = 1)."""
+    mu = torch.tensor(goal_dist_params['mu'], dtype=torch.float32).reshape(-1, 6)
+    sigma = torch.tensor(goal_dist_params['sigma'], dtype=torch.float32).reshape(-1, 6)
+    return mu, sigma
 
 
 def _pose_parts(poses):

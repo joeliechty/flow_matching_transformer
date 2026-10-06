@@ -37,6 +37,7 @@ from utils.eval_utils import (
     pose_mode_accuracy,
     pose_mode_coverage_kl,
     pose_mode_distance,
+    sample_goal_mixture,
     sample_goal_poses,
 )
 from utils.logging_utils import git_commit
@@ -252,8 +253,10 @@ def evaluate_pose_reference(config_path, epoch, device, num_samples=256):
     K = mode_poses.shape[0]
     ref, ref_idx = sample_goal_poses(goal_dist, REF_PER_MODE, REF_SEED, device)
     samples, targets = sample_goal_poses(goal_dist, num_samples // K, DATA_SEED, device)
+    # Coverage of an unconditional perfect sampler: modes drawn at random, not 64 each.
+    mixture, _ = sample_goal_mixture(goal_dist, num_samples, DATA_SEED + 100, device=device)
 
-    kl, counts = pose_mode_coverage_kl(samples, mode_poses)
+    kl, counts = pose_mode_coverage_kl(mixture, mode_poses)
     row = {
         'task': 'pose', 'variant': 'data', 'epoch': epoch, 'num_samples': samples.shape[0],
         'mode_accuracy': pose_mode_accuracy(samples, targets, mode_poses),
@@ -261,13 +264,10 @@ def evaluate_pose_reference(config_path, epoch, device, num_samples=256):
         'mode_coverage_kl': kl, 'per_mode_counts': dict(counts), 'git_commit': _commit(),
     }
     row.update(_distribution_metrics(samples, targets, mode_poses, ref, ref_idx))
-    # One-token conditions: a perfect sampler splits evenly between the two valid modes.
-    partial = []
-    for i, (pair, masked) in enumerate(PARTIAL_CONDITIONS):
-        valid = torch.tensor(_partial_valid_modes(pair, masked), device=device)
-        pool, pool_idx = sample_goal_poses(goal_dist, num_samples // K // len(valid),
-                                           DATA_SEED + 1 + i, device)
-        partial.append(pool[torch.isin(pool_idx, valid)])
+    # One-token conditions: a perfect sampler picks either valid mode with probability 1/2.
+    partial = [sample_goal_mixture(goal_dist, num_samples // K, DATA_SEED + 1 + i,
+                                   modes=_partial_valid_modes(pair, masked), device=device)[0]
+               for i, (pair, masked) in enumerate(PARTIAL_CONDITIONS)]
     row.update(_partial_metrics(partial, mode_poses, ref, ref_idx))
     return row
 

@@ -10,7 +10,7 @@ import torch
 from utils.eval_utils import (_rotvec, energy_distance, goal_mode_poses_from_config,
                               mode_balance_kl, nearest_mode_indices, path_straightness,
                               per_mode_energy_distance, pose_bias_spread, pose_mode_distance,
-                              sample_goal_poses)
+                              sample_goal_mixture, sample_goal_poses)
 from utils.tf_utils import compute_twist_between_poses
 from utils.tf_utils import _quat_to_rot_mat, add_twist_to_pose, convert_twist_to_pose
 
@@ -122,6 +122,15 @@ class PathAndRotationTest(unittest.TestCase):
         lopsided = torch.tensor([0] * 60 + [2] * 4)
         self.assertLess(mode_balance_kl(balanced, [0, 2]), 1e-6)
         self.assertGreater(mode_balance_kl(lopsided, [0, 2]), 0.3)
+
+    def test_random_mixture_gives_the_balance_noise_floor(self):
+        # A perfect sampler's 50/50 split is random, so its balance KL is ~1/(2n), not 0.
+        kls = []
+        for seed in range(200):
+            _, idx = sample_goal_mixture(GOALS, 64, seed, modes=[0, 2])
+            self.assertTrue(set(idx.tolist()) <= {0, 2})
+            kls.append(mode_balance_kl(idx, [0, 2]))
+        self.assertAlmostEqual(sum(kls) / len(kls), 1 / 128, delta=0.003)
 
 
 if __name__ == '__main__':
