@@ -315,7 +315,8 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
         return model, checkpoint
     
     @torch.no_grad()
-    def inference(self, start_poses, obs=None, num_steps=100, return_trajectory=False, cfg_scale=3.0, manifold='se3'):
+    def inference(self, start_poses, obs=None, num_steps=100, return_trajectory=False, cfg_scale=3.0, manifold='se3',
+                  obs_mask=None):
         """
         Generate goal states from start states using the trained flow model.
 
@@ -324,6 +325,8 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
                 [batch, seq_len, 7]. For manifold='euclidean': noise samples
                 [batch, input_dim] or [batch, seq_len, input_dim].
             obs: observation tensor [batch, M, obs_dim]; if None, all tokens replaced with null
+            obs_mask: optional bool [batch, M]; True replaces that obs token with the null token,
+                e.g. to condition on a subset of the tokens. Ignored when obs is None.
             num_steps: number of ODE integration steps
             return_trajectory: if True, return full trajectory; if False, only final state
             cfg_scale: classifier-free guidance scale (if >1.0, amplifies the predicted vector field for more aggressive generation)
@@ -352,7 +355,10 @@ class ConditionalFlowMatchingTransformerModel(nn.Module):
             uncond_mask = cond_mask  # both passes identical; CFG is a no-op
         else:
             uncond_mask = torch.ones(B, obs.shape[1], dtype=torch.bool, device=device)
-            cond_mask = torch.zeros(B, obs.shape[1], dtype=torch.bool, device=device)
+            if obs_mask is None:
+                cond_mask = torch.zeros(B, obs.shape[1], dtype=torch.bool, device=device)
+            else:
+                cond_mask = obs_mask.to(device=device, dtype=torch.bool)
 
         if return_trajectory: trajectory = [x.clone()]
 

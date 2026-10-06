@@ -41,7 +41,8 @@ def load_model(checkpoint_path, device='cpu', model_config=None, conditional=Fal
 
     return model, checkpoint
 
-def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, return_trajectory=False, cfg_scale=3.0, device='cpu'):
+def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, return_trajectory=False, cfg_scale=3.0, device='cpu',
+                              obs_mask=None):
     """
     Generate goal poses from start poses using the trained model.
 
@@ -49,6 +50,7 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
         model: trained FlowMatchingTransformerModel (conditional or non-conditional)
         start_poses: start poses as twists [batch, 6] or quaternions [batch, 7]
         obs: observation conditioning tensor [batch, obs_dim] (required for conditional models)
+        obs_mask: optional bool [batch, M]; True replaces that obs token with the null token
         num_steps: number of ODE integration steps
         return_trajectory: if True, return full trajectory
         device: device to run on
@@ -81,7 +83,8 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
         # Generate goal poses
         try:
             if is_conditional:
-                result = model.inference(x0, obs, num_steps=num_steps, return_trajectory=return_trajectory, cfg_scale=cfg_scale)
+                result = model.inference(x0, obs, num_steps=num_steps, return_trajectory=return_trajectory, cfg_scale=cfg_scale,
+                                         obs_mask=obs_mask)
             else:
                 result = model.inference(x0, num_steps=num_steps, return_trajectory=return_trajectory)
         except Exception as e:
@@ -91,7 +94,7 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
     return result
 
 def generate_from_distribution(model, distribution_params, batch_size, obs=None, num_steps=100,
-                               return_trajectory=False, cfg_scale=3.0, device='cpu'):
+                               return_trajectory=False, cfg_scale=3.0, device='cpu', obs_mask=None):
     """
     Sample start poses from a distribution and generate goal poses.
 
@@ -100,6 +103,7 @@ def generate_from_distribution(model, distribution_params, batch_size, obs=None,
         distribution_params: dict with 'mu' and 'sigma' for twist distribution
         batch_size: number of samples to generate
         obs: tensor of observations
+        obs_mask: optional bool [batch, M]; True replaces that obs token with the null token
         num_steps: number of ODE integration steps
         return_trajectory: if True, return full trajectory
         device: device to run on
@@ -123,7 +127,8 @@ def generate_from_distribution(model, distribution_params, batch_size, obs=None,
     # Generate goal poses
     result = generate_from_start_poses(
         model, start_poses, obs, num_steps=num_steps,
-        return_trajectory=return_trajectory, cfg_scale=cfg_scale, device=device
+        return_trajectory=return_trajectory, cfg_scale=cfg_scale, device=device,
+        obs_mask=obs_mask,
     )
 
     if return_trajectory:
