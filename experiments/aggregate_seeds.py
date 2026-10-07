@@ -59,6 +59,12 @@ VARIANT_STYLE = {
     'cond_NOOT_NOCFG': ('cond · no OT, no CFG', '#eda100', '--'),
     'uncond_OT':       ('uncond · OT',          '#e87ba4', '-'),
     'uncond_NOOT':     ('uncond · no OT',       '#008300', '--'),
+    # continuous-condition pairings (all trained without CFG). C2OT takes OT's blue and random
+    # pairing no OT's orange; the rest follow the palette order. Dashed = baselines.
+    'cond_C2OT_NOCFG':    ('cond · C²OT',              '#2a78d6', '-'),
+    'cond_CLUSTER_NOCFG': ('cond · cluster (COT Policy)', '#1baf7a', '-'),
+    'cond_C2OTFIX_NOCFG': ('cond · fixed weight',      '#eda100', '-'),
+    'cond_GOT_NOCFG':     ('cond · global OT',         '#e87ba4', '--'),
 }
 _VARIANT_ORDER = list(VARIANT_STYLE)
 

@@ -4,10 +4,12 @@ Reads what ./pose_ablations.sh writes for each task (the eval stage at epoch 100
 stage and the training logs), samples the epoch-100 models for the per-sample figures, and
 writes the PNGs that ablations_summary.md embeds:
 
-    python experiments/summary_figures.py            # -> docs/ablations/
+    python experiments/summary_figures.py                    # Part 1 (discrete) -> docs/ablations/
+    python experiments/summary_figures.py --part continuous  # Part 2 (continuous conditions)
 
-Colour = OT (blue) or no OT (orange); dashed lines / open markers = CFG-trained models sampled
-at guidance 3; grey = real data.
+Part 1: colour = OT (blue) or no OT (orange); dashed lines / open markers = CFG-trained models
+sampled at guidance 3; grey = real data. Part 2: one colour and marker per pairing
+(`PAIRING_STYLE`); dashed = baselines.
 """
 import argparse
 import ast
@@ -25,10 +27,15 @@ from omegaconf import OmegaConf
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from pose_gen_inference import _generate, _load_run, _run_config, _sample_start_poses  # noqa: E402
+from experiments.evaluate_all import _eval_obs, _token_sigma  # noqa: E402
+from experiments.evaluate_toys import NOISE_SEED, SEED_A, generate_euler  # noqa: E402
+from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel  # noqa: E402
+from pose_gen_inference import (_generate, _load_run, _run_config, _sample_start_poses,  # noqa: E402
+                                generate_from_start_poses)
 from utils.eval_utils import _rotvec, goal_mode_poses_from_config, sample_goal_mixture  # noqa: E402
-from utils.pose_task import task_conditions  # noqa: E402
-from utils.tf_utils import _quat_to_rot_mat  # noqa: E402
+from utils.pose_task import ContinuousGoalTask, task_conditions  # noqa: E402
+from utils.tf_utils import _quat_to_rot_mat, convert_twist_to_pose  # noqa: E402
+from utils.toy_tasks import joint, sample_source, sample_targets  # noqa: E402
 
 TASKS = [  # (checkpoint / results folder, panel title)
     ('pose_corners_two_orientations', 'Two orientations per corner (5σ apart)'),
@@ -325,8 +332,8 @@ def fig_training(plt, out):
 class Task:
     """A task's goal modes and conditions, read from a run's training config."""
 
-    def __init__(self, task):
-        cfg = _run_config(REPO_ROOT / f'checkpoints/{task}/seed_1', STEM['cond_OT_NOCFG']).training
+    def __init__(self, task, stem=STEM['cond_OT_NOCFG']):
+        cfg = _run_config(REPO_ROOT / f'checkpoints/{task}/seed_1', stem).training
         self.name = task
         self.goal_dist = OmegaConf.to_container(cfg.goal_dist_params, resolve=True)
         self.start_dist = OmegaConf.to_container(cfg.start_dist_params, resolve=True)
@@ -471,14 +478,290 @@ def copy_3d(out):
         print(f'Copied {path} -> {out / dst}')
 
 
+# -- Part 2: continuous conditions ----------------------------------------------------------
+
+CONT_TASKS = [  # (checkpoint / results folder, panel title)
+    ('pose_corners_two_orientations_jitter', 'Noisy tokens: corners, two orientations each'),
+    ('pose_continuous_goals', 'Continuous goals: disk, two orientations each'),
+]
+TOYS = [('moons', '8 Gaussians → moons, conditioned on x'), ('fork', 'Fork: y given x')]
+# variant -> (label, colour, linestyle, marker). C²OT takes OT's blue and random pairing no
+# OT's orange, as in Part 1; the rest follow the palette order. Dashed / dotted = baselines.
+PAIRING_STYLE = {
+    'cond_NOOT_NOCFG': ('random pairing (I-CFM)', ORANGE, '--', 's'),
+    'cond_GOT_NOCFG': ('global OT (ignores conditions)', '#e87ba4', '--', 'v'),
+    'cond_OT_NOCFG': ('per-corner OT (oracle ids)', '#008300', ':', 'P'),
+    'cond_C2OT_NOCFG': ('C²OT (adaptive weight)', BLUE, '-', 'o'),
+    'cond_C2OTFIX_NOCFG': ('fixed weight (COT-FM)', '#eda100', '-', '^'),
+    'cond_CLUSTER_NOCFG': ('cluster (COT Policy)', '#1baf7a', '-', 'D'),
+}
+SHORT = {'cond_NOOT_NOCFG': 'random\n(I-CFM)', 'cond_GOT_NOCFG': 'global\nOT',
+         'cond_OT_NOCFG': 'per-corner\nOT (oracle)', 'cond_C2OT_NOCFG': 'C²OT',
+         'cond_C2OTFIX_NOCFG': 'fixed\nweight', 'cond_CLUSTER_NOCFG': 'cluster'}
+TOY_SUFFIX = {'cond_NOOT_NOCFG': 'NOOT', 'cond_GOT_NOCFG': 'GOT', 'cond_C2OT_NOCFG': 'C2OT',
+              'cond_C2OTFIX_NOCFG': 'C2OTFIX', 'cond_CLUSTER_NOCFG': 'CLUSTER'}
+METHOD_VARIANT = {'independent': 'cond_NOOT_NOCFG', 'global': 'cond_GOT_NOCFG', 'ot': 'cond_OT_NOCFG',
+                  'c2ot': 'cond_C2OT_NOCFG', 'c2ot_fixed': 'cond_C2OTFIX_NOCFG',
+                  'cluster': 'cond_CLUSTER_NOCFG'}
+
+
+def pstyle(variant):
+    label, color, ls, marker = PAIRING_STYLE[variant]
+    return dict(label=label, color=color, ls=ls, marker=marker)
+
+
+def present(task):
+    """The pairing variants trained for a task, in PAIRING_STYLE order."""
+    rows = results(task, 'metrics')[SEEDS[0]]
+    return [v for v in PAIRING_STYLE if any(r['variant'] == v for r in rows)]
+
+
+def cont_band_line(ax, x, vals, variant):
+    st = pstyle(variant)
+    ax.fill_between(x, vals.min(0), vals.max(0), color=st['color'], alpha=0.12, lw=0)
+    ax.plot(x, vals.mean(0), color=st['color'], ls=st['ls'], lw=1.8, marker=st['marker'], ms=6,
+            label=st['label'])
+
+
+def fig_calibration(plt, out):
+    """Branch agreement against prior skew as each pairing's knob loosens (no training)."""
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2), sharey=True)
+    for ax, (task, title) in zip(axes, CONT_TASKS):
+        root = REPO_ROOT / f'experiments/results/{task}'
+        calib = read(root / 'pairing_calibration.csv')
+        diag = [r for r in read(root / 'pairing_diagnostics.csv')
+                if r['ot_batch'] == calib[0]['ot_batch'] and r['method'] in ('independent', 'global', 'ot')]
+        skew = lambda r: max(float(r['prior_skew_r2']), 0.0)
+        chosen_text = []
+        for method in ('c2ot', 'c2ot_fixed', 'cluster'):
+            rows = [r for r in calib if r['method'] == method]
+            st = pstyle(METHOD_VARIANT[method])
+            ax.plot([skew(r) for r in rows], [float(r['branch_agreement']) for r in rows], color=st['color'],
+                    ls='-', lw=1.6, marker=st['marker'], ms=5, label=st['label'] + ', knob loosening →')
+            chosen = next(r for r in rows if r['chosen'] == 'True')
+            knob = 'r_tar' if method == 'c2ot' else 'cond_scale'
+            ax.scatter([skew(chosen)], [float(chosen['branch_agreement'])], s=150, facecolors='none',
+                       edgecolors=st['color'], linewidths=2, zorder=5)
+            chosen_text.append(f"{st['label'].split(' (')[0]}: {knob} {float(chosen[knob]):g}")
+        for r in diag:
+            st = pstyle(METHOD_VARIANT[r['method']])
+            ax.scatter([skew(r)], [float(r['branch_agreement'])], s=70, marker=st['marker'], color=st['color'],
+                       zorder=4, label=st['label'])
+        ax.text(0.98, 0.04, 'chosen (rings):\n' + '\n'.join(chosen_text), transform=ax.transAxes,
+                ha='right', va='bottom', fontsize=9.5, color=INK2)
+        ax.axvline(0.02, color=MUTED, ls=':', lw=1.5)
+        ax.text(0.02, 0.02, ' skew bound ', transform=ax.get_xaxis_transform(), color=INK2, fontsize=9.5)
+        ax.set_xscale('symlog', linthresh=0.01, linscale=0.6)
+        ax.set_xlim(-0.0005, 1.2)
+        ax.set_xlabel('prior skew: R² predicting the condition from its paired noise\n(0 = every condition sees all of the noise)')
+        ax.set_title(f'{title}\nOT batch {calib[0]["ot_batch"]}')
+    axes[0].set_ylabel('branch agreement: share of noise sent to\nthe orientation it points at (0.5 = random)')
+    handles, labels = axes[0].get_legend_handles_labels()
+    extra = [(h, l) for h, l in zip(*axes[1].get_legend_handles_labels()) if l not in labels]
+    handles += [h for h, _ in extra]; labels += [l for _, l in extra]
+    fig.legend(handles, labels, loc='lower center', ncol=3, fontsize=9.5, bbox_to_anchor=(0.5, -0.1))
+    fig.suptitle('Calibrating the pairings without training: each line loosens one knob; '
+                 'ring = the loosest setting within the skew bound', y=1.0)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    save(fig, out, 'continuous_calibration.png')
+    plt.close(fig)
+
+
+@torch.no_grad()
+def fig_toys(plt, out, device, n=2000):
+    """One-step samples of each pairing on the two toys (seed 1), against real data."""
+    variants = list(TOY_SUFFIX)
+    fig, axes = plt.subplots(2, len(variants) + 1, figsize=(18, 6.4), sharex='row', sharey='row')
+    for row, (toy, title) in enumerate(TOYS):
+        summary = read(REPO_ROOT / f'experiments/results/toy_{toy}/toy_metrics_summary.csv')
+        w2 = lambda suf: next(float(r['w2_mean']) for r in summary if r['variant'] == suf
+                              and r['solver'] == 'euler' and r['num_steps'] == '1')
+        target, cond = sample_targets(toy, n, torch.Generator().manual_seed(SEED_A))
+        x0 = sample_source(toy, n, torch.Generator().manual_seed(NOISE_SEED)).to(device)
+        real = joint(toy, target, cond)
+        ax = axes[row, 0]
+        ax.scatter(real[:, 0], real[:, 1], s=3, color=MUTED, alpha=0.6, lw=0)
+        ax.set_title('real data' if row == 0 else '', fontsize=11)
+        ax.set_ylabel(title)
+        for col, v in enumerate(variants, start=1):
+            path = REPO_ROOT / f'checkpoints/toy_{toy}/seed_1/toy_{toy}_{TOY_SUFFIX[v]}_final.pt'
+            model, _ = ConditionalFlowMatchingTransformerModel.load_checkpoint(str(path), device=device)
+            samples = generate_euler(model.eval(), x0, cond.to(device).unsqueeze(1), 1).cpu()
+            pts = joint(toy, samples, cond)
+            ax = axes[row, col]
+            ax.scatter(real[:, 0], real[:, 1], s=3, color=GRID, lw=0)
+            ax.scatter(pts[:, 0], pts[:, 1], s=3, color=pstyle(v)['color'], alpha=0.6, lw=0)
+            label = pstyle(v)['label'].split(' (')[0]
+            ax.set_title(f'{label}\nW₂² {w2(TOY_SUFFIX[v]):.3g} (3 seeds)', fontsize=10.5)
+    for ax in axes.flat:
+        ax.grid(False)
+    axes[1, 0].set_xlabel('condition x'); axes[0, 0].set_xlabel('')
+    fig.suptitle('Toys: samples after ONE Euler step (seed 1), real data in grey; W₂² = mean over 3 seeds, '
+                 'lower is better', y=1.0)
+    fig.tight_layout()
+    save(fig, out, 'toy_samples.png')
+    plt.close(fig)
+
+
+def fig_continuous_overview(plt, out):
+    """Energy distance per pairing at 1, 3 and 100 steps: one dot per seed."""
+    steps_list = (1, 3, 100)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8.4), sharey='row')
+    for r, (task, title) in enumerate(CONT_TASKS):
+        steps_rows, main_rows = results(task, 'steps_sweep'), results(task, 'metrics')
+        variants = present(task)
+        for c, steps in enumerate(steps_list):
+            ax = axes[r, c]
+            for i, v in enumerate(variants):
+                vals = (per_seed(main_rows, v, 'energy_distance') if steps == 100
+                        else per_seed(steps_rows, v, 'energy_distance', num_steps=steps))
+                st = pstyle(v)
+                ax.scatter(i + np.linspace(-0.12, 0.12, len(vals)), vals, s=36, marker=st['marker'],
+                           color=st['color'], zorder=3)
+                ax.plot([i - 0.25, i + 0.25], [vals.mean()] * 2, color=st['color'], lw=2.5, zorder=4)
+                ax.text(i + 0.28, vals.mean(), f'{vals.mean():.3g}', va='center', fontsize=9, color=INK2)
+            data_line(ax, data_value(task, 'energy_distance'), where='left')
+            ax.set_yscale('log')
+            ax.set_xticks(range(len(variants)))
+            ax.set_xticklabels([SHORT[v] for v in variants], fontsize=9.5)
+            ax.set_xlim(-0.5, len(variants) - 0.2)
+            ax.grid(axis='x', visible=False)
+            ax.set_title(f'{title}\n{steps} sampling step{"s" if steps > 1 else ""}', fontsize=11)
+            if c == 0:
+                ax.set_ylabel('energy distance to real data (log)\nlower is better')
+    fig.suptitle(f'Pairings for continuous conditions, epoch {EPOCH}: one dot per seed, bar = mean', y=1.0)
+    fig.tight_layout()
+    save(fig, out, 'continuous_overview.png')
+    plt.close(fig)
+
+
+def fig_continuous_steps(plt, out):
+    """Energy distance vs. number of Euler steps, every pairing."""
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2))
+    for ax, (task, title) in zip(axes, CONT_TASKS):
+        rows = results(task, 'steps_sweep')
+        for v in present(task):
+            cont_band_line(ax, STEPS, np.stack([per_seed(rows, v, 'energy_distance', num_steps=s)
+                                                for s in STEPS], 1), v)
+        data_line(ax, data_value(task, 'energy_distance'))
+        ax.set_xscale('log'); ax.set_yscale('log')
+        ax.set_xticks(STEPS); ax.set_xticklabels([str(s) for s in STEPS]); ax.minorticks_off()
+        ax.set_xlabel('Euler steps at sampling (log)')
+        ax.set_title(title)
+    axes[0].set_ylabel('energy distance (log), lower is better')
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=3, fontsize=10, bbox_to_anchor=(0.5, -0.08))
+    fig.suptitle(f'Sampling steps, epoch {EPOCH}: mean over 5 seeds, shading = seed range', y=1.0)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    save(fig, out, 'continuous_steps_sweep.png')
+    plt.close(fig)
+
+
+class ContinuousView:
+    """Samples and yaw offsets of a Part-2 task, from its run configs."""
+
+    def __init__(self, task_name):
+        self.name = task_name
+        cfg = _run_config(REPO_ROOT / f'checkpoints/{task_name}/seed_1', 'cond_pose_flow_matching_model_NOOT_NOCFG')
+        self.config = cfg
+        self.start = OmegaConf.to_container(cfg.training.start_dist_params, resolve=True)
+        if cfg.training.get('task_type') == 'continuous':
+            self.task = ContinuousGoalTask(OmegaConf.to_container(cfg.training.task_spec, resolve=True))
+            self.conds = list(self.task.test_conditions())
+        else:
+            self.task = None
+            self.discrete = Task(task_name, stem='cond_pose_flow_matching_model_NOOT_NOCFG')
+            self.conds = self.discrete.conditions
+            self.token_sigma = _token_sigma(cfg)
+
+    def obs(self, i, n, device):
+        if self.task is not None:
+            return self.task.obs(self.conds[i].reshape(1, 2)).repeat(n, 1, 1).to(device)
+        return _eval_obs(self.conds[i], n, device, self.token_sigma, i)
+
+    def yaw_offset(self, poses, i):
+        if self.task is None:
+            return self.discrete.yaw_offset(poses, self.conds[i])
+        c = self.conds[i].cpu()
+        mid = self.task.base_yaw + self.task.yaw_gain * c[0] / self.task.radius
+        R_mid = _quat_to_rot_mat(convert_twist_to_pose(torch.tensor([[0, 0, 0, 0, 0, float(mid)]]))[:, 3:])[0]
+        return _rotvec(R_mid.T @ _quat_to_rot_mat(poses[:, 3:]))[:, 2]
+
+    def real(self, i, n, seed):
+        if self.task is None:
+            return self.discrete.real(self.conds[i], n, seed)
+        twists, _ = self.task.sample_goals(self.conds[i].cpu().reshape(1, 2).repeat(n, 1),
+                                           generator=torch.Generator().manual_seed(seed))
+        return convert_twist_to_pose(twists, dt=1.0, return_representation='quat')
+
+    @torch.no_grad()
+    def sample(self, variant, seed, steps, n, device):
+        """n samples per condition from one seed's model; the same starts for every model."""
+        stem = 'cond_pose_flow_matching_model' + variant[len('cond'):]
+        model = _load_run(str(REPO_ROOT / f'checkpoints/{self.name}/seed_{seed}'), stem, EPOCH, device)[0]
+        gen = torch.Generator().manual_seed(1000 + seed)
+        return [generate_from_start_poses(model, _sample_start_poses(self.start, n, gen), self.obs(i, n, device),
+                                          num_steps=steps, cfg_scale=1.0, device=device).cpu()
+                for i in range(len(self.conds))]
+
+
+def fig_continuous_violins(plt, out, device):
+    """Per-sample rotation about z relative to the midpoint of each condition's two orientations."""
+    fig, axes = plt.subplots(2, 1, figsize=(16, 9.5))
+    for ax, (task_name, title) in zip(axes, CONT_TASKS):
+        view = ContinuousView(task_name)
+        n = 512 // len(view.conds)  # samples per condition and seed
+        variants = present(task_name)
+        groups = [torch.cat([view.yaw_offset(view.real(i, n * len(SEEDS), seed=7 + i), i)
+                             for i in range(len(view.conds))]).numpy()]
+        colors, labels = [MUTED], ['real data']
+        for steps in (1, 3):
+            for v in variants:
+                yaws = [view.yaw_offset(p, i) for s in SEEDS for i, p in enumerate(view.sample(v, s, steps, n, device))]
+                groups.append(torch.cat(yaws).numpy()); colors.append(pstyle(v)['color']); labels.append(SHORT[v])
+        k = len(variants)
+        positions = [0] + [1.3 + i + (i // k) * 0.8 for i in range(len(groups) - 1)]
+        violins(ax, groups, positions, colors)
+        for j, steps in enumerate((1, 3)):
+            mid = (positions[1 + j * k] + positions[k + j * k]) / 2
+            ax.text(mid, -0.2, f'{steps} step{"s" if steps > 1 else ""}', transform=ax.get_xaxis_transform(),
+                    ha='center', va='top', color=INK, fontsize=11)
+        for y in (-0.25, 0.25):
+            ax.axhline(y, color=MUTED, ls=':', lw=1.3, zorder=1)
+        ax.text(0.995, 0.25, ' target orientations ', ha='right', va='bottom', transform=ax.get_yaxis_transform(),
+                color=INK2, fontsize=9.5)
+        ax.set_xticks(positions); ax.set_xticklabels(labels, fontsize=9)
+        ax.grid(axis='x', visible=False)
+        ax.set_ylim(-0.8, 0.8)
+        ax.set_ylabel('rotation about z relative to the\nmidpoint of the two orientations (rad)')
+        ax.set_title(title)
+    fig.suptitle(f'Do few-step samples keep both orientations? Epoch {EPOCH}, 5 seeds per violin '
+                 f'(bar = middle 50%, dot = median)', y=1.0)
+    fig.tight_layout()
+    save(fig, out, 'continuous_orientation_violins.png')
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out', default='docs/ablations')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--part', choices=('discrete', 'continuous'), default='discrete')
+    parser.add_argument('--only', nargs='+', default=None,
+                        help='continuous part: just these figures (calibration toys overview steps violins)')
     args = parser.parse_args()
     out = REPO_ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
     plt = setup_matplotlib()
+    if args.part == 'continuous':
+        figs = {'calibration': lambda: fig_calibration(plt, out),
+                'toys': lambda: fig_toys(plt, out, args.device),
+                'overview': lambda: fig_continuous_overview(plt, out),
+                'steps': lambda: fig_continuous_steps(plt, out),
+                'violins': lambda: fig_continuous_violins(plt, out, args.device)}
+        for name in args.only or figs:
+            figs[name]()
+        return
     fig_overview(plt, out)
     fig_steps(plt, out)
     fig_guidance(plt, out)
