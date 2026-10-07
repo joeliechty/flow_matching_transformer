@@ -6,6 +6,8 @@
   runs retrained. All results below are after the fix.
   - Main results use the **epoch-50 checkpoints**, where differences between variants are clearer. Epoch-100
     results are kept [for reference](#reference-epoch-100-results).
+- **Harder pose task:** two orientations per corner (8 modes, bimodal conditions), with 6 variants × 5 seeds.
+  Complete; see [Harder task](#harder-task-two-orientations-per-corner).
 - **MNIST:** deferred, not trained.
 
 **Code versions (branch `dev/ablations`):**
@@ -18,6 +20,31 @@
 - Since `3ac6e51`, this task is defined in `configs/pose_tasks/four_corners.yaml` rather than hard-coded.
   Retraining two runs from the file reproduced their checkpoints bit for bit, and re-evaluating every epoch-50
   model matched all 10,445 result cells.
+- The harder task was trained and evaluated at `5f77177`.
+
+## Both tasks at a glance
+
+- **OT helps few-step sampling.**
+  - It does so in both tasks for unconditional models.
+  - For conditional models, it matters only once a condition has several modes to choose between: the 3-step gain
+    grows from 1.4 to 7.4 seed SDs on the bimodal task.
+  - At 100 steps it is neutral everywhere.
+- **CFG never helps on either task.** Guidance adds bias and, with a bimodal target, makes the split between modes
+  lopsided.
+- **Both tasks still saturate** corner-level accuracy, and every model is over-dispersed at 100 steps.
+- **One real bug was found** and [fixed](#conditional-ot-pairing-fix): conditional OT paired noise across
+  conditions.
+
+| Component | Metric | Four corners | Two orientations per corner |
+| --- | ---: | ---: | ---: |
+| Conditional OT, 3 steps (no CFG) | energy distance | 0.076 → 0.044 (-1.4 SD) | 0.106 → 0.034 (-7.4 SD) |
+| Conditional OT, 100 steps (no CFG) | energy distance | 0.031 → 0.040 (+0.4 SD) | 0.035 → 0.036 (+0.1 SD) |
+| Unconditional OT, 3 steps | energy distance | 0.943 → 0.092 (-15.7 SD) | 1.063 → 0.094 (-26.5 SD) |
+| Guidance 3.0 vs. no CFG (no OT), 100 steps | energy distance | 0.031 → 0.182 (+4.6 SD) | 0.035 → 0.169 (+2.4 SD) |
+| Guidance 3.0 vs. no CFG (no OT), orientation imbalance | orientation imbalance KL | — (no bimodal conditions) | 0.013 → 0.050 (+3.4 SD) |
+
+"a → b" is the metric without → with the component; SD is the change in pooled seed standard deviations (negative =
+better). Epoch 50; real data scores 0.001 on energy distance and 0.006 on orientation imbalance.
 
 The study asks what two components add to the flow matching transformer:
 
@@ -25,7 +52,7 @@ The study asks what two components add to the flow matching transformer:
 - **CFG**: classifier-free guidance. Training randomly replaces the conditioning with a learned null token, and
   sampling extrapolates away from the unconditional prediction.
 
-## Key findings (epoch 50)
+## Four corners: key findings (epoch 50)
 
 1. **OT makes few-step sampling work for unconditional models.**
    - At 1 step, the OT model lands 1.06 from the nearest mode versus 6.99 without OT (energy distance to real data
@@ -54,7 +81,7 @@ The study asks what two components add to the flow matching transformer:
      floor).
    - One-step results match hand calculations for a perfect model.
 
-   The next phase is a harder pose task ([Next steps](#next-steps)).
+   That motivated the [harder task](#harder-task-two-orientations-per-corner).
 
 ## Conditional OT pairing fix
 
@@ -110,6 +137,19 @@ the fixed one behaves like no-OT:
 
 The pre-fix checkpoints and results are archived in `checkpoints/pose_before_ot_fix/` and
 `experiments/results/pose_before_ot_fix/`.
+
+**3-D figures** (seed 1; every model is fed the same start poses), from
+`python pose_gen_inference.py --compare_ot_fix -CE <epoch>`:
+
+- `experiments/results/pose/epoch_<E>/ot_fix_mappings.png`: start → goal sampling paths for the OT and no-OT
+  models, before vs. after the fix. Before the fix, the OT model's goals scatter around each corner.
+- `experiments/results/pose/epoch_<E>/ot_fix_goal_zoom.png`: one condition's goal samples with orientation frames,
+  against real data.
+  - At epoch 50, position error is 1.00 before the fix and 0.25 after (real data 0.16).
+  - Rotation error is 0.34 rad before and 0.21 after (real data 0.16).
+- `experiments/results/pose/ot_fix_pairings.png`: one training minibatch's pairing. Under global OT each
+  condition's starts form their own region, +1.07 noise SDs toward their goal; per-condition pairing mixes them
+  (+0.02).
 
 ## Why the task is too easy
 
@@ -516,10 +556,184 @@ falls by 30–70% for the unguided models. So training is still refining the fin
 
 The full epoch-100 sweeps are in `experiments/results/pose/epoch_100/`.
 
+## Harder task: two orientations per corner
+
+**Task** (`configs/pose_tasks/corners_two_orientations.yaml`):
+- The same four corners, each now holding **two goal modes at the same position, rotated ±0.25 rad about z**
+  (0.5 rad = 5σ apart).
+- The action tokens still name only the corner, so every full condition is **bimodal in rotation**, and every
+  one-token condition covers 4 modes.
+- Same model, training setup, seeds and evaluation as the easy task; results are at epoch 50 unless noted.
+  Training took 44 min for 30 runs (6 in parallel).
+
+Two details specific to this task:
+
+- **OT pairs within each condition**, so the two orientations of a corner are paired together and OT decides which
+  orientation each start goes to. Pairing per mode would leave that choice random.
+- **Corner accuracy** counts a sample as correct if it lands on either orientation of its corner. **Orientation
+  imbalance KL** measures how evenly each condition's samples split between its two orientations; real data scores
+  0.006 with 64 samples.
+
+### Key findings
+
+1. **Conditional OT now clearly matters at few steps.**
+   - At 3 steps, energy distance is 0.034 with OT vs. 0.106 without (7.4 seed SDs; 1.4 SDs on the easy task).
+   - Without OT, a few Euler steps average the two orientations and land *between* them: rotation bias is 0.121
+     rad vs. 0.052 with OT.
+   - With OT, each start is tied to one orientation, so the model reaches its 100-step quality in 2–3 steps. Without
+     OT it needs about 9.
+2. **Guidance costs diversity, steadily.**
+   - The orientation split gets more lopsided as guidance rises: imbalance KL is 0.014–0.019 unguided, 0.042–0.050
+     at 3.0, and 0.15–0.16 at 7 (real data 0.006).
+   - One-token imbalance follows the same pattern (0.024–0.025 → 0.22–0.24).
+   - Energy distance is best unguided, so even with a bimodal target, guidance doesn't help.
+3. **At 100 steps, OT and no-OT are level:** 0.036 vs. 0.035 (0.024 vs. 0.027 at epoch 100), conditional or not.
+4. **Unconditional results repeat the easy task.**
+   - OT wins at few steps: at 3 steps, energy distance is 0.094 vs. 1.063, and coverage KL 0.016 vs. 0.249.
+   - Its paths are straighter: 1.001 vs. 1.039.
+   - The two are level at 100 steps.
+5. **Some things are still saturated or over-dispersed.**
+   - Corner accuracy and one-token validity are still 100%, because corners are 10 units apart.
+   - Over-dispersion persists: spread is 1.45–1.90× in translation and 1.36–1.82× in rotation at epoch 50, and
+     1.13–1.41× / 1.16–1.45× at epoch 100.
+
+### Results at 100 steps (epoch 50)
+
+| Variant | Guidance scale | Corner accuracy ↑ | Orientation imbalance KL ↓ | Energy distance ↓ | Rotation bias (rad) ↓ | Spread ÷ data, translation | Spread ÷ data, rotation | Path straightness |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond · OT + CFG | 3.0 | 1.000 ± 0.000 | 0.042 ± 0.005 | 0.178 ± 0.049 | 0.074 ± 0.010 | 1.90 ± 0.20 | 1.43 ± 0.06 | 1.019 ± 0.001 |
+| cond · OT, no CFG | 1.0 (unguided) | 1.000 ± 0.000 | 0.016 ± 0.003 | 0.036 ± 0.010 | 0.057 ± 0.010 | 1.54 ± 0.06 | 1.44 ± 0.05 | 1.001 ± 0.000 |
+| cond · no OT + CFG | 3.0 | 1.000 ± 0.000 | 0.050 ± 0.013 | 0.169 ± 0.079 | 0.088 ± 0.017 | 1.85 ± 0.16 | 1.82 ± 0.13 | 1.022 ± 0.001 |
+| cond · no OT, no CFG | 1.0 (unguided) | 1.000 ± 0.000 | 0.013 ± 0.009 | 0.035 ± 0.006 | 0.062 ± 0.007 | 1.45 ± 0.02 | 1.64 ± 0.04 | 1.002 ± 0.000 |
+| uncond · OT | n/a | — | — | 0.068 ± 0.022 | 0.063 ± 0.004 | 1.84 ± 0.06 | 1.36 ± 0.06 | 1.001 ± 0.000 |
+| uncond · no OT | n/a | — | — | 0.058 ± 0.013 | 0.075 ± 0.014 | 1.53 ± 0.07 | 1.50 ± 0.07 | 1.039 ± 0.002 |
+| real data | — | 1.000 ± 0.000 | 0.006 ± 0.000 | 0.001 ± 0.000 | 0.027 ± 0.000 | 0.91 ± 0.00 | 0.96 ± 0.00 | — |
+
+### Results at 3 steps (epoch 50)
+
+| Variant | Guidance scale | Corner accuracy ↑ | Orientation imbalance KL ↓ | Energy distance ↓ | Rotation bias (rad) ↓ | Spread ÷ data, translation | Spread ÷ data, rotation | Path straightness |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond · OT + CFG | 3.0 | 1.000 ± 0.000 | 0.306 ± 0.044 | 4.626 ± 0.070 | 0.305 ± 0.041 | 3.43 ± 0.30 | 2.22 ± 0.11 | 1.072 ± 0.003 |
+| cond · OT, no CFG | 1.0 (unguided) | 1.000 ± 0.000 | 0.013 ± 0.003 | 0.034 ± 0.012 | 0.052 ± 0.011 | 0.98 ± 0.05 | 1.21 ± 0.06 | 1.000 ± 0.000 |
+| cond · no OT + CFG | 3.0 | 1.000 ± 0.000 | 0.371 ± 0.044 | 4.170 ± 0.143 | 0.387 ± 0.030 | 3.76 ± 0.09 | 2.72 ± 0.19 | 1.074 ± 0.003 |
+| cond · no OT, no CFG | 1.0 (unguided) | 1.000 ± 0.000 | 0.018 ± 0.027 | 0.106 ± 0.007 | 0.121 ± 0.006 | 0.70 ± 0.04 | 1.02 ± 0.05 | 1.001 ± 0.000 |
+| uncond · OT | n/a | — | — | 0.094 ± 0.028 | 0.069 ± 0.005 | 3.23 ± 0.23 | 1.39 ± 0.08 | 1.005 ± 0.000 |
+| uncond · no OT | n/a | — | — | 1.063 ± 0.044 | 0.242 ± 0.023 | 8.11 ± 0.33 | 2.85 ± 0.09 | 1.154 ± 0.004 |
+| real data | — | 1.000 ± 0.000 | 0.006 ± 0.000 | 0.001 ± 0.000 | 0.027 ± 0.000 | 0.91 ± 0.00 | 0.96 ± 0.00 | — |
+
+- **No OT, no CFG:** collapses at 3 steps (translation spread 0.70×) and is pulled between the two orientations
+  (rotation bias 0.121 rad).
+- **OT, no CFG:** keeps the spread (0.98× / 1.21×) and the bias low (0.052).
+- **Both CFG variants:** overshoot (energy distance 4.2–4.6) and split lopsidedly (0.31–0.37).
+
+### One-token conditioning (4 valid modes, 100 steps)
+
+| Variant | Valid-mode rate ↑ | Imbalance KL across 4 modes ↓ | Energy distance ↓ |
+| --- | ---: | ---: | ---: |
+| cond · OT + CFG | 1.000 ± 0.000 | 0.067 ± 0.009 | 0.125 ± 0.032 |
+| cond · OT, no CFG | 1.000 ± 0.000 | 0.039 ± 0.013 | 0.039 ± 0.010 |
+| cond · no OT + CFG | 1.000 ± 0.000 | 0.082 ± 0.023 | 0.107 ± 0.027 |
+| cond · no OT, no CFG | 1.000 ± 0.000 | 0.041 ± 0.010 | 0.044 ± 0.008 |
+| real data | 1.000 ± 0.000 | 0.027 ± 0.000 | 0.002 ± 0.000 |
+
+- All samples land in a valid mode.
+- The no-CFG models split nearly evenly: 0.039–0.041 against the real-data floor of 0.027, and 0.026–0.029 (at the
+  floor) by epoch 100.
+- The CFG models are lopsided (0.067–0.082).
+
+### Sampling-steps sweep (epoch 50)
+
+**Energy distance** (real data: 0.001):
+
+| Variant | 1 step | 2 steps | 3 steps | 5 steps | 9 steps | 20 steps | 50 steps | 100 steps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond · OT + CFG | 26.399 ± 0.288 | 10.122 ± 0.127 | 4.626 ± 0.070 | 1.242 ± 0.089 | 0.410 ± 0.082 | 0.250 ± 0.063 | 0.193 ± 0.053 | 0.178 ± 0.049 |
+| cond · OT, no CFG | 0.077 ± 0.028 | 0.038 ± 0.010 | 0.034 ± 0.012 | 0.030 ± 0.010 | 0.031 ± 0.009 | 0.033 ± 0.010 | 0.035 ± 0.010 | 0.036 ± 0.010 |
+| cond · no OT + CFG | 26.411 ± 0.297 | 9.743 ± 0.156 | 4.170 ± 0.143 | 0.974 ± 0.185 | 0.337 ± 0.127 | 0.222 ± 0.096 | 0.181 ± 0.083 | 0.169 ± 0.079 |
+| cond · no OT, no CFG | 0.148 ± 0.024 | 0.148 ± 0.011 | 0.106 ± 0.007 | 0.058 ± 0.006 | 0.036 ± 0.006 | 0.034 ± 0.006 | 0.034 ± 0.006 | 0.035 ± 0.006 |
+| uncond · OT | 0.357 ± 0.059 | 0.125 ± 0.022 | 0.094 ± 0.028 | 0.079 ± 0.027 | 0.072 ± 0.025 | 0.069 ± 0.024 | 0.068 ± 0.023 | 0.068 ± 0.022 |
+| uncond · no OT | 12.868 ± 0.116 | 5.125 ± 0.348 | 1.063 ± 0.044 | 0.293 ± 0.036 | 0.132 ± 0.028 | 0.078 ± 0.020 | 0.062 ± 0.014 | 0.058 ± 0.013 |
+
+**Orientation imbalance KL** (real data: 0.006):
+
+| Variant | 1 step | 2 steps | 3 steps | 5 steps | 9 steps | 20 steps | 50 steps | 100 steps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond · OT + CFG | 0.256 ± 0.011 | 0.406 ± 0.010 | 0.306 ± 0.044 | 0.135 ± 0.023 | 0.072 ± 0.012 | 0.049 ± 0.009 | 0.046 ± 0.006 | 0.042 ± 0.005 |
+| cond · OT, no CFG | 0.017 ± 0.006 | 0.010 ± 0.004 | 0.013 ± 0.003 | 0.014 ± 0.003 | 0.016 ± 0.003 | 0.016 ± 0.003 | 0.016 ± 0.003 | 0.016 ± 0.003 |
+| cond · no OT + CFG | 0.322 ± 0.026 | 0.424 ± 0.015 | 0.371 ± 0.044 | 0.177 ± 0.029 | 0.086 ± 0.014 | 0.059 ± 0.014 | 0.051 ± 0.013 | 0.050 ± 0.013 |
+| cond · no OT, no CFG | 0.085 ± 0.032 | 0.053 ± 0.053 | 0.018 ± 0.027 | 0.016 ± 0.016 | 0.014 ± 0.012 | 0.013 ± 0.009 | 0.013 ± 0.009 | 0.013 ± 0.009 |
+
+**Rotation bias, rad** (real data: 0.027):
+
+| Variant | 1 step | 2 steps | 3 steps | 5 steps | 9 steps | 20 steps | 50 steps | 100 steps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond · OT + CFG | 0.500 ± 0.079 | 0.718 ± 0.052 | 0.305 ± 0.041 | 0.108 ± 0.024 | 0.078 ± 0.015 | 0.076 ± 0.011 | 0.074 ± 0.010 | 0.074 ± 0.010 |
+| cond · OT, no CFG | 0.067 ± 0.005 | 0.052 ± 0.009 | 0.052 ± 0.011 | 0.053 ± 0.011 | 0.054 ± 0.011 | 0.056 ± 0.010 | 0.057 ± 0.010 | 0.057 ± 0.010 |
+| cond · no OT + CFG | 0.532 ± 0.058 | 0.851 ± 0.035 | 0.387 ± 0.030 | 0.142 ± 0.029 | 0.101 ± 0.022 | 0.093 ± 0.019 | 0.089 ± 0.017 | 0.088 ± 0.017 |
+| cond · no OT, no CFG | 0.163 ± 0.012 | 0.157 ± 0.008 | 0.121 ± 0.006 | 0.085 ± 0.005 | 0.066 ± 0.006 | 0.062 ± 0.006 | 0.061 ± 0.007 | 0.062 ± 0.007 |
+| uncond · OT | 0.149 ± 0.021 | 0.080 ± 0.009 | 0.069 ± 0.005 | 0.066 ± 0.003 | 0.064 ± 0.003 | 0.064 ± 0.004 | 0.063 ± 0.004 | 0.063 ± 0.004 |
+| uncond · no OT | 0.643 ± 0.187 | 0.546 ± 0.085 | 0.242 ± 0.023 | 0.099 ± 0.018 | 0.087 ± 0.017 | 0.077 ± 0.013 | 0.075 ± 0.013 | 0.075 ± 0.014 |
+
+- **Without OT:** the conditional model needs about 9 steps to converge. At 1 step its split is lopsided (0.085)
+  and its rotation is pulled between the orientations.
+- **With OT:** the conditional model is converged from 2 steps and balanced even at 1 step (0.017).
+- **With guidance 3.0:** the split is most lopsided at 2 steps (0.41–0.42) and recovers slowly with more steps.
+
+### Guidance sweep (epoch 50, 100 steps)
+
+| Variant | Guidance scale | Energy distance ↓ | Orientation imbalance KL ↓ | One-token imbalance KL ↓ | Spread ÷ data, rotation |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cond · OT + CFG | 1 | 0.046 ± 0.010 | 0.014 ± 0.004 | 0.024 ± 0.007 | 1.54 ± 0.03 |
+| cond · OT + CFG | 1.5 | 0.052 ± 0.008 | 0.015 ± 0.004 | 0.034 ± 0.007 | 1.45 ± 0.03 |
+| cond · OT + CFG | 2 | 0.081 ± 0.019 | 0.023 ± 0.005 | 0.045 ± 0.010 | 1.41 ± 0.03 |
+| cond · OT + CFG | 3 | 0.178 ± 0.049 | 0.042 ± 0.005 | 0.067 ± 0.009 | 1.43 ± 0.06 |
+| cond · OT + CFG | 5 | 0.672 ± 0.196 | 0.094 ± 0.022 | 0.133 ± 0.027 | 2.05 ± 0.33 |
+| cond · OT + CFG | 7 | 2.405 ± 0.776 | 0.162 ± 0.036 | 0.224 ± 0.044 | 3.68 ± 0.56 |
+| cond · no OT + CFG | 1 | 0.056 ± 0.012 | 0.019 ± 0.008 | 0.025 ± 0.009 | 1.74 ± 0.05 |
+| cond · no OT + CFG | 1.5 | 0.058 ± 0.012 | 0.020 ± 0.006 | 0.040 ± 0.010 | 1.69 ± 0.07 |
+| cond · no OT + CFG | 2 | 0.081 ± 0.030 | 0.029 ± 0.005 | 0.052 ± 0.011 | 1.71 ± 0.09 |
+| cond · no OT + CFG | 3 | 0.169 ± 0.079 | 0.050 ± 0.013 | 0.082 ± 0.023 | 1.82 ± 0.13 |
+| cond · no OT + CFG | 5 | 0.703 ± 0.249 | 0.097 ± 0.025 | 0.158 ± 0.028 | 2.54 ± 0.41 |
+| cond · no OT + CFG | 7 | 2.613 ± 0.678 | 0.146 ± 0.040 | 0.238 ± 0.046 | 4.09 ± 0.51 |
+
+Every distribution metric is best at guidance 1 (no guidance), and both imbalance measures rise steadily with
+guidance. CFG pushes samples toward one orientation, the classic diversity cost, without any gain in accuracy to
+offset it.
+
+### Epoch 100
+
+**100 steps:**
+
+| Variant | Guidance scale | Corner accuracy ↑ | Orientation imbalance KL ↓ | Energy distance ↓ | Rotation bias (rad) ↓ | Spread ÷ data, translation | Spread ÷ data, rotation | Path straightness |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond · OT + CFG | 3.0 | 1.000 ± 0.000 | 0.041 ± 0.008 | 0.148 ± 0.058 | 0.058 ± 0.007 | 1.29 ± 0.04 | 1.16 ± 0.03 | 1.020 ± 0.001 |
+| cond · OT, no CFG | 1.0 (unguided) | 1.000 ± 0.000 | 0.012 ± 0.003 | 0.024 ± 0.007 | 0.049 ± 0.008 | 1.31 ± 0.02 | 1.33 ± 0.04 | 1.000 ± 0.000 |
+| cond · no OT + CFG | 3.0 | 1.000 ± 0.000 | 0.058 ± 0.025 | 0.104 ± 0.028 | 0.068 ± 0.011 | 1.13 ± 0.08 | 1.36 ± 0.09 | 1.022 ± 0.001 |
+| cond · no OT, no CFG | 1.0 (unguided) | 1.000 ± 0.000 | 0.015 ± 0.004 | 0.027 ± 0.012 | 0.048 ± 0.004 | 1.28 ± 0.04 | 1.45 ± 0.05 | 1.002 ± 0.000 |
+| uncond · OT | n/a | — | — | 0.029 ± 0.007 | 0.049 ± 0.004 | 1.40 ± 0.05 | 1.27 ± 0.05 | 1.001 ± 0.000 |
+| uncond · no OT | n/a | — | — | 0.030 ± 0.006 | 0.057 ± 0.004 | 1.19 ± 0.06 | 1.43 ± 0.05 | 1.038 ± 0.002 |
+| real data | — | 1.000 ± 0.000 | 0.006 ± 0.000 | 0.001 ± 0.000 | 0.027 ± 0.000 | 0.91 ± 0.00 | 0.96 ± 0.00 | — |
+
+**3 steps:**
+
+| Variant | Guidance scale | Corner accuracy ↑ | Orientation imbalance KL ↓ | Energy distance ↓ | Rotation bias (rad) ↓ | Spread ÷ data, translation | Spread ÷ data, rotation | Path straightness |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond · OT + CFG | 3.0 | 1.000 ± 0.000 | 0.249 ± 0.047 | 3.654 ± 0.259 | 0.227 ± 0.038 | 3.86 ± 0.14 | 1.84 ± 0.15 | 1.086 ± 0.003 |
+| cond · OT, no CFG | 1.0 (unguided) | 1.000 ± 0.000 | 0.009 ± 0.003 | 0.029 ± 0.007 | 0.051 ± 0.005 | 0.81 ± 0.03 | 1.08 ± 0.06 | 1.000 ± 0.000 |
+| cond · no OT + CFG | 3.0 | 1.000 ± 0.000 | 0.360 ± 0.056 | 3.068 ± 0.189 | 0.264 ± 0.045 | 3.64 ± 0.44 | 1.85 ± 0.31 | 1.095 ± 0.004 |
+| cond · no OT, no CFG | 1.0 (unguided) | 1.000 ± 0.000 | 0.019 ± 0.009 | 0.112 ± 0.021 | 0.121 ± 0.004 | 0.53 ± 0.03 | 0.74 ± 0.02 | 1.000 ± 0.000 |
+| uncond · OT | n/a | — | — | 0.046 ± 0.010 | 0.053 ± 0.011 | 3.08 ± 0.54 | 1.36 ± 0.15 | 1.004 ± 0.000 |
+| uncond · no OT | n/a | — | — | 0.694 ± 0.077 | 0.180 ± 0.019 | 7.63 ± 0.44 | 2.74 ± 0.19 | 1.149 ± 0.005 |
+| real data | — | 1.000 ± 0.000 | 0.006 ± 0.000 | 0.001 ± 0.000 | 0.027 ± 0.000 | 0.91 ± 0.00 | 0.96 ± 0.00 | — |
+
+Same picture. The 3-step conditional OT advantage holds (energy distance 0.029 vs. 0.112), and guidance still
+unbalances the orientations.
+
 ## Known issues and caveats
 
-- **The conditional task is too easy and several metrics saturate.** See [above](#why-the-task-is-too-easy). The
-  CFG and conditional OT conclusions are specific to this task.
+- **The four-corners conditional task is too easy, and several metrics saturate.** See
+  [above](#why-the-task-is-too-easy). On the harder task, corner accuracy and one-token validity still saturate; the
+  orientation-level metrics don't.
 - **Twist distance has a floor.** Values below 0.219 mean the samples are too tightly clustered. Prefer energy
   distance and the spread ratio.
 - **Small samples for one-token conditioning.** There are 64 samples per one-token condition, so imbalance KL
@@ -558,12 +772,16 @@ Other notes:
      token lists. Modes that share a token list form one multimodal condition.
    - Evaluation reads each run's conditions from its training config.
    - The four-corners file reproduces this report exactly (bit-identical checkpoints, all result cells equal).
-4. Train and evaluate a harder pose task in its own folders, keeping this task as the easy baseline. What the new
-   metrics suggest it needs:
-   - **Closer modes** (a few σ apart), so one-token conditioning and coverage stop being trivial.
-   - **Multimodal conditionals**, where guidance has something to sharpen.
-   - **Rotation-differentiated modes.**
-   - **Few-step evaluation as a primary regime**, where OT matters.
+4. ~~Train and evaluate a harder pose task~~: done ([two orientations per
+   corner](#harder-task-two-orientations-per-corner), tag `pose-two-orientations-v1`).
+
+Possible next experiments:
+
+- **A separation sweep** (e.g. ±0.15 / ±0.5 rad, about 3σ / 10σ apart), to see how conditional OT's few-step
+  advantage and guidance's diversity cost scale with how close the modes are.
+- **Closer corners**, so corner-level accuracy stops saturating too.
+- **A lower default guidance** (1.0–1.5) for any further CFG runs.
+- **MNIST**, deferred.
 
 ## Reproducing
 
@@ -575,6 +793,11 @@ python -m unittest discover -s tests -t .   # pairing, masking, metric and task-
 
 # Another task: its own checkpoints/pose_<task>/ and experiments/results/pose_<task>/ folders
 TASK_CONFIG=configs/pose_tasks/<task>.yaml ./pose_ablations.sh
+TASK_CONFIG=configs/pose_tasks/corners_two_orientations.yaml ./pose_ablations.sh                         # harder task
+TASK_CONFIG=configs/pose_tasks/corners_two_orientations.yaml EVAL_EPOCH=50 ./pose_ablations.sh eval
+
+# 3-D before/after-fix figures for the four-corners task
+python pose_gen_inference.py --compare_ot_fix -CE 50
 ```
 
 Outputs (gitignored):
@@ -588,6 +811,8 @@ Outputs (gitignored):
   `pose_grid.png` (sample trajectories) and `cfg_sweep.png`.
 - `checkpoints/pose_before_ot_fix/` and `experiments/results/pose_before_ot_fix/`: the pre-fix conditional-OT runs
   and results.
+- `checkpoints/pose_corners_two_orientations/` and `experiments/results/pose_corners_two_orientations/epoch_<E>/`:
+  the harder task, with the same layout.
 
 ## Appendix: per-seed results (epoch 50, 100 steps)
 
