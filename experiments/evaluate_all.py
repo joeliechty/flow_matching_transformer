@@ -257,16 +257,19 @@ def evaluate_pose_reference(config_path, epoch, device, num_samples=256):
     K = mode_poses.shape[0]
     ref, ref_idx = sample_goal_poses(goal_dist, REF_PER_MODE, REF_SEED, device)
     full, partial_conditions = task_conditions_for(config)
-    draws = None
+    draw_targets = None
     if all(len(c.valid_modes) == 1 for c in full):
         # One condition per mode (or unconditional): equal draws from every mode.
         samples, targets = sample_goal_poses(goal_dist, num_samples // K, DATA_SEED, device)
     else:
-        # Multimodal conditions: each condition's valid modes, picked at random.
-        draws = [sample_goal_mixture(goal_dist, num_samples // len(full), DATA_SEED + 200 + i,
-                                     modes=c.valid_modes, device=device) for i, c in enumerate(full)]
-        samples = torch.cat([d[0] for d in draws])
-        targets = torch.cat([d[1] for d in draws])
+        # Multimodal conditions: each condition's valid modes, picked at random. Targets are
+        # assigned exactly as for the models (nearest valid mode), not from the true labels.
+        draw_poses = [sample_goal_mixture(goal_dist, num_samples // len(full), DATA_SEED + 200 + i,
+                                          modes=c.valid_modes, device=device)[0]
+                      for i, c in enumerate(full)]
+        draw_targets = [_condition_targets(d, c, mode_poses) for d, c in zip(draw_poses, full)]
+        samples = torch.cat(draw_poses)
+        targets = torch.cat(draw_targets).to(device)
     # Coverage of an unconditional perfect sampler: modes drawn at random, not 64 each.
     mixture, _ = sample_goal_mixture(goal_dist, num_samples, DATA_SEED + 100, device=device)
 
@@ -278,8 +281,8 @@ def evaluate_pose_reference(config_path, epoch, device, num_samples=256):
         'mode_coverage_kl': kl, 'per_mode_counts': dict(counts), 'git_commit': _commit(),
     }
     row.update(_distribution_metrics(samples, targets, mode_poses, ref, ref_idx))
-    if draws is not None:
-        row['condition_balance_kl'] = _condition_balance(full, [d[1] for d in draws])
+    if draw_targets is not None:
+        row['condition_balance_kl'] = _condition_balance(full, draw_targets)
     # One-token conditions: a perfect sampler picks each valid mode with equal probability.
     per_cond = num_samples // max(len(full), 1)
     partial = [sample_goal_mixture(goal_dist, per_cond, DATA_SEED + 1 + i,

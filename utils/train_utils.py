@@ -91,6 +91,18 @@ def geodesic_optimal_transport_pairing(start_poses, goal_poses):
     return optimal_transport_pairing(start_poses, goal_poses, manifold='se3')
 
 
+def _mode_condition_ids(action_mu):
+    """Condition index of each goal mode. Modes named by identical token lists share one: the
+    model can't tell them apart from its input, so OT pairs across them, not within each."""
+    keys, ids = [], []
+    for tokens in action_mu:
+        key = tuple(tuple(float(x) for x in token) for token in tokens)
+        if key not in keys:
+            keys.append(key)
+        ids.append(keys.index(key))
+    return ids
+
+
 def _pair_within_conditions(start, goal, cond_ids, pair_fn):
     """OT-pair `start` to `goal` separately within each condition.
 
@@ -315,8 +327,10 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
             obs_i = mu_tensor.unsqueeze(0) + eps * sigma_tensor.unsqueeze(0)
             obs_list.append(obs_i)
         obs = torch.cat(obs_list, dim=0)
-        # Goals and obs are both laid out mode by mode, so row i belongs to mode i // bs_per_mode.
-        cond_ids = torch.arange(num_modes, device=device).repeat_interleave(bs_per_mode)
+        # Goals and obs are both laid out mode by mode, so row i belongs to mode i // bs_per_mode;
+        # modes named by the same tokens share a condition.
+        cond_ids = torch.tensor(_mode_condition_ids(action_dist_params['mu']),
+                                device=device).repeat_interleave(bs_per_mode)
     else:
         obs = None
         cond_ids = None

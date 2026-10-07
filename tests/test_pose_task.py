@@ -60,6 +60,26 @@ class FourCornersTaskTest(unittest.TestCase):
             self.assertTrue(torch.equal(cond.obs_mask(8, 'cpu'), expected_mask))
 
 
+class CornersTwoOrientationsTaskTest(unittest.TestCase):
+    def test_corners_are_bimodal_in_rotation_only(self):
+        from utils.eval_utils import _rotvec, goal_mode_poses_from_config
+        from utils.tf_utils import _quat_to_rot_mat
+        task = load_pose_task(os.path.join(REPO, 'configs', 'pose_tasks', 'corners_two_orientations.yaml'))
+        base = load_pose_task(FOUR_CORNERS)
+        full, partial = task_conditions(task['action_dist_params'])
+        self.assertEqual([c.valid_modes for c in full], [[0, 1], [2, 3], [4, 5], [6, 7]])
+        self.assertEqual([c.valid_modes for c in partial],
+                         [[0, 1, 4, 5], [2, 3, 6, 7], [0, 1, 2, 3], [4, 5, 6, 7]])
+        poses = goal_mode_poses_from_config(task['goal_dist_params'])
+        corners = goal_mode_poses_from_config(base['goal_dist_params'])
+        for k in range(8):
+            corner = corners[k // 2]
+            self.assertTrue(torch.allclose(poses[k, :3], corner[:3]))  # same position as the corner
+            rel = _quat_to_rot_mat(corner[None, 3:])[0].T @ _quat_to_rot_mat(poses[k, None, 3:])[0]
+            expected = 0.25 if k % 2 == 0 else -0.25                    # ccw, then cw, about z
+            self.assertTrue(torch.allclose(_rotvec(rel[None])[0], torch.tensor([0., 0., expected]), atol=1e-4))
+
+
 class GeneralTaskTest(unittest.TestCase):
     def test_modes_sharing_tokens_form_one_multimodal_condition(self):
         path = write_task("""

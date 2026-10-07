@@ -7,8 +7,8 @@ import unittest
 import torch
 
 from utils.tf_utils import sample_random_twist
-from utils.train_utils import (_build_cond_mask, _pair_within_conditions, flat_ot_pairing,
-                               sequence_ot_pairing)
+from utils.train_utils import (_build_cond_mask, _mode_condition_ids, _pair_within_conditions,
+                               flat_ot_pairing, sequence_ot_pairing)
 
 
 def se3_pair(start, goal):
@@ -48,6 +48,14 @@ class PairWithinConditionsTest(unittest.TestCase):
         one = torch.zeros(len(self.cond), dtype=torch.long)
         self.assertTrue(torch.equal(_pair_within_conditions(self.start, self.goal, one, se3_pair),
                                     se3_pair(self.start, self.goal)))
+
+    def test_modes_sharing_tokens_share_a_condition(self):
+        t, b, r, l = [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0]
+        self.assertEqual(_mode_condition_ids([[t, r], [b, r], [t, l], [b, l]]), [0, 1, 2, 3])
+        self.assertEqual(_mode_condition_ids([[t, r], [t, r], [b, r], [b, r.copy()]]), [0, 0, 1, 1])
+        # what the trainer used before (one condition per mode) is unchanged for distinct tokens
+        ids = torch.tensor(_mode_condition_ids([[t, r], [b, r], [t, l], [b, l]])).repeat_interleave(32)
+        self.assertTrue(torch.equal(ids, torch.arange(4).repeat_interleave(32)))
 
     def test_flat_pairing_never_crosses_classes(self):
         x0, x1 = torch.randn(60, 49, 16), torch.randn(60, 49, 16)
