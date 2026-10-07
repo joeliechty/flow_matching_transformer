@@ -80,6 +80,25 @@ class CornersTwoOrientationsTaskTest(unittest.TestCase):
             self.assertTrue(torch.allclose(_rotvec(rel[None])[0], torch.tensor([0., 0., expected]), atol=1e-4))
 
 
+class Corners3SigmaTaskTest(unittest.TestCase):
+    def test_every_mode_is_within_3_sigma_of_every_other(self):
+        from utils.eval_utils import _rotvec, goal_mode_poses_from_config
+        from utils.tf_utils import _quat_to_rot_mat
+        task = load_pose_task(os.path.join(REPO, 'configs', 'pose_tasks', 'corners_3sigma.yaml'))
+        sigma = 0.1
+        poses = goal_mode_poses_from_config(task['goal_dist_params'])
+        positions = torch.cdist(poses[:, :3], poses[:, :3])
+        R = _quat_to_rot_mat(poses[:, 3:])
+        angles = torch.stack([_rotvec(R[i].T @ R)[:, 2].abs() for i in range(8)])  # yaw between modes
+        self.assertAlmostEqual(positions.max().item(), 3 * sigma, delta=1e-4)          # the diagonal
+        self.assertAlmostEqual(angles.max().item(), 3 * sigma, delta=1e-4)
+        corners = positions[positions > 1e-6].unique()
+        self.assertAlmostEqual(corners.min().item(), 3 * sigma / 2 ** 0.5, delta=1e-4)  # adjacent corners
+        full, partial = task_conditions(task['action_dist_params'])
+        self.assertEqual([c.valid_modes for c in full], [[0, 1], [2, 3], [4, 5], [6, 7]])
+        self.assertEqual(len(partial), 4)
+
+
 class GeneralTaskTest(unittest.TestCase):
     def test_modes_sharing_tokens_form_one_multimodal_condition(self):
         path = write_task("""

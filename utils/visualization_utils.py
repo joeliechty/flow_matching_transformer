@@ -133,24 +133,38 @@ MUTED = '#8a8a85'
 
 
 def plot_condition_mappings(ax, trajectory, condition_idx, mode_poses=None, title=None,
-                            condition_names=None):
+                            condition_names=None, center=None, half_width=None, frame_length=0.9):
     """Start -> goal sampling paths [N, T+1, 7] (positions), one colour + marker per condition:
-    small marker at the start, larger at the goal; goal-mode frames for reference."""
-    traj = trajectory.detach().cpu().numpy()
+    small marker at the start, larger at the goal; goal-mode frames for reference.
+
+    With `center` [3] and `half_width`, only the final approach into the cube around `center`
+    is drawn (for goal modes packed too close together to see at full scale)."""
+    traj = trajectory.detach().cpu().numpy()[..., :3]
     cond = np.asarray(condition_idx)
+    zoom = half_width is not None
+    c0 = np.zeros(3) if center is None else torch.as_tensor(center).cpu().numpy()
     for c in np.unique(cond):
         color = CONDITION_COLORS[c % len(CONDITION_COLORS)]
         marker = CONDITION_MARKERS[c % len(CONDITION_MARKERS)]
         paths = traj[cond == c]
         for path in paths:
+            if zoom:
+                tail = _tail_in_box(path - c0, half_width)
+                if tail is None:
+                    continue
+                path = tail + c0
             ax.plot(path[:, 0], path[:, 1], path[:, 2], color=color, alpha=0.45, linewidth=1.0)
-        ax.scatter(paths[:, 0, 0], paths[:, 0, 1], paths[:, 0, 2], color=color, marker=marker,
-                   s=12, alpha=0.9, depthshade=False)
+        if not zoom:
+            ax.scatter(paths[:, 0, 0], paths[:, 0, 1], paths[:, 0, 2], color=color, marker=marker,
+                       s=12, alpha=0.9, depthshade=False)
+        ends = paths[:, -1]
+        if zoom:  # endpoints outside the cube would be drawn outside the axes
+            ends = ends[np.all(np.abs(ends - c0) <= half_width, axis=1)]
         name = condition_names[c] if condition_names else f'condition {c}'
-        ax.scatter(paths[:, -1, 0], paths[:, -1, 1], paths[:, -1, 2], color=color, marker=marker,
+        ax.scatter(ends[:, 0], ends[:, 1], ends[:, 2], color=color, marker=marker,
                    s=26, edgecolors='white', linewidths=0.4, depthshade=False, label=name)
     if mode_poses is not None:
-        draw_goal_modes(ax, mode_poses, length=0.9, linewidth=3.0, label=False)
+        draw_goal_modes(ax, mode_poses, length=frame_length, linewidth=3.0, label=False)
     if title:
         ax.set_title(title, fontsize=10)
 

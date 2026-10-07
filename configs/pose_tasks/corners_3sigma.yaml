@@ -1,0 +1,53 @@
+# corners_two_orientations with every mode within 3 sigma of every other (sigma = 0.1):
+# overlapping modes, to test generation when mode separation is hard.
+#   Positions: corners at (5, ±0.106, ±0.106), so the diagonal is exactly 3 sigma (0.3) and
+#              adjacent corners are 2.1 sigma apart.
+#   Orientations: one shared base orientation (90 deg about z); each corner holds two modes at
+#              ±0.15 rad from it, 3 sigma apart.
+# The tokens name the corner, so every full condition is bimodal in rotation.
+# Same format as four_corners.yaml (see utils/pose_task.py).
+name: corners_3sigma
+
+start:
+  mu: [0, 0, 0, 0, 0, 0]
+  sigma: [1, 1, 1, 1, 1, 1]
+
+tokens:
+  top:    [0, 0, 1, 0, 0, 0]
+  bottom: [0, 0, -1, 0, 0, 0]
+  right:  [0, 1, 0, 0, 0, 0]
+  left:   [0, -1, 0, 0, 0, 0]
+
+modes:
+  - name: top_right_ccw
+    tokens: [top, right]
+    mu: [5, 0.106066, 0.106066, 0, 0, 1.7208]
+    sigma: 0.1
+  - name: top_right_cw
+    tokens: [top, right]
+    mu: [5, 0.106066, 0.106066, 0, 0, 1.4208]
+    sigma: 0.1
+  - name: bottom_right_ccw
+    tokens: [bottom, right]
+    mu: [5, 0.106066, -0.106066, 0, 0, 1.7208]
+    sigma: 0.1
+  - name: bottom_right_cw
+    tokens: [bottom, right]
+    mu: [5, 0.106066, -0.106066, 0, 0, 1.4208]
+    sigma: 0.1
+  - name: top_left_ccw
+    tokens: [top, left]
+    mu: [5, -0.106066, 0.106066, 0, 0, 1.7208]
+    sigma: 0.1
+  - name: top_left_cw
+    tokens: [top, left]
+    mu: [5, -0.106066, 0.106066, 0, 0, 1.4208]
+    sigma: 0.1
+  - name: bottom_left_ccw
+    tokens: [bottom, left]
+    mu: [5, -0.106066, -0.106066, 0, 0, 1.7208]
+    sigma: 0.1
+  - name: bottom_left_cw
+    tokens: [bottom, left]
+    mu: [5, -0.106066, -0.106066, 0, 0, 1.4208]
+    sigma: 0.1

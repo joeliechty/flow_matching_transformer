@@ -509,6 +509,11 @@ def visualize_task(args, device):
         return f'{n} step{"s" if n > 1 else ""}'
 
     # 1. start -> goal mappings, few vs many steps -------------------------------------
+    # Goal modes packed within ~1 unit can't be told apart at full scale: zoom to the goal region.
+    mode_pos = mode_poses[:, :3]
+    spread = (mode_pos - mode_pos.mean(0)).norm(dim=-1).max().item()
+    zoom = spread < 1.0
+    goal_center, goal_half = mode_pos.mean(0), max(0.5, 4 * spread)
     fig = plt.figure(figsize=(21, 15))
     for r, (label, ot_stem, noot_stem) in enumerate(TASK_ROWS):
         for c, (steps, stem, which) in enumerate([(few, ot_stem, 'OT'), (few, noot_stem, 'no OT'),
@@ -527,14 +532,29 @@ def visualize_task(args, device):
                 dist = pose_mode_distance(traj[:, -1], mode_poses)
             ax = fig.add_subplot(3, 4, r * 4 + c + 1, projection='3d')
             guidance = f', guidance {args.cfg_scale:g}' if stem.startswith('cond_') and stem.endswith('_CFG') else ''
-            plot_condition_mappings(ax, traj, cond_idx, mode_poses=mode_poses, condition_names=names,
-                                    title=f'{label}{guidance}: {which}, {plural(steps)}\n'
-                                          f'mean twist distance to nearest valid mode {dist:.2f}')
-            _position_axes(ax, args)
+            title = f'{label}{guidance}: {which}, {plural(steps)}\nmean twist distance to nearest valid mode {dist:.2f}'
+            if zoom:
+                outside = int(((traj[:, -1, :3] - goal_center).abs() > goal_half).any(dim=-1).sum())
+                if outside:
+                    title += f'\n({outside} of {traj.shape[0]} end outside this view)'
+                plot_condition_mappings(ax, traj, cond_idx, mode_poses=mode_poses, condition_names=names,
+                                        title=title, center=goal_center, half_width=goal_half,
+                                        frame_length=goal_half / 4)
+                for lim, mid in zip((ax.set_xlim, ax.set_ylim, ax.set_zlim), goal_center.tolist()):
+                    lim(mid - goal_half, mid + goal_half)
+                ax.set_box_aspect((1, 1, 1))
+                ax.view_init(elev=args.elev, azim=args.azim)
+                ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')
+            else:
+                plot_condition_mappings(ax, traj, cond_idx, mode_poses=mode_poses, condition_names=names,
+                                        title=title)
+                _position_axes(ax, args)
     handles, labels = fig.axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='lower center', ncol=len(labels), frameon=False)
+    region = (f'; zoomed to the goal region (±{goal_half:.2f} around the modes), final approach only'
+              if zoom else '')
     fig.suptitle(f'Start -> goal mappings, epoch {epoch}: the same {args.num_samples} start poses per condition '
-                 f'for every model (unconditional samples coloured by the corner they reach)', fontsize=13)
+                 f'for every model (unconditional samples coloured by the corner they reach){region}', fontsize=13)
     _finish(fig, plt, args, os.path.join(epoch_dir, 'mappings_3d.png'))
 
     # Orientations are shown relative to the midpoint of the condition's orientations, so the
