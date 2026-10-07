@@ -1,0 +1,53 @@
+# corners_two_orientations with Gaussian noise (std 0.1) on every conditioning token, so every
+# training sample's condition is slightly different. The corners stay far apart in token space
+# (two corners' token pairs are at least 2 apart; two noisy copies of one corner about 0.5), so
+# conditions still cluster by corner, but exact per-condition pairing breaks down: each
+# condition is a single sample. Tests the condition-aware pairings on noisy discrete conditions.
+# Same modes as corners_two_orientations.yaml (see utils/pose_task.py, token_sigma).
+name: corners_two_orientations_jitter
+
+token_sigma: 0.1
+
+start:
+  mu: [0, 0, 0, 0, 0, 0]
+  sigma: [1, 1, 1, 1, 1, 1]
+
+tokens:
+  top:    [0, 0, 1, 0, 0, 0]
+  bottom: [0, 0, -1, 0, 0, 0]
+  right:  [0, 1, 0, 0, 0, 0]
+  left:   [0, -1, 0, 0, 0, 0]
+
+modes:
+  - name: top_right_ccw       # 90 deg + 0.25 about z
+    tokens: [top, right]
+    mu: [5, 5, 5, 0, 0, 1.8208]
+    sigma: 0.1
+  - name: top_right_cw        # 90 deg - 0.25
+    tokens: [top, right]
+    mu: [5, 5, 5, 0, 0, 1.3208]
+    sigma: 0.1
+  - name: bottom_right_ccw    # -90 deg + 0.25
+    tokens: [bottom, right]
+    mu: [5, 5, -5, 0, 0, -1.3208]
+    sigma: 0.1
+  - name: bottom_right_cw     # -90 deg - 0.25
+    tokens: [bottom, right]
+    mu: [5, 5, -5, 0, 0, -1.8208]
+    sigma: 0.1
+  - name: top_left_ccw        # 180 deg + 0.25
+    tokens: [top, left]
+    mu: [5, -5, 5, 0, 0, 3.39159]
+    sigma: 0.1
+  - name: top_left_cw         # 180 deg - 0.25
+    tokens: [top, left]
+    mu: [5, -5, 5, 0, 0, 2.89159]
+    sigma: 0.1
+  - name: bottom_left_ccw     # 180 deg + 0.25
+    tokens: [bottom, left]
+    mu: [5, -5, -5, 0, 0, 3.39159]
+    sigma: 0.1
+  - name: bottom_left_cw      # 180 deg - 0.25
+    tokens: [bottom, left]
+    mu: [5, -5, -5, 0, 0, 2.89159]
+    sigma: 0.1

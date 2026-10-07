@@ -8,7 +8,7 @@ from models.flow_matching_transformer import FlowMatchingTransformerModel
 from utils.train_utils import PAIRINGS, Pairer, generate_interpolated_poses, sample_pose_batch, train
 from omegaconf import OmegaConf
 from utils.logging_utils import _Tee, git_commit
-from utils.pose_task import load_pose_task
+from utils.pose_task import ContinuousGoalTask, load_pose_task
 
 DEFAULT_TASK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             'configs', 'pose_tasks', 'four_corners.yaml')
@@ -67,6 +67,9 @@ def set_seed(seed):
 def generate_training_and_model_config(args, start_dist_params=None, goal_dist_params=None, action_dist_params=None):
     # Distribution parameters (twist representation) come from the task file unless given.
     task = load_pose_task(args.task_config)
+    continuous = task['type'] == 'continuous'
+    if continuous and not args.conditional:
+        raise ValueError(f"{args.task_config} is a continuous-condition task; add --conditional")
     task_name, mode_names = ((task['name'], task['mode_names']) if goal_dist_params is None
                              else ('custom', None))
     if start_dist_params is None:
@@ -77,13 +80,16 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         action_dist_params = task['action_dist_params']
 
     if args.batch_size is None:
-        batch_size = len(goal_dist_params['mu'])*32
+        batch_size = 128 if continuous else len(goal_dist_params['mu'])*32
     else:
         batch_size = args.batch_size
 
     save_path = os.path.join(args.save_path, run_name(args))
     # action token size (6 for twist actions)
-    obs_dim = len(action_dist_params['mu'][0][0]) if args.conditional else None
+    if continuous:
+        obs_dim = task['obs_dim']
+    else:
+        obs_dim = len(action_dist_params['mu'][0][0]) if args.conditional else None
 
     # make a config object
     training_config = {
@@ -97,6 +103,8 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         'seed': args.seed,
         'git_commit': git_commit(),
         'task': task_name,
+        'task_type': task['type'],
+        'task_spec': task['spec'] if continuous else None,
         'mode_names': mode_names,
         'num_epochs': args.num_epochs,
         'num_batches_per_epoch': args.num_batches_per_epoch,
@@ -225,8 +233,13 @@ if __name__ == "__main__":
     # The original 'ot' / 'independent' runs keep their exact training path (and RNG stream);
     # every other pairing, or a bigger OT batch, draws paired batches from a Pairer.
     pairer = None
-    if config.training.pairing not in ('ot', 'independent') or config.training.ot_batch_mult > 1:
-        t = config.training
+    t = config.training
+    if t.task_type == 'continuous':
+        sampler = ContinuousGoalTask(OmegaConf.to_container(t.task_spec)).batch_sampler(
+            t.start_dist_params, seq_len=t.seq_len, device=device)
+        pairer = Pairer(t.pairing, sampler, t.batch_size, ot_batch_mult=t.ot_batch_mult,
+                        r_tar=t.r_tar, num_clusters=t.num_clusters)
+    elif t.pairing not in ('ot', 'independent') or t.ot_batch_mult > 1:
         sampler = lambda n: sample_pose_batch(n, t.start_dist_params, t.goal_dist_params,
                                               t.action_dist_params, seq_len=t.seq_len, device=device)
         pairer = Pairer(t.pairing, sampler, t.batch_size, ot_batch_mult=t.ot_batch_mult,

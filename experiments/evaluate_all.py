@@ -40,7 +40,8 @@ from utils.eval_utils import (
 )
 from utils.logging_utils import git_commit
 from utils.mnist_classifier import load_classifier
-from utils.pose_task import task_conditions
+from utils.pose_task import ContinuousGoalTask, task_conditions
+from utils.tf_utils import convert_twist_to_pose
 from pose_gen_inference import (
     generate_from_distribution,
     load_model as load_pose_model,
@@ -59,6 +60,7 @@ from image_gen_inference import (
 # model-sampling noise (and with it every older metric) is unchanged.
 REF_SEED, REF_PER_MODE = 1234, 1024
 DATA_SEED = 4321  # independent draws scored as if from a perfect sampler (the 'data' row)
+TOKEN_SEED = 5678  # eval-time noise on the obs tokens of tasks trained with token_sigma > 0
 
 
 # Filename schema:
@@ -67,8 +69,11 @@ DATA_SEED = 4321  # independent draws scored as if from a perfect sampler (the '
 #           image_flow_matching_model, cond_image_flow_matching_model}
 _CKPT_RE = re.compile(
     r"^(?P<prefix>cond_)?(?P<task>pose|image)_flow_matching_model"
-    r"(?P<ot>_OT|_NOOT)(?P<cfg>_CFG|_NOCFG)_epoch_(?P<epoch>\d+)\.pt$"
+    r"(?P<ot>_OT|_NOOT|_GOT|_C2OTFIX|_C2OT|_CLUSTER)(?P<cfg>_CFG|_NOCFG)_epoch_(?P<epoch>\d+)\.pt$"
 )
+# Checkpoint suffix -> noise-data pairing (`utils.train_utils.PAIRINGS`, pose_gen_trainer.py).
+SUFFIX_PAIRING = {'_OT': 'ot', '_NOOT': 'independent', '_GOT': 'global', '_C2OT': 'c2ot',
+                  '_C2OTFIX': 'c2ot_fixed', '_CLUSTER': 'cluster'}
 
 
 def discover_checkpoints(ckpt_dir: Path, epoch=None):
@@ -118,6 +123,25 @@ def task_conditions_for(config):
     if actions is None:
         return [], []
     return task_conditions(OmegaConf.to_container(actions, resolve=True))
+
+
+def _token_sigma(config):
+    """Std of the noise on the obs tokens during training (0 for clean discrete tokens)."""
+    actions = config.training.get('action_dist_params')
+    if actions is None:
+        return 0.0
+    return max(float(v) for mode in actions['sigma'] for token in mode for v in token)
+
+
+def _eval_obs(cond, n, device, token_sigma, index):
+    """Obs tokens for `n` samples of `cond`. With token noise in training, each sample's tokens
+    get fresh noise of the same std from a generator of their own (seeded per condition), so
+    the sampling noise is unchanged and every variant sees the same tokens."""
+    obs = cond.obs(n, device)
+    if token_sigma > 0:
+        gen = torch.Generator().manual_seed(TOKEN_SEED + index)
+        obs = obs + token_sigma * torch.randn(obs.shape, generator=gen).to(device)
+    return obs
 
 
 def _condition_targets(samples, condition, mode_poses):
@@ -186,7 +210,8 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
     # CFG has no effect without conditioning, so leave it blank for unconditional rows.
     row = {
         'task': 'pose', 'variant': variant_name(meta), 'conditional': conditional,
-        'ot': meta['ot'] == '_OT', 'cfg': meta['cfg'] == '_CFG' if conditional else None,
+        'ot': meta['ot'] == '_OT', 'pairing': SUFFIX_PAIRING[meta['ot']],
+        'cfg': meta['cfg'] == '_CFG' if conditional else None,
         'cfg_scale_at_inference': cfg_scale if conditional else None,
         'num_steps': num_steps, 'num_samples': num_samples, 'epoch': meta['epoch'],
         'mode_accuracy': None, 'mode_distance': None, 'mode_coverage_kl': None,
@@ -195,11 +220,13 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
 
     if conditional:
         full, partial_conditions = task_conditions_for(config)
+        token_sigma = _token_sigma(config)
         per_cond = num_samples // len(full)
         all_traj, all_targets = [], []
-        for cond in full:
+        for i, cond in enumerate(full):
             _, traj = generate_from_distribution(
-                model, start_dist_flat, batch_size=per_cond, obs=cond.obs(per_cond, device),
+                model, start_dist_flat, batch_size=per_cond,
+                obs=_eval_obs(cond, per_cond, device, token_sigma, i),
                 num_steps=num_steps, return_trajectory=True,
                 cfg_scale=cfg_scale, device=device,
             )
@@ -236,9 +263,10 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
     if conditional:
         # Drawn after the full-condition samples, so those keep their noise.
         partial = []
-        for cond in partial_conditions:
+        for i, cond in enumerate(partial_conditions):
             _, partial_samples = generate_from_distribution(
-                model, start_dist_flat, batch_size=per_cond, obs=cond.obs(per_cond, device),
+                model, start_dist_flat, batch_size=per_cond,
+                obs=_eval_obs(cond, per_cond, device, token_sigma, len(full) + i),
                 obs_mask=cond.obs_mask(per_cond, device),
                 num_steps=num_steps, return_trajectory=False, cfg_scale=cfg_scale, device=device,
             )
@@ -249,9 +277,92 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
     return row
 
 
+def _continuous_task(config):
+    return ContinuousGoalTask(OmegaConf.to_container(config.training.task_spec, resolve=True))
+
+
+def _continuous_reference(task, c, index, device):
+    """Real goal poses for one condition, REF_PER_MODE per mode, and their mode indices."""
+    gen = torch.Generator().manual_seed(REF_SEED + index)
+    mu = task.mode_twists(c.reshape(1, 2).cpu())[0]                      # [K, 6]
+    twists = mu[:, None] + task.sigma * torch.randn(task.num_modes, REF_PER_MODE, 6, generator=gen)
+    poses = convert_twist_to_pose(twists.reshape(-1, 6), dt=1.0, return_representation='quat')
+    return poses.to(device), torch.arange(task.num_modes).repeat_interleave(REF_PER_MODE).to(device)
+
+
+def _continuous_metrics(task, conds, sample_sets, device):
+    """Metrics of a continuous-condition task, each computed per test condition against that
+    condition's own modes and real samples, then averaged over conditions. Same column names
+    as the discrete evaluator; condition_balance_kl is the split between the orientations."""
+    per_cond = []
+    for i, (c, samples) in enumerate(zip(conds, sample_sets)):
+        modes = task.mode_poses(c.reshape(1, 2))[0].to(device)           # [K, 7]
+        ref, ref_idx = _continuous_reference(task, c, i, device)
+        assigned = nearest_mode_indices(samples, modes)
+        m = pose_bias_spread(samples, assigned, modes, ref, ref_idx)
+        m['energy_distance'] = per_mode_energy_distance(samples, assigned, ref, ref_idx)
+        m['condition_balance_kl'] = mode_balance_kl(assigned, list(range(task.num_modes)))
+        m['mode_distance'] = pose_mode_distance(samples, modes, assigned)
+        per_cond.append(m)
+    return {k: statistics.fmean(m[k] for m in per_cond if m[k] is not None)
+            for k in per_cond[0]}
+
+
+def evaluate_pose_continuous(meta, device, num_samples=1024, num_steps=100, cfg_scale=3.0,
+                             eval_seed=0):
+    """Pose metrics for a continuous-condition task: num_samples spread evenly over the task's
+    fixed test conditions."""
+    cfg_scale = effective_cfg_scale(meta, cfg_scale)
+    config = OmegaConf.load(_config_path_for(meta["path"]))
+    model_config = OmegaConf.to_container(config.model, resolve=True)
+    model, _ = load_pose_model(str(meta["path"]), device=device, model_config=model_config,
+                               conditional=True)
+    torch.manual_seed(eval_seed)
+    task = _continuous_task(config)
+    start = OmegaConf.to_container(config.training.start_dist_params, resolve=True)
+    start_dist_flat = {'mu': start['mu'][0], 'sigma': start['sigma'][0]}
+    conds = task.test_conditions(device)
+    per_cond = num_samples // len(conds)
+
+    trajectories = []
+    for c in conds:
+        _, traj = generate_from_distribution(
+            model, start_dist_flat, batch_size=per_cond,
+            obs=task.obs(c.reshape(1, 2)).repeat(per_cond, 1, 1), num_steps=num_steps,
+            return_trajectory=True, cfg_scale=cfg_scale, device=device)
+        trajectories.append(traj)
+    row = {
+        'task': 'pose', 'variant': variant_name(meta), 'conditional': True,
+        'ot': meta['ot'] == '_OT', 'pairing': SUFFIX_PAIRING[meta['ot']],
+        'cfg': meta['cfg'] == '_CFG', 'cfg_scale_at_inference': cfg_scale,
+        'num_steps': num_steps, 'num_samples': per_cond * len(conds), 'epoch': meta['epoch'],
+    }
+    row.update(_continuous_metrics(task, conds, [t[:, -1] for t in trajectories], device))
+    row['path_straightness'], row['transport_cost'] = path_straightness(torch.cat(trajectories))
+    return row
+
+
+def evaluate_pose_continuous_reference(config, epoch, device, num_samples=1024):
+    """Real goal samples scored like the models: the floor of every continuous-task metric."""
+    task = _continuous_task(config)
+    conds = task.test_conditions()
+    per_cond = num_samples // len(conds)
+    sample_sets = []
+    for i, c in enumerate(conds):
+        gen = torch.Generator().manual_seed(DATA_SEED + i)
+        twists, _ = task.sample_goals(c.reshape(1, 2).repeat(per_cond, 1), generator=gen)
+        sample_sets.append(convert_twist_to_pose(twists, dt=1.0, return_representation='quat').to(device))
+    row = {'task': 'pose', 'variant': 'data', 'epoch': epoch, 'num_samples': per_cond * len(conds),
+           'git_commit': _commit()}
+    row.update(_continuous_metrics(task, conds, sample_sets, device))
+    return row
+
+
 def evaluate_pose_reference(config_path, epoch, device, num_samples=256):
     """Score real goal samples with the pose metrics: what a perfect sampler gets."""
     config = OmegaConf.load(config_path)
+    if config.training.get('task_type') == 'continuous':
+        return evaluate_pose_continuous_reference(config, epoch, device, num_samples)
     goal_dist = OmegaConf.to_container(config.training.goal_dist_params, resolve=True)
     mode_poses = goal_mode_poses_from_config(goal_dist, device=device)
     K = mode_poses.shape[0]
@@ -349,7 +460,11 @@ def _commit():
 def evaluate(meta, device, classifier, **kwargs):
     """Run the task's evaluator. Returns None for MNIST when no classifier is loaded."""
     if meta['task'] == 'pose':
-        row = evaluate_pose(meta, device, **kwargs)
+        config = OmegaConf.load(_config_path_for(meta['path']))
+        if config.training.get('task_type') == 'continuous':
+            row = evaluate_pose_continuous(meta, device, **kwargs)
+        else:
+            row = evaluate_pose(meta, device, **kwargs)
     elif classifier is None:
         return None
     else:

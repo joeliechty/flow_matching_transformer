@@ -1,0 +1,26 @@
+# Continuous conditions: the condition is a goal position anywhere on a disk, so no two
+# training samples share one. Each goal holds two orientations ±0.25 rad about z (5 sigma
+# apart, as in corners_two_orientations) around a base yaw that turns smoothly with the
+# position, so the conditional is bimodal and changes continuously across conditions.
+#   Condition: c uniform on a disk of radius 5 in the y-z plane; the model sees c / 5.
+#   Goal:      position (5, c_y, c_z); yaw = 90 deg + 0.5 rad * c_y / 5 ± 0.25 rad;
+#              noise sigma = 0.1 on every twist dimension.
+# Loaded by utils/pose_task.py (ContinuousGoalTask).
+name: continuous_goals
+type: continuous
+
+start:
+  mu: [0, 0, 0, 0, 0, 0]
+  sigma: [1, 1, 1, 1, 1, 1]
+
+condition:
+  radius: 5.0
+
+goal:
+  x: 5.0
+  sigma: 0.1
+  base_yaw: 1.5708          # rad about z at c = 0
+  yaw_gain: 0.5             # the base yaw changes by yaw_gain * c_y / radius
+  orientations: [0.25, -0.25]
+
+test_conditions: 16         # fixed conditions drawn for evaluation

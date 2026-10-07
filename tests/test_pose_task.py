@@ -99,6 +99,55 @@ class Corners3SigmaTaskTest(unittest.TestCase):
         self.assertEqual(len(partial), 4)
 
 
+class ContinuousGoalsTaskTest(unittest.TestCase):
+    def setUp(self):
+        self.spec = load_pose_task(os.path.join(REPO, 'configs', 'pose_tasks', 'continuous_goals.yaml'))
+        self.task = self.spec['task']
+
+    def test_goals_sit_at_their_condition_with_two_orientations(self):
+        from utils.eval_utils import _rotvec
+        from utils.tf_utils import _quat_to_rot_mat
+        torch.manual_seed(0)
+        c = self.task.sample_conditions(2000)
+        self.assertLessEqual(c.norm(dim=1).max().item(), 5.0)
+        self.assertEqual(self.spec['obs_dim'], 2)
+        self.assertTrue(torch.allclose(self.task.obs(c)[:, 0], c / 5))
+        twists, k = self.task.sample_goals(c)
+        self.assertTrue(torch.allclose(twists[:, 1:3], c, atol=0.6))       # 6σ
+        self.assertAlmostEqual(twists[:, 0].mean().item(), 5.0, delta=0.02)
+        self.assertAlmostEqual(k.float().mean().item(), 0.5, delta=0.05)    # equal odds
+        modes = self.task.mode_poses(c[:3])                                  # [3, 2, 7]
+        R = _quat_to_rot_mat(modes.reshape(-1, 7)[:, 3:]).reshape(3, 2, 3, 3)
+        between = _rotvec(R[:, 0].transpose(-1, -2) @ R[:, 1])
+        self.assertTrue(torch.allclose(between, torch.tensor([0., 0., -0.5]).expand(3, 3), atol=1e-4))
+        base = self.task.mode_twists(c[:3])[:, :, 5].mean(1)
+        self.assertTrue(torch.allclose(base, 1.5708 + 0.5 * c[:3, 0] / 5))
+
+    def test_test_conditions_are_fixed(self):
+        self.assertTrue(torch.equal(self.task.test_conditions(), self.task.test_conditions()))
+        self.assertEqual(self.task.test_conditions().shape, (16, 2))
+
+    def test_batch_sampler_shapes(self):
+        from utils.pose_task import pose_batch_sampler
+        start, goal, obs, ids = pose_batch_sampler(self.spec)(32)
+        self.assertEqual((start.shape, goal.shape, obs.shape, ids), ((32, 1, 6), (32, 1, 6), (32, 1, 2), None))
+
+
+class JitterTaskTest(unittest.TestCase):
+    def test_same_modes_as_two_orientations_with_noisy_tokens(self):
+        from utils.pose_task import pose_batch_sampler
+        jitter = load_pose_task(os.path.join(REPO, 'configs', 'pose_tasks', 'corners_two_orientations_jitter.yaml'))
+        clean = load_pose_task(os.path.join(REPO, 'configs', 'pose_tasks', 'corners_two_orientations.yaml'))
+        self.assertEqual(jitter['goal_dist_params'], clean['goal_dist_params'])
+        self.assertEqual(jitter['action_dist_params']['mu'], clean['action_dist_params']['mu'])
+        torch.manual_seed(0)
+        _, _, obs, ids = pose_batch_sampler(jitter)(4096)
+        # the sampler lays the 8 modes out in order, 4096 / 8 rows each
+        clean_obs = torch.tensor(clean['action_dist_params']['mu']).repeat_interleave(4096 // 8, dim=0)
+        self.assertAlmostEqual((obs - clean_obs).std().item(), 0.1, delta=0.005)
+        self.assertEqual(torch.unique(obs.flatten(1), dim=0).shape[0], 4096)  # every condition differs
+
+
 class GeneralTaskTest(unittest.TestCase):
     def test_modes_sharing_tokens_form_one_multimodal_condition(self):
         path = write_task("""

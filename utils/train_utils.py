@@ -136,7 +136,7 @@ def _pair_within_conditions(start, goal, cond_ids, pair_fn):
 #   c2ot         cost + w·d(c_i, c_j), w set per batch so a share r_tar of all pairs are
 #                admissible [C²OT, Cheng & Schwing 2025]
 #   c2ot_fixed   cost + w·d with one large w fixed at the start [COT-FM, Kerrigan et al. 2024]
-#   cluster      cost + γ·|c̄_noise,i − c̄_j|² on K-means centroids of the conditions
+#   cluster      cost + γ·|c̄_i − c̄_j|² on K-means centroids of the conditions
 #                [COT Policy, Sochopoulos et al. 2025]
 # Noise i starts out carrying the condition c_i of the data row it was drawn with, which is a
 # random partner. d is the squared distance between condition vectors. Only the noise is
@@ -194,7 +194,23 @@ def c2ot_weight(base, cond_dist, r_tar, w_init=None, iters=30, max_doublings=60)
 
 def nearest_centroid(cond, centroids):
     """Index of each condition's nearest centroid [B]."""
-    return _sq_dists(cond, centroids).argmin(dim=1)
+    return torch.cdist(cond, centroids).argmin(dim=1)
+
+
+def kmeans(x, k, iters=30):
+    """Lloyd's K-means with k-means++ seeding on x's device (global RNG). x [N, C] -> [k, C]."""
+    centroids = x[torch.randint(x.shape[0], (1,), device=x.device)]
+    d2 = _sq_dists(x, centroids).squeeze(1)
+    for _ in range(1, k):
+        new = x[torch.multinomial(d2 / d2.sum(), 1)]
+        centroids = torch.cat([centroids, new])
+        d2 = torch.minimum(d2, _sq_dists(x, new).squeeze(1))
+    for _ in range(iters):
+        assign = nearest_centroid(x, centroids)
+        counts = torch.bincount(assign, minlength=k).unsqueeze(1)
+        sums = torch.zeros_like(centroids).index_add_(0, assign, x)
+        centroids = torch.where(counts > 0, sums / counts.clamp_min(1), centroids)
+    return centroids
 
 
 def condition_aware_pairing(start, goal, method, cond=None, cond_ids=None, manifold='se3',
@@ -232,9 +248,10 @@ def condition_aware_pairing(start, goal, method, cond=None, cond_ids=None, manif
         cost = base + w * d
         info = {'w': w, 'r': admissible_ratio(base, d, w)}
     elif method == 'cluster':
+        # COT Policy gives the noise a random permutation of the batch's centroids. Noise and
+        # data are drawn independently here, so noise i's own partner already is one.
         cbar = centroids[nearest_centroid(cond, centroids)]
-        cnoise = cbar[torch.randperm(cbar.shape[0], device=cbar.device)]
-        d = _sq_dists(cnoise, cbar)
+        d = _sq_dists(cbar, cbar)
         gamma = (gamma_scale * base.mean() / d.mean().clamp_min(1e-12)).item()
         cost = base + gamma * d
         info = {'gamma': gamma}
@@ -276,16 +293,12 @@ class Pairer:
         return scale * base_sum / cond_sum
 
     def _fit_centroids(self, k, n=100_000):
-        from scipy.cluster.vq import kmeans2
         conds, have = [], 0
         while have < n:
             obs = self.sampler(self.ot_batch)[2]
-            conds.append(obs.flatten(1).cpu())
+            conds.append(obs.flatten(1))
             have += obs.shape[0]
-        conds = torch.cat(conds)[:n].double().numpy()
-        seed = int(torch.randint(2 ** 31 - 1, (1,)).item())
-        centroids, _ = kmeans2(conds, k, iter=20, minit='++', rng=seed)
-        return torch.tensor(centroids, dtype=torch.float32, device=obs.device)
+        return kmeans(torch.cat(conds)[:n], k)
 
     def next_batch(self):
         """(start, goal, obs) for one network step; obs is None for unconditional models."""
