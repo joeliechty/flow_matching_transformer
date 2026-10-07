@@ -619,9 +619,11 @@ def fig_continuous_overview(plt, out):
                 ax.scatter(i + np.linspace(-0.12, 0.12, len(vals)), vals, s=36, marker=st['marker'],
                            color=st['color'], zorder=3)
                 ax.plot([i - 0.25, i + 0.25], [vals.mean()] * 2, color=st['color'], lw=2.5, zorder=4)
-                ax.text(i + 0.28, vals.mean(), f'{vals.mean():.3g}', va='center', fontsize=9, color=INK2)
+                ax.text(i, vals.max() * 1.35, f'{vals.mean():.3g}', ha='center', va='bottom', fontsize=9,
+                        color=INK2)
             data_line(ax, data_value(task, 'energy_distance'), where='left')
             ax.set_yscale('log')
+            ax.set_ylim(None, ax.get_ylim()[1] * 2.5)
             ax.set_xticks(range(len(variants)))
             ax.set_xticklabels([SHORT[v] for v in variants], fontsize=9.5)
             ax.set_xlim(-0.5, len(variants) - 0.2)
@@ -742,13 +744,51 @@ def fig_continuous_violins(plt, out, device):
     plt.close(fig)
 
 
+def fig_sensitivity(plt, out, task='pose_continuous_goals', variant='cond_C2OTFIX_NOCFG'):
+    """The sensitivity sweep of one pairing: energy distance vs. steps for each setting."""
+    ramp = ('#86b6ef', '#2a78d6', '#104281')  # one hue, light -> dark = small -> large
+    panels = [('OT batch (network batches per assignment)',
+               [('ot_batch_x1', '×1 (128)'), (None, '×4 (512), main runs'), ('ot_batch_x10', '×10 (1280)')]),
+              ('condition weight cond_scale (smaller = looser)',
+               [('cond_scale_0.35', '0.35 (skew 0.035)'), (None, '0.7, calibrated (skew 0.017)'),
+                ('cond_scale_1.4', '1.4 (skew 0.002)')])]
+    main_rows = results(task, 'steps_sweep')
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2), sharey=True)
+    for ax, (title, settings) in zip(axes, panels):
+        vals = np.stack([per_seed(main_rows, 'cond_NOOT_NOCFG', 'energy_distance', num_steps=n) for n in STEPS], 1)
+        ax.fill_between(STEPS, vals.min(0), vals.max(0), color=ORANGE, alpha=0.12, lw=0)
+        ax.plot(STEPS, vals.mean(0), color=ORANGE, ls='--', lw=1.8, marker='s', ms=6,
+                label='random pairing (I-CFM), 5 seeds')
+        for color, (name, label) in zip(ramp, settings):
+            if name is None:
+                rows = main_rows
+            else:
+                d = REPO_ROOT / f'experiments/results/{task}/sensitivity/{name}/epoch_{EPOCH}'
+                rows = {s: read(d / f'seed_{s}/steps_sweep.csv') for s in (1, 2, 3)}
+            vals = np.stack([per_seed(rows, variant, 'energy_distance', num_steps=n) for n in STEPS], 1)
+            ax.fill_between(STEPS, vals.min(0), vals.max(0), color=color, alpha=0.12, lw=0)
+            ax.plot(STEPS, vals.mean(0), color=color, lw=1.8, marker='o', ms=6,
+                    label=f'{label}, {len(rows)} seeds')
+        ax.set_xscale('log'); ax.set_yscale('log')
+        ax.set_xticks(STEPS); ax.set_xticklabels([str(n) for n in STEPS]); ax.minorticks_off()
+        ax.set_xlabel('Euler steps at sampling (log)')
+        ax.set_title(title, fontsize=11.5)
+        ax.legend(fontsize=9.5, loc='upper right')
+    axes[0].set_ylabel('energy distance (log), lower is better')
+    fig.suptitle('Fixed-weight pairing on continuous goals: one setting varied at a time '
+                 '(mean, shading = seed range)', y=1.0)
+    fig.tight_layout()
+    save(fig, out, 'continuous_sensitivity.png')
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out', default='docs/ablations')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--part', choices=('discrete', 'continuous'), default='discrete')
     parser.add_argument('--only', nargs='+', default=None,
-                        help='continuous part: just these figures (calibration toys overview steps violins)')
+                        help='continuous part: just these figures (calibration toys overview steps violins sensitivity)')
     args = parser.parse_args()
     out = REPO_ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -758,7 +798,8 @@ def main():
                 'toys': lambda: fig_toys(plt, out, args.device),
                 'overview': lambda: fig_continuous_overview(plt, out),
                 'steps': lambda: fig_continuous_steps(plt, out),
-                'violins': lambda: fig_continuous_violins(plt, out, args.device)}
+                'violins': lambda: fig_continuous_violins(plt, out, args.device),
+                'sensitivity': lambda: fig_sensitivity(plt, out)}
         for name in args.only or figs:
             figs[name]()
         return
