@@ -33,24 +33,41 @@ Geodesic OT can be applied at different granularities depending on whether the s
 * **Per-frame** (`sequence_ot_pairing` in [utils/train_utils.py](utils/train_utils.py)) computes an independent Hungarian assignment for each slot in the action chunk. Used by the SE(3) pose trainer, where each slot is a separate pose with no spatial neighbor relationship.
 * **Flat** (`flat_ot_pairing` in [utils/train_utils.py](utils/train_utils.py)) flattens `[B, S*D]` and computes a single permutation across the whole image. Used by the MNIST trainer, because independent per-patch OT would scramble spatial coherence and break the image structure of the noise samples.
 
-### 6. Time Sampling: Grid vs Continuous (Rectified Flow) [4]
+### 6. OT Pairing with Continuous Conditions [10–15]
+Minibatch OT and conditioning interact. A conditional model is sampled from the full noise distribution under every condition, so during training each condition has to see all of the noise distribution too.
+* **Plain (global) OT skews the prior.** Pairing across a mixed-condition batch hands each condition only the noise samples nearest its own goals. The model never learns what to do with the rest of the noise, but sampling draws from all of it [10]. In this repo's pose ablations, this made conditional models worse than no OT at all.
+* **Per-condition OT fixes this for discrete conditions.** `_pair_within_conditions` in [utils/train_utils.py](utils/train_utils.py) runs the Hungarian assignment separately within each condition. It is the pose trainer's default (`--pairing ot`).
+* **Per-condition OT breaks down for continuous conditions.** When every condition is slightly different (a continuous goal, a noisy observation), each group holds a single sample, so per-condition pairing is just random pairing (I-CFM) and the few-step benefit of OT is lost.
+
+The way out is to let noise move only between *nearby* conditions. If the conditional distribution p(x | c) changes smoothly with c, samples with nearby conditions are nearly samples of the same conditional, and pairing among them keeps each condition's noise close to the full prior. Three ways of doing this are implemented (`condition_aware_pairing` and `Pairer` in [utils/train_utils.py](utils/train_utils.py), selected with `--pairing`). In each, noise sample i starts out carrying the condition c_i of the data sample it was drawn with:
+* **Soft condition penalty with an adaptive weight (`c2ot`) [10].** One Hungarian assignment over the whole batch, with cost `C[i,j] = cost(x0_i, x1_j) + w · ‖c_i − c_j‖²`. At w = 0 this is plain OT; as w → ∞ every noise sample stays with its own condition (per-condition OT for discrete conditions, random pairing for continuous ones). C²OT sets w per batch by bisection, so that a target share `r_tar` (default 0.01) of all pairs is admissible: they cost no more than the noise sample's original random partner. That removes any dependence on the scale of the condition metric.
+* **Fixed large weight (`c2ot_fixed`) [12, 13].** The same cost with one large w, fixed at the start of training. This is the minibatch form of dynamic conditional OT (COT-FM) and Bayesian OT flow matching; their theory shows that the weighted problem recovers the conditional OT plan as w → ∞.
+* **Cluster, then match (`cluster`) [11].** COT Policy quantizes the conditions with K-means (K about the batch size, with PCA first for image observations) and adds `γ · ‖c̄_i − c̄_j‖²` on the cluster centroids. γ is set per batch so the condition term outweighs the sample term about 10×. The network still sees the raw condition.
+
+Two practical points:
+* **The OT batch size matters.** The penalty only helps if each sample has partners with nearby conditions in its batch, and their number falls quickly as the condition dimension grows. C²OT solves one assignment over an OT batch several times the network batch and splits it into network batches (`--ot_batch_mult`).
+* **Beyond minibatches.** Semidiscrete flow matching (SD-FM) [14] pairs fresh noise with the whole dataset through a learned dual potential, which removes the minibatch limit. Conditional variable flow matching [15] amortizes conditional OT across continuous conditions. Neither is implemented here.
+
+The comparison of these pairings on continuous-condition pose tasks is in [ablations_summary.md](ablations_summary.md#part-2-continuous-conditioning).
+
+### 7. Time Sampling: Grid vs Continuous (Rectified Flow) [4]
 Flow matching has freedom in how the time variable `t ∈ [0, 1]` is sampled during training; both regimes are implemented in `_run_flow_matching_step` ([utils/train_utils.py](utils/train_utils.py)).
 * **Grid sampling** pre-computes `n_steps` interpolated states per sample and fans the batch out to `[B*n_steps, S, D]` for one minibatch. This is the SE(3) trainer's default — it amortizes the cost of geodesic interpolation across many `t` values per pose pair.
 * **Continuous sampling** (Rectified Flow / I-CFM standard) samples a single `t ~ U(0, 1)` per example and evaluates the loss only there. This is the image trainer's default — it scales better to large batches and avoids overcommitting compute to redundant `t` values when the manifold is Euclidean.
 
-### 7. Transformer Backbone and AdaLN [5]
+### 8. Transformer Backbone and AdaLN [5]
 The core architecture ([models/flow_matching_transformer.py](models/flow_matching_transformer.py)) relies on a sequence-to-sequence Transformer.
 * Timestep Conditioning: The continuous time variable t in [0, 1] is embedded using sinusoidal positional encodings and injected into every layer via Adaptive Layer Normalization (AdaLN). This modulates the scale and shift of the features based on the current integration phase.
 
-### 8. 2D Sin-Cos Positional Embeddings and Learned Null Tokens [2]
+### 9. 2D Sin-Cos Positional Embeddings and Learned Null Tokens [2]
 Two small architectural details are worth calling out because they materially affect conditional image generation.
 * **2D sin-cos positional embeddings** (`get_2d_sincos_pos_embed` in [models/support_models.py](models/support_models.py)) give each of the 49 MNIST patches a position encoding that splits row and column into separate sinusoidal halves. This DiT-style spatial inductive bias outperforms a single learned 1D embedding when the token grid has a known 2D layout.
-* **Learned null token** ([models/conditional_flow_matching_transformer.py:121](models/conditional_flow_matching_transformer.py#L121)) is a trainable `[1, 1, hidden_dim]` parameter that replaces observation embeddings on the unconditional path (training dropout and CFG inference). Unlike zero-masking, the network learns an explicit representation of "no condition," which is what makes the double-pass CFG extrapolation in section 10 numerically well-behaved.
+* **Learned null token** ([models/conditional_flow_matching_transformer.py:121](models/conditional_flow_matching_transformer.py#L121)) is a trainable `[1, 1, hidden_dim]` parameter that replaces observation embeddings on the unconditional path (training dropout and CFG inference). Unlike zero-masking, the network learns an explicit representation of "no condition," which is what makes the double-pass CFG extrapolation in section 11 numerically well-behaved.
 
-### 9. Cross-Attention for Multimodal Conditioning [9]
+### 10. Cross-Attention for Multimodal Conditioning [9]
 The `ConditionalFlowMatchingTransformerModel` extends the architecture to support goal-directed generation. Discrete actions or observations (e.g., "top", "left") are embedded and passed as context to a Cross-Attention mechanism, allowing the vector field to split into multimodal trajectories based on the specified condition.
 
-### 10. Classifier-Free Guidance (CFG) [3]
+### 11. Classifier-Free Guidance (CFG) [3]
 Classifier-free guidance lets a single conditional model trade off sample diversity for stronger adherence to its conditioning at inference time, without training a separate classifier.
 * Training: With probability ~10% (see `_run_flow_matching_step` in [utils/train_utils.py](utils/train_utils.py)), conditioning tokens are replaced with a learned null embedding. The model therefore learns both the conditional vector field v(x, t | c) and the unconditional vector field v(x, t | ∅) simultaneously.
 * Inference: At each ODE step, two forward passes are run — one with the real condition, one with the null condition — and the result is extrapolated as `v = v_uncond + cfg_scale * (v_cond - v_uncond)` (see `inference` in [models/conditional_flow_matching_transformer.py](models/conditional_flow_matching_transformer.py)). `cfg_scale = 1.0` recovers the standard conditional flow; higher values push the trajectory more aggressively toward the conditioned mode at the cost of diversity.
@@ -101,6 +118,11 @@ Useful Flags:
 * `--conditional` / `-C`: Trains the conditional model variant with action-token cross-attention; omit for the unconditional model.
 * `--no_ot` / `-NOOT`: Disables Optimal Transport pairing (useful for seeing how OT improves flow straightness).
 * `--no_cfg` / `-NOCFG`: Disables classifier-free guidance (no unconditional dropout during training).
+* `--pairing`: How noise is paired with data (section 6). `ot` (default) runs OT within each condition, or over the whole batch for unconditional models; `independent` is the same as `--no_ot`; `global`, `c2ot`, `c2ot_fixed` and `cluster` are the pairings for continuous conditions. The checkpoint suffix follows the pairing (`_OT`, `_NOOT`, `_GOT`, `_C2OT`, `_C2OTFIX`, `_CLUSTER`).
+* `--r_tar`: For `c2ot`, the target share of admissible pairs that sets the condition weight (default 0.01).
+* `--ot_batch_mult`: Pairs over this many network batches at once, then splits them (default 1).
+* `--num_clusters`: For `cluster`, the number of K-means clusters (default: the OT batch size).
+* `--task_config`: Pose task file in [configs/pose_tasks/](configs/pose_tasks/) (goal modes and conditioning).
 * `--n_steps`: Number of interpolation steps per trajectory during training.
 * `--seq_len` / `-S`: Sequence length per trajectory (action chunk size).
 * `--save_path`: Directory to save `.pt` checkpoints and `.yaml` config files.
@@ -214,3 +236,15 @@ With `--return_trajectory`, the script tiles intermediate timesteps so you can s
 [8] Zhou, Y., Barnes, C., Lu, J., Yang, J., & Li, H. (2018). On the Continuity of Rotation Representations in Neural Networks. arXiv. https://doi.org/10.48550/arxiv.1812.07035
 
 [9] Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., & Polosukhin, I. (2017). Attention Is All You Need. Advances in Neural Information Processing Systems. https://arxiv.org/abs/1706.03762
+
+[10] Cheng, H. K., & Schwing, A. (2025). The Curse of Conditions: Analyzing and Improving Optimal Transport for Conditional Flow-Based Generation. IEEE/CVF International Conference on Computer Vision (ICCV 2025). https://arxiv.org/abs/2503.10636
+
+[11] Sochopoulos, A., Malkin, N., Tsagkas, N., Moura, J., Gienger, M., & Vijayakumar, S. (2025). Fast Flow-based Visuomotor Policies via Conditional Optimal Transport Couplings. Proceedings of the 9th Conference on Robot Learning (CoRL), PMLR 305, 3357-3377. https://arxiv.org/abs/2505.01179
+
+[12] Kerrigan, G., Migliorini, G., & Smyth, P. (2024). Dynamic Conditional Optimal Transport through Simulation-Free Flows. Advances in Neural Information Processing Systems 37 (NeurIPS 2024). https://arxiv.org/abs/2404.04240
+
+[13] Chemseddine, J., Hagemann, P., Steidl, G., & Wald, C. (2025). Conditional Wasserstein Distances with Applications in Bayesian OT Flow Matching. Journal of Machine Learning Research, 26(141). https://arxiv.org/abs/2403.18705
+
+[14] Mousavi-Hosseini, A., Zhang, S. Y., Klein, M., & Cuturi, M. (2026). Flow Matching with Semidiscrete Couplings. International Conference on Learning Representations (ICLR 2026). https://arxiv.org/abs/2509.25519
+
+[15] Generale, A. P., Robertson, A. E., & Kalidindi, S. R. (2024). Conditional Variable Flow Matching: Transforming Conditional Densities with Amortized Conditional Optimal Transport. arXiv. https://arxiv.org/abs/2411.08314

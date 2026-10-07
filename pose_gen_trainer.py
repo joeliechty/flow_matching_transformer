@@ -5,13 +5,17 @@ import numpy as np
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, compute_twist_between_poses, add_twist_to_pose
 from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel
 from models.flow_matching_transformer import FlowMatchingTransformerModel
-from utils.train_utils import generate_interpolated_poses, train
+from utils.train_utils import PAIRINGS, Pairer, generate_interpolated_poses, sample_pose_batch, train
 from omegaconf import OmegaConf
 from utils.logging_utils import _Tee, git_commit
 from utils.pose_task import load_pose_task
 
 DEFAULT_TASK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             'configs', 'pose_tasks', 'four_corners.yaml')
+
+# Checkpoint-name suffix of each noise-data pairing (see `utils.train_utils.PAIRINGS`).
+PAIRING_SUFFIX = {'independent': '_NOOT', 'ot': '_OT', 'global': '_GOT', 'c2ot': '_C2OT',
+                  'c2ot_fixed': '_C2OTFIX', 'cluster': '_CLUSTER'}
 
 def parse_args():
     import argparse
@@ -28,8 +32,29 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42, help='Random seed for torch/numpy/random (for reproducible ablations)')
     parser.add_argument('--task_config', type=str, default=DEFAULT_TASK,
                         help='Pose task file: start/goal distributions and conditioning tokens')
+    parser.add_argument('--pairing', type=str, default=None, choices=PAIRINGS,
+                        help="Noise-data pairing (default: 'ot', or 'independent' with --no_ot). "
+                             "'global', 'c2ot', 'c2ot_fixed' and 'cluster' are for continuous conditions")
+    parser.add_argument('--r_tar', type=float, default=0.01,
+                        help="c2ot: target share of admissible pairs that sets the condition weight")
+    parser.add_argument('--ot_batch_mult', type=int, default=1,
+                        help='Pair over this many network batches at once (the OT batch)')
+    parser.add_argument('--num_clusters', type=int, default=None,
+                        help='cluster: K-means clusters of the conditions (default: the OT batch size)')
     args = parser.parse_args()
+    if args.pairing is None:
+        args.pairing = 'independent' if args.no_ot else 'ot'
+    elif args.no_ot and args.pairing != 'independent':
+        parser.error('--no_ot contradicts --pairing ' + args.pairing)
+    if not args.conditional and args.pairing not in ('independent', 'ot', 'global'):
+        parser.error(f'--pairing {args.pairing} needs conditions; add --conditional')
     return args
+
+
+def run_name(args):
+    """Checkpoint stem, e.g. 'cond_pose_flow_matching_model_C2OT_NOCFG'."""
+    model = 'cond_pose_flow_matching_model' if args.conditional else 'pose_flow_matching_model'
+    return f"{model}{PAIRING_SUFFIX[args.pairing]}{'_NOCFG' if args.no_cfg else '_CFG'}"
 
 
 def set_seed(seed):
@@ -56,20 +81,19 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
     else:
         batch_size = args.batch_size
 
-    ot_suffix = '_NOOT' if args.no_ot else '_OT'
-    cfg_suffix = '_NOCFG' if args.no_cfg else '_CFG'
-    if args.conditional:
-        save_path = os.path.join(args.save_path, f'cond_pose_flow_matching_model{ot_suffix}{cfg_suffix}')
-        obs_dim = len(action_dist_params['mu'][0][0])  # action token size (6 for twist actions)
-    else:
-        save_path = os.path.join(args.save_path, f'pose_flow_matching_model{ot_suffix}{cfg_suffix}')
-        obs_dim = None
+    save_path = os.path.join(args.save_path, run_name(args))
+    # action token size (6 for twist actions)
+    obs_dim = len(action_dist_params['mu'][0][0]) if args.conditional else None
 
     # make a config object
     training_config = {
         'conditional': args.conditional,
-        'use_ot': not args.no_ot,
+        'use_ot': args.pairing != 'independent',
         'use_cfg': not args.no_cfg,
+        'pairing': args.pairing,
+        'r_tar': args.r_tar,
+        'ot_batch_mult': args.ot_batch_mult,
+        'num_clusters': args.num_clusters,
         'seed': args.seed,
         'git_commit': git_commit(),
         'task': task_name,
@@ -144,11 +168,7 @@ if __name__ == "__main__":
     set_seed(args.seed)
     print(f"Seed: {args.seed}")
 
-    _ot_suffix = '_NOOT' if args.no_ot else '_OT'
-    _cfg_suffix = '_NOCFG' if args.no_cfg else '_CFG'
-    _model_name = 'cond_pose_flow_matching_model' if args.conditional else 'pose_flow_matching_model'
-    _log_root = os.path.join(args.save_path, f'{_model_name}{_ot_suffix}{_cfg_suffix}')
-    _tee = _Tee(_log_root + '_log.txt')
+    _tee = _Tee(os.path.join(args.save_path, run_name(args)) + '_log.txt')
 
     # Set device (cuda > mps > cpu)
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
@@ -201,6 +221,16 @@ if __name__ == "__main__":
     
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr, weight_decay=config.training.weight_decay)
+
+    # The original 'ot' / 'independent' runs keep their exact training path (and RNG stream);
+    # every other pairing, or a bigger OT batch, draws paired batches from a Pairer.
+    pairer = None
+    if config.training.pairing not in ('ot', 'independent') or config.training.ot_batch_mult > 1:
+        t = config.training
+        sampler = lambda n: sample_pose_batch(n, t.start_dist_params, t.goal_dist_params,
+                                              t.action_dist_params, seq_len=t.seq_len, device=device)
+        pairer = Pairer(t.pairing, sampler, t.batch_size, ot_batch_mult=t.ot_batch_mult,
+                        r_tar=t.r_tar, num_clusters=t.num_clusters)
     
     # Train the model
     loss_history = train(
@@ -217,7 +247,8 @@ if __name__ == "__main__":
         use_ot=config.training.use_ot,
         use_cfg=config.training.use_cfg,
         device=device,
-        save_path=config.training.save_path
+        save_path=config.training.save_path,
+        pairer=pairer,
     )
     
     # Plot loss history

@@ -62,6 +62,15 @@ def optimal_transport_pairing(start, goal, manifold='se3'):
     Returns:
         paired_start: Tensor of shape [batch_size, D], reordered for OT.
     """
+    dists = _pairwise_cost(start, goal, manifold)
+    row_ind, col_ind = linear_sum_assignment(dists.detach().cpu().numpy())
+    sorted_indices = np.argsort(col_ind)
+    return start[row_ind[sorted_indices]]
+
+
+def _pairwise_cost(start, goal, manifold='se3'):
+    """[B, B] cost of pairing start i with goal j: the geodesic twist norm ('se3') or L2
+    ('euclidean'), unsquared."""
     if manifold == 'se3':
         # Convert twists to quaternion poses for geodesic distance
         start_pose = convert_twist_to_pose(start, dt=1.0, return_representation='quat')
@@ -80,10 +89,7 @@ def optimal_transport_pairing(start, goal, manifold='se3'):
         dists = torch.cdist(start, goal, p=2)
     else:
         raise ValueError(f"Unknown manifold: {manifold!r}.")
-
-    row_ind, col_ind = linear_sum_assignment(dists.detach().cpu().numpy())
-    sorted_indices = np.argsort(col_ind)
-    return start[row_ind[sorted_indices]]
+    return dists
 
 
 # Backward-compat alias for any external callers
@@ -115,6 +121,190 @@ def _pair_within_conditions(start, goal, cond_ids, pair_fn):
         idx = (cond_ids == c).nonzero(as_tuple=True)[0]
         paired[idx] = pair_fn(start[idx], goal[idx])
     return paired
+
+
+# -- condition-aware pairing ------------------------------------------------------------
+#
+# A conditional model is sampled from the full noise distribution under every condition, so
+# training should show each condition all of it. Pairing within each condition does that
+# for discrete conditions, but when every condition differs (continuous or noisy ones) each
+# group is a single sample and it falls back to random pairing. The pairings (readme
+# section 6):
+#   independent  random pairing (I-CFM)
+#   ot           OT within each discrete condition id; global OT when there are none
+#   global       OT over the whole batch, ignoring conditions (skews each condition's noise)
+#   c2ot         cost + w·d(c_i, c_j), w set per batch so a share r_tar of all pairs are
+#                admissible [C²OT, Cheng & Schwing 2025]
+#   c2ot_fixed   cost + w·d with one large w fixed at the start [COT-FM, Kerrigan et al. 2024]
+#   cluster      cost + γ·|c̄_noise,i − c̄_j|² on K-means centroids of the conditions
+#                [COT Policy, Sochopoulos et al. 2025]
+# Noise i starts out carrying the condition c_i of the data row it was drawn with, which is a
+# random partner. d is the squared distance between condition vectors. Only the noise is
+# reordered: the network sees each data row with its own condition.
+PAIRINGS = ('independent', 'ot', 'global', 'c2ot', 'c2ot_fixed', 'cluster')
+
+
+def _batch_cost(start, goal, manifold='se3', ot_mode='per_frame'):
+    """[B, B] cost of pairing noise sequence i with data sequence j [B, S, D]: per-frame
+    costs summed ('per_frame'), or the L2 cost of the flattened sequences ('flat')."""
+    if ot_mode == 'flat':
+        return _pairwise_cost(start.flatten(1), goal.flatten(1), manifold='euclidean')
+    return sum(_pairwise_cost(start[:, s], goal[:, s], manifold) for s in range(start.shape[1]))
+
+
+def _sq_dists(a, b):
+    """[N, M] squared Euclidean distances between the rows of a [N, C] and b [M, C]."""
+    return (a.unsqueeze(1) - b.unsqueeze(0)).pow(2).sum(-1)
+
+
+def _assignment(cost):
+    """Hungarian assignment as an index into the noise: noise perm[j] goes with data row j."""
+    row, col = linear_sum_assignment(cost.detach().cpu().numpy())
+    return torch.as_tensor(row[np.argsort(col)], device=cost.device)
+
+
+def admissible_ratio(base, cond_dist, w):
+    """C²OT's r(w): the share of (noise i, data j) pairs whose cost, condition penalty
+    included, is no more than that of noise i's own random partner (j = i)."""
+    return ((base + w * cond_dist) <= base.diagonal().unsqueeze(1)).float().mean().item()
+
+
+def c2ot_weight(base, cond_dist, r_tar, w_init=None, iters=30, max_doublings=60):
+    """Condition weight w with r(w) ≈ r_tar: exponential search for an upper bound, then
+    bisection (r falls as w grows). When no w gets there, because pairs with identical
+    conditions alone exceed r_tar (discrete conditions), the largest w tried is returned,
+    which pairs within conditions."""
+    if cond_dist.max() == 0 or admissible_ratio(base, cond_dist, 0.0) <= r_tar:
+        return 0.0
+    lo, hi = 0.0, w_init or (base.mean() / cond_dist.mean()).item()
+    for _ in range(max_doublings):
+        if admissible_ratio(base, cond_dist, hi) <= r_tar:
+            break
+        lo, hi = hi, hi * 2
+    else:
+        return hi
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        if admissible_ratio(base, cond_dist, mid) > r_tar:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def nearest_centroid(cond, centroids):
+    """Index of each condition's nearest centroid [B]."""
+    return _sq_dists(cond, centroids).argmin(dim=1)
+
+
+def condition_aware_pairing(start, goal, method, cond=None, cond_ids=None, manifold='se3',
+                            ot_mode='per_frame', r_tar=0.01, w=None, centroids=None,
+                            gamma_scale=10.0):
+    """Pair noise `start` [B, S, D] with data `goal` by one of `PAIRINGS`.
+
+    cond:      [B, C] condition vector of each data row (the flattened obs tokens).
+    cond_ids:  [B] discrete condition ids, for 'ot'.
+    w:         the condition weight for 'c2ot_fixed', or the search's warm start for 'c2ot'.
+    centroids: [K, C] K-means centroids of the conditions, for 'cluster'.
+
+    Returns the reordered noise (row j now goes with goal[j]) and a dict of what was chosen
+    ('w' and the realised admissible ratio 'r' for c2ot, 'gamma' for cluster).
+    """
+    if method == 'independent':
+        return start, {}
+    if method == 'ot':
+        if ot_mode == 'flat':
+            pair_fn = lambda s, g: flat_ot_pairing(s, g, manifold=manifold)
+        else:
+            pair_fn = lambda s, g: sequence_ot_pairing(s, g, manifold=manifold)
+        if cond_ids is None:
+            return pair_fn(start, goal), {}
+        return _pair_within_conditions(start, goal, cond_ids, pair_fn), {}
+
+    base = _batch_cost(start, goal, manifold, ot_mode)
+    info = {}
+    if method == 'global':
+        cost = base
+    elif method in ('c2ot', 'c2ot_fixed'):
+        d = _sq_dists(cond, cond)
+        if method == 'c2ot':
+            w = c2ot_weight(base, d, r_tar, w_init=w)
+        cost = base + w * d
+        info = {'w': w, 'r': admissible_ratio(base, d, w)}
+    elif method == 'cluster':
+        cbar = centroids[nearest_centroid(cond, centroids)]
+        cnoise = cbar[torch.randperm(cbar.shape[0], device=cbar.device)]
+        d = _sq_dists(cnoise, cbar)
+        gamma = (gamma_scale * base.mean() / d.mean().clamp_min(1e-12)).item()
+        cost = base + gamma * d
+        info = {'gamma': gamma}
+    else:
+        raise ValueError(f"Unknown pairing: {method!r}. Expected one of {PAIRINGS}.")
+    return start[_assignment(cost)], info
+
+
+class Pairer:
+    """Serves paired network batches for any of `PAIRINGS`.
+
+    One OT batch of `ot_batch_mult` network batches is drawn from `sampler(n)` -> (start,
+    goal, obs, cond_ids), paired at once, shuffled and handed out one network batch at a time.
+    A bigger OT batch gives each sample more near-condition partners to pair with [C²OT].
+    'c2ot_fixed' fixes w once, at 10× the ratio of mean sample cost to mean condition
+    distance; 'cluster' fits K-means centroids (K defaults to the OT batch size) once.
+    """
+
+    def __init__(self, method, sampler, batch_size, ot_batch_mult=1, manifold='se3',
+                 ot_mode='per_frame', r_tar=0.01, num_clusters=None):
+        if method not in PAIRINGS:
+            raise ValueError(f"Unknown pairing: {method!r}. Expected one of {PAIRINGS}.")
+        self.method, self.sampler, self.batch_size = method, sampler, batch_size
+        self.ot_batch = batch_size * ot_batch_mult
+        self.manifold, self.ot_mode, self.r_tar = manifold, ot_mode, r_tar
+        self.w, self.centroids, self.info, self.queue = None, None, {}, []
+        if method == 'c2ot_fixed':
+            self.w = self._fixed_weight()
+        elif method == 'cluster':
+            self.centroids = self._fit_centroids(num_clusters or self.ot_batch)
+
+    def _fixed_weight(self, n_batches=8, scale=10.0):
+        base_sum = cond_sum = 0.0
+        for _ in range(n_batches):
+            start, goal, obs, _ = self.sampler(self.ot_batch)
+            cond = obs.flatten(1)
+            base_sum += _batch_cost(start, goal, self.manifold, self.ot_mode).mean().item()
+            cond_sum += _sq_dists(cond, cond).mean().item()
+        return scale * base_sum / cond_sum
+
+    def _fit_centroids(self, k, n=100_000):
+        from scipy.cluster.vq import kmeans2
+        conds, have = [], 0
+        while have < n:
+            obs = self.sampler(self.ot_batch)[2]
+            conds.append(obs.flatten(1).cpu())
+            have += obs.shape[0]
+        conds = torch.cat(conds)[:n].double().numpy()
+        seed = int(torch.randint(2 ** 31 - 1, (1,)).item())
+        centroids, _ = kmeans2(conds, k, iter=20, minit='++', rng=seed)
+        return torch.tensor(centroids, dtype=torch.float32, device=obs.device)
+
+    def next_batch(self):
+        """(start, goal, obs) for one network step; obs is None for unconditional models."""
+        if not self.queue:
+            start, goal, obs, cond_ids = self.sampler(self.ot_batch)
+            cond = obs.flatten(1) if obs is not None else None
+            start, self.info = condition_aware_pairing(
+                start, goal, self.method, cond=cond, cond_ids=cond_ids, manifold=self.manifold,
+                ot_mode=self.ot_mode, r_tar=self.r_tar, w=self.w, centroids=self.centroids)
+            if self.method == 'c2ot':
+                self.w = self.info['w']  # warm start for the next OT batch
+            order = torch.randperm(self.ot_batch, device=start.device)
+            self.queue = [(start[idx], goal[idx], obs[idx] if obs is not None else None)
+                          for idx in order.split(self.batch_size)]
+        return self.queue.pop(0)
+
+    def describe(self):
+        """The last OT batch's chosen weights, for the training log."""
+        return ''.join(f", {k}: {v:.3g}" for k, v in self.info.items())
 
 
 def generate_interpolated_states(start, goal, n_steps=10, manifold='se3'):
@@ -280,6 +470,41 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
     """Pose-flow minibatch: samples start/goal twists from mode distributions (manifold='se3')."""
     model.train()
 
+    start_poses, goal_poses, obs, cond_ids = sample_pose_batch(
+        batch_size, start_dist_params, goal_dist_params, action_dist_params,
+        seq_len=seq_len, device=device)
+
+    return _run_flow_matching_step(
+        model, optimizer,
+        start=start_poses, goal=goal_poses, obs=obs,
+        n_steps=n_steps,
+        state_dim=7, vel_dim=6,
+        manifold='se3', use_ot=use_ot, use_cfg=use_cfg, device=device,
+        time_sampling='grid', ot_mode='per_frame', scheduler=scheduler,
+        cond_ids=cond_ids,
+    )
+
+
+def train_one_paired_minibatch(model, optimizer, pairer, n_steps, use_cfg=True, device='cpu',
+                               scheduler=None, manifold='se3', time_sampling='grid'):
+    """One step on the next network batch from `pairer` (already paired). SE(3) pose flows use
+    the grid time sampling of `train_one_minibatch`; Euclidean ones may sample t continuously."""
+    model.train()
+    start, goal, obs = pairer.next_batch()
+    dim = goal.shape[-1]
+    state_dim, vel_dim = (7, 6) if manifold == 'se3' else (dim, dim)
+    return _run_flow_matching_step(
+        model, optimizer, start=start, goal=goal, obs=obs, n_steps=n_steps,
+        state_dim=state_dim, vel_dim=vel_dim, manifold=manifold, use_ot=False, use_cfg=use_cfg,
+        device=device, time_sampling=time_sampling, ot_mode=pairer.ot_mode, scheduler=scheduler,
+    )
+
+
+def sample_pose_batch(batch_size, start_dist_params, goal_dist_params, action_dist_params,
+                      seq_len=1, device='cpu'):
+    """A pose batch from the mode distributions: start and goal twists [B, seq_len, 6], laid
+    out mode by mode, with obs tokens [B, M, obs_dim] and condition ids [B] for conditional
+    tasks (None otherwise)."""
     if batch_size % len(goal_dist_params['mu']) != 0:
         raise ValueError("Batch size must be divisible by the number of goal distribution modes.")
 
@@ -335,15 +560,7 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
         obs = None
         cond_ids = None
 
-    return _run_flow_matching_step(
-        model, optimizer,
-        start=start_poses, goal=goal_poses, obs=obs,
-        n_steps=n_steps,
-        state_dim=7, vel_dim=6,
-        manifold='se3', use_ot=use_ot, use_cfg=use_cfg, device=device,
-        time_sampling='grid', ot_mode='per_frame', scheduler=scheduler,
-        cond_ids=cond_ids,
-    )
+    return start_poses, goal_poses, obs, cond_ids
 
 
 def train_one_minibatch_image(model, optimizer, dataloader_iter, n_steps,
@@ -406,7 +623,7 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
                     goal_dist_params, action_dist_params, seq_len=1, use_ot=True, use_cfg=True,
                     device='cpu', manifold='se3', dataloader=None, num_classes=10,
                     patch_encode=None, time_sampling='continuous', ot_mode='flat',
-                    scheduler=None):
+                    scheduler=None, pairer=None):
     total_loss = 0.0
     completed = 0
 
@@ -439,16 +656,23 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
                 print(f"  Batch {batch_idx + 1}/{num_batches}, Loss: {loss:.6f}{lr_str}")
     else:
         for batch_idx in range(num_batches):
-            loss = train_one_minibatch(
-                model, optimizer, batch_size, n_steps,
-                start_dist_params, goal_dist_params, action_dist_params,
-                seq_len=seq_len, use_ot=use_ot, use_cfg=use_cfg, device=device,
-                scheduler=scheduler,
-            )
+            if pairer is None:
+                loss = train_one_minibatch(
+                    model, optimizer, batch_size, n_steps,
+                    start_dist_params, goal_dist_params, action_dist_params,
+                    seq_len=seq_len, use_ot=use_ot, use_cfg=use_cfg, device=device,
+                    scheduler=scheduler,
+                )
+            else:
+                loss = train_one_paired_minibatch(
+                    model, optimizer, pairer, n_steps, use_cfg=use_cfg, device=device,
+                    scheduler=scheduler,
+                )
             total_loss += loss
             completed += 1
             if (batch_idx + 1) % 10 == 0:
-                print(f"  Batch {batch_idx + 1}/{num_batches}, Loss: {loss:.6f}")
+                extra = pairer.describe() if pairer is not None else ''
+                print(f"  Batch {batch_idx + 1}/{num_batches}, Loss: {loss:.6f}{extra}")
 
     return total_loss / max(completed, 1)
 
@@ -457,10 +681,11 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
           start_dist_params=None, goal_dist_params=None, action_dist_params=None,
           seq_len=1, use_ot=True, use_cfg=True, device='cpu', save_path=None,
           manifold='se3', dataloader=None, num_classes=10, patch_encode=None,
-          time_sampling='continuous', ot_mode='flat', scheduler=None):
+          time_sampling='continuous', ot_mode='flat', scheduler=None, pairer=None):
     """
     Full training loop. SE(3) (default) trains from distribution params; 'euclidean' trains
-    from a torch DataLoader yielding (images, labels).
+    from a torch DataLoader yielding (images, labels). An SE(3) run given a `Pairer` draws
+    its (already paired) batches from it instead of from the distribution params.
     """
     loss_history = []
 
@@ -480,7 +705,7 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
             seq_len=seq_len, use_ot=use_ot, use_cfg=use_cfg, device=device,
             manifold=manifold, dataloader=dataloader, num_classes=num_classes,
             patch_encode=patch_encode,
-            time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler,
+            time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler, pairer=pairer,
         )
 
         loss_history.append(avg_loss)
