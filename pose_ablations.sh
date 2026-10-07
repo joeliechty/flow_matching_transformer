@@ -268,16 +268,45 @@ sensitivity_stage() {
     settings+=("${knob}_$v|--$knob $v")
   done
   settings+=("ot_batch_x1|--ot_batch_mult 1" "ot_batch_x10|--ot_batch_mult 10")
-  VARIANTS=("cond_pose_flow_matching_model_${suffix}_NOCFG|--conditional --no_cfg --pairing $pairing $flags")
+  local variant="cond_pose_flow_matching_model_${suffix}_NOCFG"
+  VARIANTS=("$variant|--conditional --no_cfg --pairing $pairing $flags")
   SEEDS="${SENS_SEEDS:-1 2 3}"
-  local base_flags="$EXTRA_FLAGS" name
+  local base_flags="$EXTRA_FLAGS" name seed running=0 failed=0
+  # Train every setting x seed from one job pool (train_one reads CKPT_ROOT and EXTRA_FLAGS
+  # when it forks), then evaluate each setting.
+  echo "=== Sensitivity ($TASK): $pairing, settings [${settings[*]%%|*}], seeds [$SEEDS] ==="
   for entry in "${settings[@]}"; do
     name="${entry%%|*}"
     EXTRA_FLAGS="$base_flags ${entry#*|}"   # later flags win
     CKPT_ROOT="checkpoints/$TASK_DIR/sensitivity/$name"
+    for seed in $SEEDS; do
+      mkdir -p "$CKPT_ROOT/seed_$seed"
+      if [[ -f "$CKPT_ROOT/seed_$seed/${variant}_epoch_${EPOCHS}.pt" ]]; then
+        echo "  skip    $name seed $seed (already trained)"
+        continue
+      fi
+      if (( running >= JOBS )); then
+        wait -n || failed=1
+        running=$(( running - 1 ))
+      fi
+      # shellcheck disable=SC2086  # flags are intentionally word-split
+      train_one "$seed" "$variant" ${VARIANTS[0]#*|} &
+      running=$(( running + 1 ))
+    done
+  done
+  while (( running > 0 )); do
+    wait -n || failed=1
+    running=$(( running - 1 ))
+  done
+  if (( failed )); then
+    echo "ERROR: some sensitivity runs failed (see above)" >&2
+    exit 1
+  fi
+  for entry in "${settings[@]}"; do
+    name="${entry%%|*}"
+    CKPT_ROOT="checkpoints/$TASK_DIR/sensitivity/$name"
     RESULTS_ROOT="experiments/results/$TASK_DIR/sensitivity/$name/epoch_$EVAL_EPOCH"
-    echo "=== Sensitivity: $pairing, $name ==="
-    train_stage
+    echo "=== Sensitivity eval: $pairing, $name ==="
     eval_stage
   done
 }
