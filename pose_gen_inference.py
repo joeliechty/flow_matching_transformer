@@ -165,8 +165,18 @@ def parse_args():
                         help="Checkpoints from before the fix (for --compare_ot_fix)")
     parser.add_argument('--after_dir', type=str, default='checkpoints/pose/seed_1/',
                         help="Checkpoints from after the fix (for --compare_ot_fix)")
-    parser.add_argument('--save_dir', type=str, default='experiments/results/pose/',
-                        help="Results directory for --compare_ot_fix: epoch figures go to <save_dir>/epoch_<CE>/")
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help="Results directory for the figures (epoch figures go to <save_dir>/epoch_<CE>/). "
+                             "Default: experiments/results/pose/ for --compare_ot_fix, "
+                             "experiments/results/<task dir of -CP>/ for --visualize_task")
+    # --visualize_task: figures for a task with several orientations per condition
+    parser.add_argument('--visualize_task', action='store_true',
+                        help="Save 3-D figures (mappings, rotation-space paths, goal close-ups, pairings) for the "
+                             "runs in -CP (default checkpoints/pose_corners_two_orientations/seed_1/)")
+    parser.add_argument('--few_steps', type=int, default=3,
+                        help="Few-step sampling shown next to -STEPS in --visualize_task")
+    parser.add_argument('--pairing_batches', type=int, default=10,
+                        help="Training minibatches pooled for the --visualize_task pairing figure")
     parser.add_argument('--compare_seed', type=int, default=0, help="Seed for the shared start noise")
     parser.add_argument('--elev', type=float, default=18, help="3-D view elevation (degrees)")
     parser.add_argument('--azim', type=float, default=-35, help="3-D view azimuth (degrees)")
@@ -270,22 +280,16 @@ def compare_ot_fix(args, device):
 
     dirs = {'before': args.before_dir, 'after': args.after_dir}
     epoch = args.checkpoint_epoch
+    save_dir = args.save_dir or 'experiments/results/pose/'
     # Epoch-specific figures sit with that epoch's other results; the pairing figure doesn't
     # depend on the epoch.
-    epoch_dir = os.path.join(args.save_dir, f'epoch_{epoch}')
-
-    def config_for(which, stem):
-        return OmegaConf.load(os.path.join(dirs[which], f'{stem}_training_config.yaml'))
+    epoch_dir = os.path.join(save_dir, f'epoch_{epoch}')
 
     def load(which, stem):
-        config = config_for(which, stem)
-        model, _ = load_model(os.path.join(dirs[which], f'{stem}_epoch_{epoch}.pt'), device=device,
-                              model_config=OmegaConf.to_container(config.model, resolve=True),
-                              conditional=True)
-        return model
+        return _load_run(dirs[which], stem, epoch, device)[0]
 
     # Task layout (identical for every panel) from the unaffected no-OT run.
-    task = config_for('after', 'cond_pose_flow_matching_model_NOOT_NOCFG').training
+    task = _run_config(dirs['after'], 'cond_pose_flow_matching_model_NOOT_NOCFG').training
     goal_dist = OmegaConf.to_container(task.goal_dist_params, resolve=True)
     start_dist = OmegaConf.to_container(task.start_dist_params, resolve=True)
     actions = OmegaConf.to_container(task.action_dist_params, resolve=True)
@@ -298,10 +302,8 @@ def compare_ot_fix(args, device):
     zoom_starts = _sample_start_poses(start_dist, 64, gen)
 
     def sample(model, stem, cond, start_poses, trajectory=True):
-        scale = args.cfg_scale if stem.endswith('_CFG') else 1.0  # no-CFG models sampled unguided
-        return generate_from_start_poses(model, start_poses, cond.obs(start_poses.shape[0], device),
-                                         num_steps=args.num_steps, return_trajectory=trajectory,
-                                         cfg_scale=scale, device=device).cpu()
+        return _generate(model, stem, start_poses, cond, args.num_steps, args.cfg_scale, device,
+                         trajectory=trajectory)
 
     # 1. start -> goal mappings -------------------------------------------------------
     fig = plt.figure(figsize=(18, 11))
@@ -392,7 +394,266 @@ def compare_ot_fix(args, device):
     fig.legend(handles, labels, loc='lower center', ncol=len(labels), frameon=False)
     fig.suptitle(f'Training-time OT pairing of one {K * per_mode}-sample minibatch: '
                  f'start positions coloured by the condition of their paired goal', fontsize=12)
-    _finish(fig, plt, args, os.path.join(args.save_dir, 'ot_fix_pairings.png'))
+    _finish(fig, plt, args, os.path.join(save_dir, 'ot_fix_pairings.png'))
+
+
+def _run_config(ckpt_dir, stem):
+    return OmegaConf.load(os.path.join(ckpt_dir, f'{stem}_training_config.yaml'))
+
+
+def _load_run(ckpt_dir, stem, epoch, device):
+    """Model and training config of one run's checkpoint at `epoch`."""
+    config = _run_config(ckpt_dir, stem)
+    model, _ = load_model(os.path.join(ckpt_dir, f'{stem}_epoch_{epoch}.pt'), device=device,
+                          model_config=OmegaConf.to_container(config.model, resolve=True),
+                          conditional=stem.startswith('cond_'))
+    return model, config
+
+
+def _generate(model, stem, start_poses, cond, num_steps, cfg_scale, device, trajectory=True):
+    """Sample from given start poses: CFG-trained conditional models at `cfg_scale`, every other
+    model unguided; `cond` is a utils.pose_task.Condition (None for unconditional models)."""
+    guided = stem.startswith('cond_') and stem.endswith('_CFG')
+    obs = cond.obs(start_poses.shape[0], device) if cond is not None else None
+    return generate_from_start_poses(model, start_poses, obs, num_steps=num_steps,
+                                     return_trajectory=trajectory,
+                                     cfg_scale=cfg_scale if guided else 1.0, device=device).cpu()
+
+
+def _position_axes(ax, args):
+    ax.set_xlim(-3, 7); ax.set_ylim(-7, 7); ax.set_zlim(-7, 7)
+    ax.set_box_aspect((10, 14, 14))
+    ax.view_init(elev=args.elev, azim=args.azim)
+    ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')
+
+
+# -- --visualize_task: figures for a task whose conditions hold several orientations --------
+
+# Mappings figure rows: (row label, OT checkpoint stem, no-OT checkpoint stem)
+TASK_ROWS = [
+    ('conditional, no CFG', 'cond_pose_flow_matching_model_OT_NOCFG', 'cond_pose_flow_matching_model_NOOT_NOCFG'),
+    ('conditional + CFG', 'cond_pose_flow_matching_model_OT_CFG', 'cond_pose_flow_matching_model_NOOT_CFG'),
+    ('unconditional', 'pose_flow_matching_model_OT_CFG', 'pose_flow_matching_model_NOOT_CFG'),
+]
+# The conditional variants, for the close-up figures
+TASK_CONDITIONAL = [
+    ('OT, no CFG', 'cond_pose_flow_matching_model_OT_NOCFG'),
+    ('no OT, no CFG', 'cond_pose_flow_matching_model_NOOT_NOCFG'),
+    ('OT + CFG', 'cond_pose_flow_matching_model_OT_CFG'),
+    ('no OT + CFG', 'cond_pose_flow_matching_model_NOOT_CFG'),
+]
+
+
+def visualize_task(args, device):
+    """3-D figures for a task whose conditions name several orientations at one position (e.g.
+    corners_two_orientations), for the runs in -CP at epoch -CE. Every model is fed the same start
+    poses, so differences come from the model:
+      epoch_<E>/mappings_3d.png           start -> goal paths per model, at few and many steps
+      epoch_<E>/rotation_paths_3d.png     one condition's sampling paths in rotation space, relative
+                                          to the midpoint of its orientations, near the targets
+      epoch_<E>/orientation_fan_3d.png    that condition's goal headings drawn from one origin: two
+                                          bundles = both orientations, one middle bundle = averaged
+      pairings_3d.png                     training starts in rotation space, coloured by the
+                                          orientation they're paired with: no OT vs OT
+    """
+    import matplotlib
+    if not args.show:
+        matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from utils.eval_utils import (_rotvec, goal_mode_poses_from_config, mode_offsets, nearest_mode_indices,
+                                  pose_mode_distance, sample_goal_poses)
+    from utils.pose_task import task_conditions
+    from utils.train_utils import _mode_condition_ids, _pair_within_conditions, sequence_ot_pairing
+    from utils.visualization_utils import (plot_condition_mappings, plot_heading_fan,
+                                           plot_rotation_pairings, plot_rotation_paths)
+
+    ckpt_dir = args.checkpoint_path or 'checkpoints/pose_corners_two_orientations/seed_1/'
+    task_dir = os.path.basename(os.path.dirname(os.path.normpath(ckpt_dir)))  # e.g. pose_corners_...
+    save_dir = args.save_dir or os.path.join('experiments', 'results', task_dir)
+    epoch, few, many = args.checkpoint_epoch, args.few_steps, args.num_steps
+    epoch_dir = os.path.join(save_dir, f'epoch_{epoch}')
+
+    task = _run_config(ckpt_dir, 'cond_pose_flow_matching_model_NOOT_NOCFG').training
+    goal_dist = OmegaConf.to_container(task.goal_dist_params, resolve=True)
+    start_dist = OmegaConf.to_container(task.start_dist_params, resolve=True)
+    actions = OmegaConf.to_container(task.action_dist_params, resolve=True)
+    mode_poses = goal_mode_poses_from_config(goal_dist)
+    conditions, _ = task_conditions(actions)
+    names = [_condition_name(c.tokens, i) for i, c in enumerate(conditions)]
+    mode_names = list(task.get('mode_names') or [f'mode {k}' for k in range(mode_poses.shape[0])])
+    mode_to_cond = {m: i for i, c in enumerate(conditions) for m in c.valid_modes}
+    focus = conditions[0]  # the condition shown up close
+    valid = focus.valid_modes
+
+    gen = torch.Generator().manual_seed(args.compare_seed)
+    starts = [_sample_start_poses(start_dist, args.num_samples, gen) for _ in conditions]
+    focus_starts = _sample_start_poses(start_dist, 64, gen)
+
+    models = {}
+
+    def model(stem):
+        if stem not in models:
+            models[stem] = _load_run(ckpt_dir, stem, epoch, device)[0]
+        return models[stem]
+
+    def nearest_valid(samples, modes):
+        modes = torch.tensor(modes)
+        return modes[nearest_mode_indices(samples, mode_poses[modes])]
+
+    def rotation_error(samples, targets):
+        R_s = _quat_to_rot_mat(samples[:, 3:])
+        R_t = _quat_to_rot_mat(mode_poses[targets, 3:])
+        return _rotvec(R_t.transpose(-1, -2) @ R_s).norm(dim=-1)
+
+    def plural(n):
+        return f'{n} step{"s" if n > 1 else ""}'
+
+    # 1. start -> goal mappings, few vs many steps -------------------------------------
+    fig = plt.figure(figsize=(21, 15))
+    for r, (label, ot_stem, noot_stem) in enumerate(TASK_ROWS):
+        for c, (steps, stem, which) in enumerate([(few, ot_stem, 'OT'), (few, noot_stem, 'no OT'),
+                                                  (many, ot_stem, 'OT'), (many, noot_stem, 'no OT')]):
+            if stem.startswith('cond_'):
+                trajs = [_generate(model(stem), stem, s, cond, steps, args.cfg_scale, device)
+                         for cond, s in zip(conditions, starts)]
+                cond_idx = [i for i, t in enumerate(trajs) for _ in range(t.shape[0])]
+                traj = torch.cat(trajs)
+                targets = torch.cat([nearest_valid(t[:, -1], cond.valid_modes)
+                                     for t, cond in zip(trajs, conditions)])
+                dist = pose_mode_distance(traj[:, -1], mode_poses, targets)
+            else:
+                traj = _generate(model(stem), stem, torch.cat(starts), None, steps, args.cfg_scale, device)
+                cond_idx = [mode_to_cond[k] for k in nearest_mode_indices(traj[:, -1], mode_poses).tolist()]
+                dist = pose_mode_distance(traj[:, -1], mode_poses)
+            ax = fig.add_subplot(3, 4, r * 4 + c + 1, projection='3d')
+            guidance = f', guidance {args.cfg_scale:g}' if stem.startswith('cond_') and stem.endswith('_CFG') else ''
+            plot_condition_mappings(ax, traj, cond_idx, mode_poses=mode_poses, condition_names=names,
+                                    title=f'{label}{guidance}: {which}, {plural(steps)}\n'
+                                          f'mean twist distance to nearest valid mode {dist:.2f}')
+            _position_axes(ax, args)
+    handles, labels = fig.axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=len(labels), frameon=False)
+    fig.suptitle(f'Start -> goal mappings, epoch {epoch}: the same {args.num_samples} start poses per condition '
+                 f'for every model (unconditional samples coloured by the corner they reach)', fontsize=13)
+    _finish(fig, plt, args, os.path.join(epoch_dir, 'mappings_3d.png'))
+
+    # Orientations are shown relative to the midpoint of the condition's orientations, so the
+    # targets sit at +/- their yaw offset on the 'yaw' axis and "between them" means yaw near 0.
+    q = mode_poses[valid, 3:].clone()
+    q = torch.where((q * q[:1]).sum(-1, keepdim=True) < 0, -q, q)  # same hemisphere before averaging
+    R_mid = _quat_to_rot_mat((q.mean(0) / q.mean(0).norm())[None])[0]
+
+    def local_rotvec(quats):
+        return _rotvec(R_mid.T @ _quat_to_rot_mat(quats.reshape(-1, 4)))
+
+    real, real_idx = sample_goal_poses(goal_dist, 64, seed=args.compare_seed)
+    real_focus = real[torch.isin(real_idx, torch.tensor(valid))]
+    target_local = local_rotvec(mode_poses[valid, 3:])
+    gap = (target_local[:, 2].max() - target_local[:, 2].min()).item()
+    band = 0.2 * gap  # "between the orientations": within 20% of the gap from the midpoint
+
+    def between(samples):
+        return (local_rotvec(samples[:, 3:])[:, 2].abs() < band).float().mean().item()
+
+    real_between = between(real_focus)
+
+    # 2. one condition's paths in rotation space, near the target orientations -----------
+    finals = {}
+    fig = plt.figure(figsize=(21, 10.5))
+    half_width = 0.6
+    for r, steps in enumerate((few, many)):
+        for c, (label, stem) in enumerate(TASK_CONDITIONAL):
+            traj = _generate(model(stem), stem, focus_starts, focus, steps, args.cfg_scale, device)
+            finals[(steps, stem)] = traj[:, -1]
+            rv = local_rotvec(traj[..., 3:]).reshape(traj.shape[0], -1, 3)
+            local = [valid.index(k) for k in nearest_valid(traj[:, -1], valid).tolist()]
+            split = '/'.join(str(local.count(k)) for k in range(len(valid)))
+            outside = int((rv[:, -1].abs() > half_width).any(dim=-1).sum())
+            guidance = f', guidance {args.cfg_scale:g}' if stem.endswith('_CFG') else ''
+            ax = fig.add_subplot(2, 4, r * 4 + c + 1, projection='3d')
+            plot_rotation_paths(ax, rv, local, target_local, [mode_names[k] for k in valid],
+                                reference=local_rotvec(real_focus[:, 3:]), half_width=half_width,
+                                title=f'{label}{guidance}, {plural(steps)}\n'
+                                      f'between orientations: {between(traj[:, -1]):.0%}, split {split}'
+                                      + (f'\n({outside} of 64 end outside this view)' if outside else ''))
+            ax.set_xlim(-half_width, half_width); ax.set_ylim(-half_width, half_width)
+            ax.set_zlim(-half_width, half_width)
+            ax.set_box_aspect((1, 1, 1))
+            ax.view_init(elev=8, azim=-55)
+            ax.set_xlabel('roll'); ax.set_ylabel('pitch'); ax.set_zlabel('yaw')
+    handles, labels = fig.axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=len(labels), frameon=False)
+    fig.suptitle(f'"{names[0]}": final approach of 64 sampling paths in rotation space (axis-angle, rad, relative '
+                 f'to the midpoint between the two orientations), epoch {epoch}. Stars = target orientations.\n'
+                 f'"Between orientations" = |yaw| < {band:.2f} rad of the midpoint (real data: '
+                 f'{real_between:.0%}). Top: {plural(few)}, bottom: {plural(many)}', fontsize=12)
+    _finish(fig, plt, args, os.path.join(epoch_dir, 'rotation_paths_3d.png'))
+
+    # 3. orientation fans: every sample's heading from a common origin -------------------------
+    heading = _quat_to_rot_mat(mode_poses[valid, 3:])[:, :, 0].mean(0)
+    azim = torch.rad2deg(torch.atan2(heading[1], heading[0])).item() - 90  # look across the headings
+    center = mode_poses[valid[0]]
+    panels = [('real goal samples', None)] + TASK_CONDITIONAL
+    fig = plt.figure(figsize=(22, 10))
+    for r, steps in enumerate((few, many)):
+        for c, (label, stem) in enumerate(panels):
+            samples = real_focus if stem is None else finals[(steps, stem)]
+            local = [valid.index(k) for k in nearest_valid(samples, valid).tolist()]
+            split = '/'.join(str(local.count(k)) for k in range(len(valid)))
+            rms_p = mode_offsets(samples, center)[0].pow(2).sum(-1).mean().sqrt().item()
+            title = label if stem is None else f'{label}, {plural(steps)}'
+            ax = fig.add_subplot(2, 5, r * 5 + c + 1, projection='3d')
+            plot_heading_fan(ax, samples, local, mode_poses[valid], [mode_names[k] for k in valid],
+                             title=f'{title}\nbetween orientations: {between(samples):.0%}, split {split}\n'
+                                   f'position error {rms_p:.2f} (RMS)')
+            ax.view_init(elev=70, azim=azim)
+    handles, labels = fig.axes[1].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=len(labels), frameon=False)
+    fig.suptitle(f'"{names[0]}": each goal sample\'s heading (body x-axis) drawn from one origin, epoch {epoch}; '
+                 f'coloured by nearest orientation, thick lines = the two modes. Two bundles = both orientations '
+                 f'kept; one middle bundle = averaged.\nTop: {plural(few)}, bottom: {plural(many)} '
+                 f'(real data repeated in both rows)', fontsize=12)
+    _finish(fig, plt, args, os.path.join(epoch_dir, 'orientation_fan_3d.png'), hspace=0.3)
+
+    # 4. training-time pairing, in rotation space ------------------------------------------
+    mus = torch.tensor(goal_dist['mu'], dtype=torch.float32).reshape(-1, 6)
+    sigmas = torch.tensor(goal_dist['sigma'], dtype=torch.float32).reshape(-1, 6)
+    K = mus.shape[0]
+    per_mode = 128 // K
+    cond_ids = torch.tensor(_mode_condition_ids(actions['mu'])).repeat_interleave(per_mode)
+    modes = torch.arange(K).repeat_interleave(per_mode)
+    se3 = lambda s, g: sequence_ot_pairing(s, g, manifold='se3')
+    in_focus = torch.isin(modes, torch.tensor(valid))
+    collected = {'no OT': ([], []), 'OT': ([], [])}
+    for _ in range(args.pairing_batches):  # training-sized minibatches
+        start_tw = (torch.tensor(start_dist['mu'], dtype=torch.float32).reshape(6)
+                    + torch.tensor(start_dist['sigma'], dtype=torch.float32).reshape(6)
+                    * torch.randn(K * per_mode, 6, generator=gen)).unsqueeze(1)
+        goal_tw = (mus.repeat_interleave(per_mode, 0) + sigmas.repeat_interleave(per_mode, 0)
+                   * torch.randn(K * per_mode, 6, generator=gen)).unsqueeze(1)
+        for key, paired in (('no OT', start_tw), ('OT', _pair_within_conditions(start_tw, goal_tw, cond_ids, se3))):
+            poses = convert_twist_to_pose(paired[:, 0], dt=1.0, return_representation='quat')
+            collected[key][0].append(_rotvec(_quat_to_rot_mat(poses[in_focus, 3:])))
+            collected[key][1].extend(valid.index(k) for k in modes[in_focus].tolist())
+    fig = plt.figure(figsize=(15, 7))
+    for p, (key, title) in enumerate((('no OT', 'without OT: independent pairing'),
+                                      ('OT', 'with OT within the condition'))):
+        rv, paired = torch.cat(collected[key][0]), collected[key][1]
+        paired_t = torch.tensor(paired)
+        means = ', '.join(f'{rv[paired_t == k, 2].mean():+.2f} -> {mode_names[m]}' for k, m in enumerate(valid))
+        ax = fig.add_subplot(1, 2, p + 1, projection='3d')
+        plot_rotation_pairings(ax, rv, paired, [mode_names[k] for k in valid],
+                               title=f'{title}\nmean start rotation about z: {means}')
+        ax.set_xlim(-3, 3); ax.set_ylim(-3, 3); ax.set_zlim(-3, 3)
+        ax.set_box_aspect((1, 1, 1))
+        ax.view_init(elev=12, azim=-60)
+        ax.set_xlabel('rotation x'); ax.set_ylabel('rotation y'); ax.set_zlabel('rotation z')
+    handles, labels = fig.axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=len(labels), frameon=False)
+    fig.suptitle(f'Training-time pairing for "{names[0]}" ({args.pairing_batches} minibatches): start '
+                 f'orientations (axis-angle, rad), coloured by the orientation of the goal they are paired with',
+                 fontsize=12)
+    _finish(fig, plt, args, os.path.join(save_dir, 'pairings_3d.png'))
 
 
 def _finish(fig, plt, args, path, hspace=None):
@@ -417,6 +678,9 @@ if __name__ == "__main__":
 
     if args.compare_ot_fix:
         compare_ot_fix(args, device)
+        raise SystemExit(0)
+    if args.visualize_task:
+        visualize_task(args, device)
         raise SystemExit(0)
 
     # Resolve effective CFG scale (--no_cfg forces 1.0, otherwise honor --cfg_scale)

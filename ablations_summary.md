@@ -574,6 +574,24 @@ Two details specific to this task:
   imbalance KL** measures how evenly each condition's samples split between its two orientations; real data scores
   0.006 with 64 samples.
 
+**3-D figures** (seed 1; every model is fed the same start poses), from
+`python pose_gen_inference.py --visualize_task -CE <epoch>`, in `experiments/results/pose_corners_two_orientations/`:
+
+- `epoch_<E>/rotation_paths_3d.png`: one condition's sampling paths in rotation space, relative to the midpoint
+  between its two orientations.
+  - Without OT at 3 steps, endpoints stack between the two target orientations: 50% within 0.1 rad of the midpoint,
+    vs. 17% with OT and 9% for real data.
+  - At 100 steps it's 22% vs. 11%.
+- `epoch_<E>/orientation_fan_3d.png`: every goal sample's heading drawn from one origin. Keeping both orientations
+  shows as two bundles; averaging shows as a single bundle in the middle.
+- `epoch_<E>/mappings_3d.png`: start → goal paths in position space for all six variants at 3 and 100 steps.
+  - This shows the guidance overshoot past the corners at 3 steps, and the unconditional no-OT model falling short.
+  - Orientation effects are invisible here: both orientations share a position.
+- `pairings_3d.png`: training starts in rotation space, coloured by the orientation they're paired with.
+  - With OT, a start's rotation about z decides its orientation (mean +0.57 vs. −0.60 rad); without OT the
+    assignment is random.
+  - This is the mechanism behind the few-step result.
+
 ### Key findings
 
 1. **Conditional OT now clearly matters at few steps.**

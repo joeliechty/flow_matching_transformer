@@ -155,20 +155,28 @@ def plot_condition_mappings(ax, trajectory, condition_idx, mode_poses=None, titl
         ax.set_title(title, fontsize=10)
 
 
-def plot_goal_cloud(ax, poses, center, radius, frame_length=0.12, title=None):
+def plot_goal_cloud(ax, poses, center, radius, frame_length=0.12, title=None,
+                    point_colors=None, mode_poses=None):
     """Zoomed view of goal samples [N, 7] around one mode centre [7]: positions with small
     orientation frames, plus the mode's own frame. Same `radius` across panels compares spread.
     Samples farther than `radius` from the centre are left out (3-D axes don't clip); returns
-    how many were left out."""
+    how many were left out.
+
+    point_colors: optional colour per sample (e.g. by nearest mode) instead of black.
+    mode_poses: optional mode poses [K, 7] to draw as dark frames instead of just `center`.
+    """
     poses = torch.as_tensor(poses, dtype=torch.float32).reshape(-1, 7).cpu()
     center = torch.as_tensor(center, dtype=torch.float32).reshape(7).cpu()
     inside = (poses[:, :3] - center[:3]).abs().max(dim=-1).values <= radius
     poses = poses[inside]
     draw_frames(ax, poses, length=frame_length, linewidth=0.8, alpha=0.75)
     p = poses[:, :3].numpy()
-    ax.scatter(p[:, 0], p[:, 1], p[:, 2], color='black', s=4, depthshade=False)
-    draw_frames(ax, center, length=frame_length * 3, linewidth=3.0,
-                colors=MODE_FRAME_COLORS[0])
+    colors = 'black' if point_colors is None else [c for c, keep in zip(point_colors, inside) if keep]
+    ax.scatter(p[:, 0], p[:, 1], p[:, 2], c=colors, s=10 if point_colors else 4, depthshade=False)
+    frames = [center] if mode_poses is None else list(torch.as_tensor(mode_poses).reshape(-1, 7).cpu())
+    for k, frame in enumerate(frames):
+        draw_frames(ax, frame, length=frame_length * 3, linewidth=3.0,
+                    colors=MODE_FRAME_COLORS[k % len(MODE_FRAME_COLORS)])
     c = center[:3].numpy()
     for lim, mid in zip((ax.set_xlim, ax.set_ylim, ax.set_zlim), c):
         lim(mid - radius, mid + radius)
@@ -176,6 +184,104 @@ def plot_goal_cloud(ax, poses, center, radius, frame_length=0.12, title=None):
     if title:
         ax.set_title(title, fontsize=10)
     return int((~inside).sum())
+
+
+def _tail_in_box(path, half_width):
+    """The final stretch of a polyline [T, 3] inside the cube |coord| <= half_width: from where
+    it last enters the cube (cut exactly at the boundary) to its end. 3-D axes don't clip, so
+    paths are cut by hand. Returns None if the path doesn't end inside the cube."""
+    inside = np.all(np.abs(path) <= half_width, axis=1)
+    if not inside[-1]:
+        return None
+    first = len(path) - 1
+    while first > 0 and inside[first - 1]:
+        first -= 1
+    if first == 0:
+        return path
+    a, b = path[first - 1], path[first]  # a outside, b inside: find where the segment crosses
+    lo, hi = 0.0, 1.0
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        if np.all(np.abs(a + mid * (b - a)) <= half_width):
+            hi = mid
+        else:
+            lo = mid
+    return np.vstack([a + hi * (b - a), path[first:]])
+
+
+def plot_rotation_paths(ax, rotvec_paths, nearest, target_rotvecs, target_names, reference=None,
+                        title=None, half_width=None):
+    """Sampling paths in rotation-vector (axis-angle, radians) space [N, T+1, 3], coloured by
+    the target orientation each sample ends nearest to (`nearest` indexes `target_rotvecs`).
+    Targets [K, 3] are large stars; `reference` [M, 3] (real goal rotations) faint grey dots.
+    With `half_width`, only the part of each path inside the cube |coord| <= half_width is drawn
+    (rotations should then be expressed relative to an orientation near the targets)."""
+    rv = torch.as_tensor(rotvec_paths).cpu().numpy()
+    nearest = np.asarray(nearest)
+    if reference is not None:
+        ref = torch.as_tensor(reference).cpu().numpy()
+        ax.scatter(ref[:, 0], ref[:, 1], ref[:, 2], color=MUTED, s=4, alpha=0.6, depthshade=False,
+                   label='real goal samples')
+    for k, name in enumerate(target_names):
+        color = CONDITION_COLORS[k % len(CONDITION_COLORS)]
+        sel = nearest == k
+        for path in rv[sel]:
+            if half_width is not None:
+                path = _tail_in_box(path, half_width)
+                if path is None:
+                    continue
+            ax.plot(path[:, 0], path[:, 1], path[:, 2], color=color, alpha=0.35, linewidth=0.9)
+        if half_width is not None:  # endpoints outside the box would be drawn outside the axes
+            sel = sel & np.all(np.abs(rv[:, -1]) <= half_width, axis=1)
+        ax.scatter(rv[sel, -1, 0], rv[sel, -1, 1], rv[sel, -1, 2], color=color,
+                   marker=CONDITION_MARKERS[k % len(CONDITION_MARKERS)], s=16, depthshade=False,
+                   label=f'ends nearest {name}')
+        t = torch.as_tensor(target_rotvecs[k]).cpu().numpy()
+        ax.scatter([t[0]], [t[1]], [t[2]], color=color, marker='*', s=320, edgecolors='black',
+                   linewidths=0.8, depthshade=False)
+    if title:
+        ax.set_title(title, fontsize=10)
+
+
+def plot_heading_fan(ax, poses, nearest, mode_poses, mode_names, title=None):
+    """Orientation 'fan': every sample's heading (its body x-axis) drawn as a unit line from a
+    common origin, coloured by the mode it is nearest to (`nearest` indexes `mode_poses`); the
+    modes' headings are thick, outlined lines. Seen from above, orientations that differ by yaw
+    form separate bundles, and samples averaged between them form one bundle in the middle."""
+    R = _quat_to_rot_mat(torch.as_tensor(poses, dtype=torch.float32).reshape(-1, 7)[:, 3:7]).numpy()
+    heading = R[:, :, 0]
+    nearest = np.asarray(nearest)
+    theta = np.linspace(0, 2 * np.pi, 120)
+    ax.plot(np.cos(theta), np.sin(theta), np.zeros_like(theta), color=MUTED, linewidth=0.8)
+    for k, name in enumerate(mode_names):
+        color = CONDITION_COLORS[k % len(CONDITION_COLORS)]
+        for d in heading[nearest == k]:
+            ax.plot([0, d[0]], [0, d[1]], [0, d[2]], color=color, alpha=0.4, linewidth=0.9)
+    mode_R = _quat_to_rot_mat(torch.as_tensor(mode_poses, dtype=torch.float32).reshape(-1, 7)[:, 3:7]).numpy()
+    for k, name in enumerate(mode_names):
+        d = mode_R[k, :, 0] * 1.15
+        ax.plot([0, d[0]], [0, d[1]], [0, d[2]], color='black', linewidth=5.0)
+        ax.plot([0, d[0]], [0, d[1]], [0, d[2]], color=CONDITION_COLORS[k % len(CONDITION_COLORS)],
+                linewidth=3.0, label=name)
+    ax.set_xlim(-1.15, 1.15); ax.set_ylim(-1.15, 1.15); ax.set_zlim(-1.15, 1.15)
+    ax.set_box_aspect((1, 1, 1))
+    ax.set_axis_off()  # directions only; the unit circle is the reference
+    if title:
+        ax.set_title(title, fontsize=10)
+
+
+def plot_rotation_pairings(ax, start_rotvecs, paired, names, title=None):
+    """Training starts in rotation-vector space [N, 3], coloured by the orientation (index into
+    `names`) of the goal each one is paired with."""
+    rv = torch.as_tensor(start_rotvecs).cpu().numpy()
+    paired = np.asarray(paired)
+    for k, name in enumerate(names):
+        sel = paired == k
+        ax.scatter(rv[sel, 0], rv[sel, 1], rv[sel, 2], color=CONDITION_COLORS[k % len(CONDITION_COLORS)],
+                   marker=CONDITION_MARKERS[k % len(CONDITION_MARKERS)], s=14, depthshade=False,
+                   label=f'paired with {name}')
+    if title:
+        ax.set_title(title, fontsize=10)
 
 
 def plot_pairings(ax, start_poses, goal_poses, condition_idx, title=None, condition_names=None):
