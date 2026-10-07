@@ -16,8 +16,14 @@ For each pairing, over many OT batches of a task:
                  random pairing; this is what lets few-step samples keep both branches.
   w, r, gamma    the chosen condition weights (c2ot: w and the realised admissible ratio r).
 
+With --calibrate, each condition-aware pairing's knob is instead swept from strict to loose
+(c2ot: r_tar up; c2ot_fixed and cluster: cond_scale down), and the loosest setting whose prior
+skew stays within --max_skew is chosen: as close to plain OT as the bound allows. The choice
+goes to <output>.env as trainer flags (C2OT_FLAGS=..., read by pose_ablations.sh).
+
     python experiments/pairing_diagnostics.py --task moons
     python experiments/pairing_diagnostics.py --task configs/pose_tasks/continuous_goals.yaml --ot_batch 128 512 1280
+    python experiments/pairing_diagnostics.py --task configs/pose_tasks/continuous_goals.yaml --calibrate
 """
 import argparse
 import statistics
@@ -35,6 +41,14 @@ from utils.toy_tasks import TOYS, toy_batch_sampler
 from utils.train_utils import Pairer, _batch_cost, _sq_dists, condition_aware_pairing
 
 TOY_METHODS = ('independent', 'global', 'c2ot', 'c2ot_fixed', 'cluster')
+# method -> (knob, values from strict to loose, the env var pose_ablations.sh reads). Both
+# grids step by about 1.5x, so every method gets about as close to the skew bound.
+_SCALES = (10, 7, 5, 3, 2, 1.5, 1, 0.7, 0.5, 0.3, 0.2, 0.15, 0.1, 0.07, 0.05, 0.03, 0.01)
+CALIBRATION_GRID = {
+    'c2ot': ('r_tar', (0.01, 0.02, 0.03, 0.05, 0.07, 0.1, 0.15, 0.2, 0.3), 'C2OT_FLAGS'),
+    'c2ot_fixed': ('cond_scale', _SCALES, 'C2OTFIX_FLAGS'),
+    'cluster': ('cond_scale', _SCALES, 'CLUSTER_FLAGS'),
+}
 
 
 def branch_agreement_fn(task, spec):
@@ -96,8 +110,10 @@ def r_squared(x_train, y_train, x_test, y_test):
 
 
 @torch.no_grad()
-def diagnose(method, sampler, ot_batch, manifold, ot_mode, batches, r_tar, branch_fn=None):
-    pairer = Pairer(method, sampler, ot_batch, manifold=manifold, ot_mode=ot_mode, r_tar=r_tar)
+def diagnose(method, sampler, ot_batch, manifold, ot_mode, batches, r_tar, branch_fn=None,
+             cond_scale=10.0):
+    pairer = Pairer(method, sampler, ot_batch, manifold=manifold, ot_mode=ot_mode, r_tar=r_tar,
+                    cond_scale=cond_scale)
     w = pairer.w
     ratios, shifts, infos, xs, cs, agree = [], [], [], [], [], []
     for _ in range(batches):
@@ -105,7 +121,8 @@ def diagnose(method, sampler, ot_batch, manifold, ot_mode, batches, r_tar, branc
         cond = obs.flatten(1)
         paired, info = condition_aware_pairing(
             start, goal, method, cond=cond, cond_ids=cond_ids, manifold=manifold,
-            ot_mode=ot_mode, r_tar=r_tar, w=w, centroids=pairer.centroids)
+            ot_mode=ot_mode, r_tar=r_tar, w=w, centroids=pairer.centroids,
+            gamma_scale=cond_scale)
         if method == 'c2ot':
             w = info['w']
         before = _batch_cost(start, goal, manifold, ot_mode).diagonal().mean()
@@ -122,6 +139,7 @@ def diagnose(method, sampler, ot_batch, manifold, ot_mode, batches, r_tar, branc
             agree.append(branch_fn(paired, goal, obs, cond_ids))
     split = int(0.8 * batches)
     row = {'method': method, 'r_tar': r_tar if method == 'c2ot' else None,
+           'cond_scale': cond_scale if method in ('c2ot_fixed', 'cluster') else None,
            'ot_batch': ot_batch, 'cost_ratio': statistics.fmean(ratios),
            'cond_shift': statistics.fmean(shifts),
            'prior_skew_r2': r_squared(torch.cat(xs[:split]), torch.cat(cs[:split]),
@@ -134,6 +152,34 @@ def diagnose(method, sampler, ot_batch, manifold, ot_mode, batches, r_tar, branc
     return row
 
 
+def calibrate(name, sampler, manifold, ot_mode, ot_batch, batches, branch_fn, max_skew, seed):
+    """Sweep each knob from strict to loose; keep the loosest setting within the skew bound.
+    Skew rises as the knob loosens, so the sweep stops at the first setting over the bound."""
+    rows, flags = [], []
+    for method, (knob, values, var) in CALIBRATION_GRID.items():
+        chosen = values[0]
+        for value in values:
+            torch.manual_seed(seed)
+            kw = {'r_tar': value if knob == 'r_tar' else 0.01,
+                  'cond_scale': value if knob == 'cond_scale' else 10.0}
+            row = {'task': name, **diagnose(method, sampler, ot_batch, manifold, ot_mode, batches,
+                                            branch_fn=branch_fn, **kw)}
+            row['within_bound'] = row['prior_skew_r2'] <= max_skew
+            rows.append(row)
+            print(f"{name} {method:>11} {knob} {value:<5}: skew {row['prior_skew_r2']:.4f}  "
+                  f"agreement {row['branch_agreement'] or float('nan'):.3f}  "
+                  f"cost {row['cost_ratio']:.4f}")
+            if not row['within_bound']:
+                break
+            chosen = value
+        for row in rows:
+            if row['method'] == method:
+                row['chosen'] = row.get(knob) == chosen
+        flags.append(f'{var}="--{knob} {chosen}"')
+        print(f"  -> {method}: --{knob} {chosen}")
+    return rows, flags
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', required=True, help=f'toy name {TOYS} or a pose task file')
@@ -143,12 +189,28 @@ def main():
     parser.add_argument('--r_tar', type=float, nargs='+', default=[0.01],
                         help='c2ot target ratios (one c2ot row each)')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--calibrate', action='store_true',
+                        help='choose each pairing knob within the skew bound (see the docstring)')
+    parser.add_argument('--max_skew', type=float, default=0.02)
     parser.add_argument('--output', type=str, default=None,
-                        help='default: experiments/results/<task>/pairing_diagnostics.csv')
+                        help='default: experiments/results/<task>/pairing_{diagnostics,calibration}.csv')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     name, sampler, manifold, ot_mode, methods, default_batch, branch_fn = make_sampler(args.task, device)
+    fields = ['task', 'method', 'r_tar', 'cond_scale', 'ot_batch', 'cost_ratio', 'cond_shift',
+              'prior_skew_r2', 'branch_agreement', 'w', 'r', 'gamma']
+    if args.calibrate:
+        ot_batch = (args.ot_batch or [default_batch])[0]
+        rows, flags = calibrate(name, sampler, manifold, ot_mode, ot_batch, args.batches,
+                                branch_fn, args.max_skew, args.seed)
+        output = Path(args.output or REPO_ROOT / 'experiments' / 'results' / name / 'pairing_calibration.csv')
+        write_csv(rows, output, fieldnames=fields + ['within_bound', 'chosen'])
+        env = output.with_suffix('.env')
+        env.write_text(f"# chosen by pairing_diagnostics.py --calibrate: max prior skew {args.max_skew}, "
+                       f"OT batch {ot_batch}, {args.batches} batches\n" + "\n".join(flags) + "\n")
+        print(f"Wrote {env}")
+        return
     rows = []
     for ot_batch in args.ot_batch or [default_batch]:
         for method in methods:
@@ -161,9 +223,7 @@ def main():
                     f"{k} {v:.3g}" for k, v in row.items()
                     if k not in ('task', 'method', 'ot_batch') and v is not None))
     output = args.output or REPO_ROOT / 'experiments' / 'results' / name / 'pairing_diagnostics.csv'
-    write_csv(rows, output, fieldnames=['task', 'method', 'r_tar', 'ot_batch', 'cost_ratio',
-                                        'cond_shift', 'prior_skew_r2', 'branch_agreement',
-                                        'w', 'r', 'gamma'])
+    write_csv(rows, output, fieldnames=fields)
 
 
 if __name__ == '__main__':

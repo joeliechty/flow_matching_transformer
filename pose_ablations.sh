@@ -7,8 +7,13 @@
 #
 # curves: main metrics (100 and 3 sampling steps) at every saved epoch, for training plots.
 # diagnostics: pairing statistics at several OT batch sizes, no training (pairing_diagnostics.py).
-# sensitivity: retrain one pairing (SENS_PAIRING=c2ot|cluster) with its knob and the OT batch
-#              size varied, 3 seeds each, under <dir>/sensitivity/<setting>/.
+# calibrate: choose each condition-aware pairing's knob for this task without training (the
+#            loosest setting whose prior skew stays <= MAX_SKEW, default 0.02), written to
+#            experiments/results/<dir>/pairing_calibration.env. The jitter and continuous sets
+#            train with these flags, so run it before 'train'.
+# sensitivity: retrain one pairing (SENS_PAIRING=c2ot|c2ot_fixed|cluster) with its calibrated
+#              knob moved each way and the OT batch size varied, 3 seeds each, under
+#              <dir>/sensitivity/<setting>/.
 #
 # The variant set follows the task (override with VARIANT_SET):
 #   discrete    clean tokens: 4 conditional (OT x CFG) + 2 unconditional variants
@@ -54,8 +59,8 @@ CKPT_ROOT="${CKPT_ROOT:-checkpoints/$TASK_DIR}"
 RESULTS_ROOT="${RESULTS_ROOT:-experiments/results/$TASK_DIR/epoch_$EVAL_EPOCH}"
 
 case "$STAGE" in
-  train|eval|all|curves|diagnostics|sensitivity) ;;
-  *) echo "usage: $0 [train|eval|all|curves|diagnostics|sensitivity]" >&2; exit 2 ;;
+  train|eval|all|curves|diagnostics|calibrate|sensitivity) ;;
+  *) echo "usage: $0 [train|eval|all|curves|diagnostics|calibrate|sensitivity]" >&2; exit 2 ;;
 esac
 
 if (( EVAL_EPOCH % 10 != 0 )); then
@@ -99,15 +104,23 @@ case "$VARIANT_SET" in
     )
     EXTRA_FLAGS=""; NUM_SAMPLES=256 ;;
   jitter|continuous)
+    CALIB_ENV="experiments/results/$TASK_DIR/pairing_calibration.env"
+    if [[ -f "$CALIB_ENV" ]]; then
+      # shellcheck disable=SC1090
+      source "$CALIB_ENV"
+    elif [[ "$STAGE" == train || "$STAGE" == all || "$STAGE" == sensitivity ]]; then
+      echo "ERROR: no $CALIB_ENV — run '$0 calibrate' first" >&2
+      exit 1
+    fi
     VARIANTS=("cond_pose_flow_matching_model_NOOT_NOCFG|--conditional --no_cfg --pairing independent")
     if [[ "$VARIANT_SET" == jitter ]]; then
       VARIANTS+=("cond_pose_flow_matching_model_OT_NOCFG|--conditional --no_cfg --pairing ot")
     fi
     VARIANTS+=(
       "cond_pose_flow_matching_model_GOT_NOCFG|--conditional --no_cfg --pairing global"
-      "cond_pose_flow_matching_model_C2OT_NOCFG|--conditional --no_cfg --pairing c2ot"
-      "cond_pose_flow_matching_model_C2OTFIX_NOCFG|--conditional --no_cfg --pairing c2ot_fixed"
-      "cond_pose_flow_matching_model_CLUSTER_NOCFG|--conditional --no_cfg --pairing cluster"
+      "cond_pose_flow_matching_model_C2OT_NOCFG|--conditional --no_cfg --pairing c2ot ${C2OT_FLAGS:-}"
+      "cond_pose_flow_matching_model_C2OTFIX_NOCFG|--conditional --no_cfg --pairing c2ot_fixed ${C2OTFIX_FLAGS:-}"
+      "cond_pose_flow_matching_model_CLUSTER_NOCFG|--conditional --no_cfg --pairing cluster ${CLUSTER_FLAGS:-}"
     )
     EXTRA_FLAGS="--ot_batch_mult ${OT_BATCH_MULT:-4}"
     # the continuous task scores 16 test conditions, 64 samples each
@@ -230,19 +243,32 @@ diagnostics_stage() {
     --output "experiments/results/$TASK_DIR/pairing_diagnostics.csv"
 }
 
+calibrate_stage() {
+  echo "=== Calibrating pairing knobs ($TASK): OT batch of ${OT_BATCH_MULT:-4} network batches ==="
+  "$PYTHON" experiments/pairing_diagnostics.py --task "$TASK_CONFIG" --calibrate \
+    --ot_batch $(( ${OT_BATCH_MULT:-4} * BATCH )) --batches 100 --max_skew "${MAX_SKEW:-0.02}" \
+    --output "experiments/results/$TASK_DIR/pairing_calibration.csv"
+}
+
 sensitivity_stage() {
-  # One pairing, its knob and the OT batch varied around the defaults (r_tar 0.01, K = OT batch,
-  # OT batch = 4 network batches), which the main runs already cover.
-  local pairing="${SENS_PAIRING:?set SENS_PAIRING=c2ot or cluster}" suffix settings entry
+  # One pairing with its calibrated knob halved and doubled, and the OT batch at 1 and 10
+  # network batches. The main runs already cover the calibrated setting at 4.
+  local pairing="${SENS_PAIRING:?set SENS_PAIRING=c2ot, c2ot_fixed or cluster}" suffix knob value flags
   case "$pairing" in
-    c2ot)    suffix=C2OT
-             settings=("r_tar_0.005|--r_tar 0.005" "r_tar_0.03|--r_tar 0.03" "r_tar_0.1|--r_tar 0.1") ;;
-    cluster) suffix=CLUSTER
-             settings=("K_$(( BATCH ))|--num_clusters $(( BATCH ))" "K_$(( 16 * BATCH ))|--num_clusters $(( 16 * BATCH ))") ;;
-    *) echo "ERROR: SENS_PAIRING must be c2ot or cluster" >&2; exit 2 ;;
+    c2ot)       suffix=C2OT;    flags="${C2OT_FLAGS:-}" ;;
+    c2ot_fixed) suffix=C2OTFIX; flags="${C2OTFIX_FLAGS:-}" ;;
+    cluster)    suffix=CLUSTER; flags="${CLUSTER_FLAGS:-}" ;;
+    *) echo "ERROR: SENS_PAIRING must be c2ot, c2ot_fixed or cluster" >&2; exit 2 ;;
   esac
+  read -r knob value <<< "${flags#--}"
+  local settings=() entry
+  for factor in 0.5 2; do
+    local v
+    v=$("$PYTHON" -c "print(f'{$value * $factor:.4g}')")
+    settings+=("${knob}_$v|--$knob $v")
+  done
   settings+=("ot_batch_x1|--ot_batch_mult 1" "ot_batch_x10|--ot_batch_mult 10")
-  VARIANTS=("cond_pose_flow_matching_model_${suffix}_NOCFG|--conditional --no_cfg --pairing $pairing")
+  VARIANTS=("cond_pose_flow_matching_model_${suffix}_NOCFG|--conditional --no_cfg --pairing $pairing $flags")
   SEEDS="${SENS_SEEDS:-1 2 3}"
   local base_flags="$EXTRA_FLAGS" name
   for entry in "${settings[@]}"; do
@@ -258,6 +284,7 @@ sensitivity_stage() {
 
 if [[ "$STAGE" == curves ]]; then curves_stage; exit 0; fi
 if [[ "$STAGE" == diagnostics ]]; then diagnostics_stage; exit 0; fi
+if [[ "$STAGE" == calibrate ]]; then calibrate_stage; exit 0; fi
 if [[ "$STAGE" == sensitivity ]]; then sensitivity_stage; exit 0; fi
 if [[ "$STAGE" == train || "$STAGE" == all ]]; then train_stage; fi
 if [[ "$STAGE" == eval  || "$STAGE" == all ]]; then eval_stage; fi
