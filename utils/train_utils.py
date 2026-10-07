@@ -266,20 +266,22 @@ class Pairer:
     One OT batch of `ot_batch_mult` network batches is drawn from `sampler(n)` -> (start,
     goal, obs, cond_ids), paired at once, shuffled and handed out one network batch at a time.
     A bigger OT batch gives each sample more near-condition partners to pair with [C²OT].
-    'c2ot_fixed' fixes w once, at 10× the ratio of mean sample cost to mean condition
-    distance; 'cluster' fits K-means centroids (K defaults to the OT batch size) once.
+    'c2ot_fixed' fixes w once, at `cond_scale` times the ratio of mean sample cost to mean
+    condition distance; 'cluster' scales γ the same way per batch, after fitting K-means
+    centroids (K defaults to the OT batch size) once. The papers' scale is 10.
     """
 
     def __init__(self, method, sampler, batch_size, ot_batch_mult=1, manifold='se3',
-                 ot_mode='per_frame', r_tar=0.01, num_clusters=None):
+                 ot_mode='per_frame', r_tar=0.01, num_clusters=None, cond_scale=10.0):
         if method not in PAIRINGS:
             raise ValueError(f"Unknown pairing: {method!r}. Expected one of {PAIRINGS}.")
         self.method, self.sampler, self.batch_size = method, sampler, batch_size
         self.ot_batch = batch_size * ot_batch_mult
         self.manifold, self.ot_mode, self.r_tar = manifold, ot_mode, r_tar
+        self.cond_scale = cond_scale
         self.w, self.centroids, self.info, self.queue = None, None, {}, []
         if method == 'c2ot_fixed':
-            self.w = self._fixed_weight()
+            self.w = self._fixed_weight(scale=cond_scale)
         elif method == 'cluster':
             self.centroids = self._fit_centroids(num_clusters or self.ot_batch)
 
@@ -307,7 +309,8 @@ class Pairer:
             cond = obs.flatten(1) if obs is not None else None
             start, self.info = condition_aware_pairing(
                 start, goal, self.method, cond=cond, cond_ids=cond_ids, manifold=self.manifold,
-                ot_mode=self.ot_mode, r_tar=self.r_tar, w=self.w, centroids=self.centroids)
+                ot_mode=self.ot_mode, r_tar=self.r_tar, w=self.w, centroids=self.centroids,
+                gamma_scale=self.cond_scale)
             if self.method == 'c2ot':
                 self.w = self.info['w']  # warm start for the next OT batch
             order = torch.randperm(self.ot_batch, device=start.device)

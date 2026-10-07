@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument('--r_tar', type=float, default=0.01)
     parser.add_argument('--ot_batch_mult', type=int, default=4)
     parser.add_argument('--num_clusters', type=int, default=None)
+    parser.add_argument('--cond_scale', type=float, default=10.0)
     parser.add_argument('--iterations', type=int, default=20_000)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=3e-4)
@@ -71,6 +72,7 @@ def main():
                     'phase_dim': 128, 'max_seq_len': 1}
     training_config = {'toy': args.toy, 'pairing': args.pairing, 'r_tar': args.r_tar,
                        'ot_batch_mult': args.ot_batch_mult, 'num_clusters': args.num_clusters,
+                       'cond_scale': args.cond_scale,
                        'iterations': args.iterations, 'batch_size': args.batch_size,
                        'lr': args.lr, 'seed': args.seed, 'git_commit': git_commit()}
     OmegaConf.save(OmegaConf.create({'training': training_config, 'model': model_config}),
@@ -81,7 +83,7 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     pairer = Pairer(args.pairing, toy_batch_sampler(args.toy, device), args.batch_size,
                     ot_batch_mult=args.ot_batch_mult, manifold='euclidean', ot_mode='flat',
-                    r_tar=args.r_tar, num_clusters=args.num_clusters)
+                    r_tar=args.r_tar, num_clusters=args.num_clusters, cond_scale=args.cond_scale)
 
     running = 0.0
     for it in range(1, args.iterations + 1):

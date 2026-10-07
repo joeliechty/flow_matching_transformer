@@ -41,6 +41,9 @@ def parse_args():
                         help='Pair over this many network batches at once (the OT batch)')
     parser.add_argument('--num_clusters', type=int, default=None,
                         help='cluster: K-means clusters of the conditions (default: the OT batch size)')
+    parser.add_argument('--cond_scale', type=float, default=10.0,
+                        help='c2ot_fixed / cluster: condition weight as a multiple of mean sample '
+                             'cost / mean condition distance (papers: 10)')
     args = parser.parse_args()
     if args.pairing is None:
         args.pairing = 'independent' if args.no_ot else 'ot'
@@ -100,6 +103,7 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         'r_tar': args.r_tar,
         'ot_batch_mult': args.ot_batch_mult,
         'num_clusters': args.num_clusters,
+        'cond_scale': args.cond_scale,
         'seed': args.seed,
         'git_commit': git_commit(),
         'task': task_name,
@@ -238,12 +242,12 @@ if __name__ == "__main__":
         sampler = ContinuousGoalTask(OmegaConf.to_container(t.task_spec)).batch_sampler(
             t.start_dist_params, seq_len=t.seq_len, device=device)
         pairer = Pairer(t.pairing, sampler, t.batch_size, ot_batch_mult=t.ot_batch_mult,
-                        r_tar=t.r_tar, num_clusters=t.num_clusters)
+                        r_tar=t.r_tar, num_clusters=t.num_clusters, cond_scale=t.cond_scale)
     elif t.pairing not in ('ot', 'independent') or t.ot_batch_mult > 1:
         sampler = lambda n: sample_pose_batch(n, t.start_dist_params, t.goal_dist_params,
                                               t.action_dist_params, seq_len=t.seq_len, device=device)
         pairer = Pairer(t.pairing, sampler, t.batch_size, ot_batch_mult=t.ot_batch_mult,
-                        r_tar=t.r_tar, num_clusters=t.num_clusters)
+                        r_tar=t.r_tar, num_clusters=t.num_clusters, cond_scale=t.cond_scale)
     
     # Train the model
     loss_history = train(
