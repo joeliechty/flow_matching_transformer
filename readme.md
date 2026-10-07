@@ -200,6 +200,27 @@ Useful Inference Flags:
 
 With `--return_trajectory`, the script tiles intermediate timesteps so you can see the noise denoise into MNIST digits.
 
+### 5. Pairing Experiments with Continuous Conditions
+
+These experiments compare the pairings of section 6. The results are in [ablations_summary.md](ablations_summary.md#part-2-continuous-conditioning).
+
+**Toys first.** `toy_gen_trainer.py` trains a conditional flow on one of two 2-D toys (`utils/toy_tasks.py`). `moons` is C²OT's 8 Gaussians → moons, conditioned on the target's x-coordinate. `fork` is COT Policy's fork: y given x, with two branches for x > 0. Hyperparameters follow C²OT's toy setup.
+```bash
+python toy_gen_trainer.py --toy moons --pairing c2ot --seed 1 --save_path checkpoints/toy_moons/seed_1/
+./toy_ablations.sh                    # every pairing x toy x seed, then W₂² at 1-100 Euler steps and RK45
+./toy_ablations.sh diagnostics        # pairing statistics only, no training
+```
+
+**Pose tasks with continuous conditions.** `configs/pose_tasks/continuous_goals.yaml` puts each goal anywhere on a disk, so no two samples share a condition. `configs/pose_tasks/corners_two_orientations_jitter.yaml` adds noise to the corner tokens. `pose_ablations.sh` detects the kind of task and trains one conditional model per pairing:
+```bash
+export TASK_CONFIG=configs/pose_tasks/continuous_goals.yaml
+./pose_ablations.sh diagnostics   # cost ratio, condition shift, prior skew, branch agreement (no training)
+./pose_ablations.sh calibrate     # pick each pairing's knob: the loosest setting with prior skew <= 0.02
+./pose_ablations.sh               # train every pairing x 5 seeds with the calibrated knobs, then evaluate
+SENS_PAIRING=c2ot ./pose_ablations.sh sensitivity   # retrain one pairing with its knob and OT batch varied
+```
+Run `calibrate` before training. The published defaults (`--r_tar 0.01`, `--cond_scale 10`) barely change the pairing when one large offset (here the 5-unit translation to the goals) dominates every pairing cost. `experiments/pairing_diagnostics.py` measures this without training.
+
 ## Code Structure
 
 * `models/`: Neural network architectures.
@@ -211,10 +232,15 @@ With `--return_trajectory`, the script tiles intermediate timesteps so you can s
   * `train_utils.py`: Data generation, geodesic interpolation, and slot-wise Optimal Transport logic.
   * `visualization_utils.py`: 3D plotting utilities for visualizing SE(3) pose trajectories over time.
   * `logging_utils.py`: Utilities for routing output streams, formatting console logs, and tracking metrics.
+  * `pose_task.py`: Pose task files (`configs/pose_tasks/`): discrete goal modes named by tokens, or goals that vary continuously with the condition (`ContinuousGoalTask`).
+  * `toy_tasks.py`: The 2-D toys (moons, fork) used to check the continuous-condition pairings.
 * `pose_gen_trainer.py`: SE(3) pose-generation training loop with the built-in multimodal goal distribution, minibatch sequence formatting, loss computation, and checkpointing.
 * `pose_gen_inference.py`: ODE solver (Euler integration) for sampling SE(3) pose action chunks from the trained vector field, plus 3D trajectory visualization.
 * `image_gen_trainer.py`: MNIST training entrypoint. Tokenizes images into 7×7 patch grids and reuses the shared training loop for Euclidean flow matching.
 * `image_gen_inference.py`: MNIST sampling entrypoint. Integrates patch-space noise back to images and tiles the noise → denoised trajectory.
+* `toy_gen_trainer.py`: Trains a conditional flow on a 2-D toy with one pairing.
+* `pose_ablations.sh`, `toy_ablations.sh`, `mnist_ablations.sh`: Ablation drivers (train every variant and seed, then evaluate).
+* `experiments/`: Evaluation and figures. `evaluate_all.py` (pose and MNIST metrics), `steps_sweep.py`, `cfg_sweep.py`, `evaluate_toys.py`, `pairing_diagnostics.py` (pairing statistics and knob calibration, no training), `aggregate_seeds.py`, and `summary_figures.py` (the figures in ablations_summary.md).
 * `pyproject.toml`: Project metadata and build configuration, allowing the repository to be installed as a standard Python package.
 
 
