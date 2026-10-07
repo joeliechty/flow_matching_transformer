@@ -3,7 +3,9 @@
 # OT / no-OT) for every seed, then evaluate them. Identical hyperparameters across
 # variants — only the OT/CFG/conditional knobs differ.
 #
-#   ./pose_ablations.sh [train|eval|all]        (default: all)
+#   ./pose_ablations.sh [train|eval|all|curves]   (default: all = train + eval)
+#
+# curves: main metrics (100 and 3 sampling steps) at every saved epoch, for training plots.
 #
 # The task (goal modes and conditioning tokens) comes from TASK_CONFIG, a file in
 # configs/pose_tasks/. Each task gets its own folders, <dir> below: the original
@@ -13,6 +15,7 @@
 #   checkpoints/<dir>/seed_<N>/                     checkpoints (every 10 epochs), configs, logs
 #   experiments/results/<dir>/epoch_<E>/seed_<N>/   metrics, CFG + sampling-steps sweeps, grids
 #   experiments/results/<dir>/epoch_<E>/            *_summary.csv + plots, mean ± std over seeds
+#   experiments/results/<dir>/training_curves/seed_<N>/metrics_epoch<E>_steps<S>.csv   (curves)
 #
 # Env overrides: SEEDS="1 2 3 4 5" JOBS=6 EPOCHS=100 PYTHON=python
 #                TASK_CONFIG=configs/pose_tasks/four_corners.yaml
@@ -41,8 +44,8 @@ CKPT_ROOT="${CKPT_ROOT:-checkpoints/$TASK_DIR}"
 RESULTS_ROOT="${RESULTS_ROOT:-experiments/results/$TASK_DIR/epoch_$EVAL_EPOCH}"
 
 case "$STAGE" in
-  train|eval|all) ;;
-  *) echo "usage: $0 [train|eval|all]" >&2; exit 2 ;;
+  train|eval|all|curves) ;;
+  *) echo "usage: $0 [train|eval|all|curves]" >&2; exit 2 ;;
 esac
 
 if (( EVAL_EPOCH % 10 != 0 )); then
@@ -140,6 +143,44 @@ eval_stage() {
   "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT"
 }
 
+curve_one() {  # <seed> <epoch> <steps>
+  local seed=$1 epoch=$2 steps=$3 out="$CURVES_ROOT/seed_$1"
+  local csv="$out/metrics_epoch${epoch}_steps${steps}.csv"
+  [[ -f "$csv" ]] && return 0
+  mkdir -p "$out"
+  "$PYTHON" experiments/evaluate_all.py --checkpoint_dir "$CKPT_ROOT/seed_$seed" --epoch "$epoch" \
+    --num_steps "$steps" --output "$csv" > "$out/metrics_epoch${epoch}_steps${steps}_console.txt" 2>&1 \
+    || { echo "  FAILED  seed $seed epoch $epoch, $steps steps" >&2; return 1; }
+}
+
+curves_stage() {
+  CURVES_ROOT="experiments/results/$TASK_DIR/training_curves"
+  echo "=== Training curves ($TASK): seeds [$SEEDS], every 10 epochs to $EPOCHS, $JOBS at a time ==="
+  local running=0 failed=0 seed epoch steps
+  for seed in $SEEDS; do
+    for (( epoch = 10; epoch <= EPOCHS; epoch += 10 )); do
+      for steps in 100 3; do
+        if (( running >= JOBS )); then
+          wait -n || failed=1
+          running=$(( running - 1 ))
+        fi
+        curve_one "$seed" "$epoch" "$steps" &
+        running=$(( running + 1 ))
+      done
+    done
+  done
+  while (( running > 0 )); do
+    wait -n || failed=1
+    running=$(( running - 1 ))
+  done
+  if (( failed )); then
+    echo "ERROR: some curve evaluations failed (see above)" >&2
+    exit 1
+  fi
+  echo "Done. Curves in $CURVES_ROOT/"
+}
+
+if [[ "$STAGE" == curves ]]; then curves_stage; exit 0; fi
 if [[ "$STAGE" == train || "$STAGE" == all ]]; then train_stage; fi
 if [[ "$STAGE" == eval  || "$STAGE" == all ]]; then eval_stage; fi
 echo "Done. Summaries in $RESULTS_ROOT/"

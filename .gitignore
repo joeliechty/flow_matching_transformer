@@ -27,6 +27,7 @@ huggingface/_stage/
 *.jpg
 *.jpeg
 *.gif
+!docs/**/*.png
 
 # logs
 setup_log.txt
