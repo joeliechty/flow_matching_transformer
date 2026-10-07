@@ -15,6 +15,9 @@
 - The [new metrics](#new-metrics) were evaluated at `0a1180a` (sweeps) and `af13ac3` (main metrics and the real-data
   row). The original metrics reproduce exactly at both.
 - Result rows from now on record their commit in a `git_commit` column.
+- Since `3ac6e51`, this task is defined in `configs/pose_tasks/four_corners.yaml` rather than hard-coded.
+  Retraining two runs from the file reproduced their checkpoints bit for bit, and re-evaluating every epoch-50
+  model matched all 10,445 result cells.
 
 The study asks what two components add to the flow matching transformer:
 
@@ -550,7 +553,11 @@ Other notes:
 
 1. ~~Verify the conditional-OT fix~~: done (tag `pose-easy-v1`).
 2. ~~Add and validate metrics that don't saturate~~: done ([New metrics](#new-metrics), tag `pose-easy-v2`).
-3. Generalize the hard-coded 4-mode task into a config. Confirm it reproduces this report's numbers exactly.
+3. ~~Generalize the hard-coded 4-mode task into a config~~: done (tag `pose-task-config-v1`).
+   - Tasks are YAML files in `configs/pose_tasks/`: start distribution, token vocabulary, and goal modes named by
+     token lists. Modes that share a token list form one multimodal condition.
+   - Evaluation reads each run's conditions from its training config.
+   - The four-corners file reproduces this report exactly (bit-identical checkpoints, all result cells equal).
 4. Train and evaluate a harder pose task in its own folders, keeping this task as the easy baseline. What the new
    metrics suggest it needs:
    - **Closer modes** (a few σ apart), so one-token conditioning and coverage stop being trivial.
@@ -564,7 +571,10 @@ Other notes:
 conda activate FmT
 ./pose_ablations.sh                     # train 5 seeds × 6 variants (resumable), evaluate the epoch-100 checkpoints
 EVAL_EPOCH=50 ./pose_ablations.sh eval  # evaluate the epoch-50 checkpoints (this report's main results)
-python -m unittest discover -s tests -t .   # pairing, masking and metric sanity tests
+python -m unittest discover -s tests -t .   # pairing, masking, metric and task-file tests
+
+# Another task: its own checkpoints/pose_<task>/ and experiments/results/pose_<task>/ folders
+TASK_CONFIG=configs/pose_tasks/<task>.yaml ./pose_ablations.sh
 ```
 
 Outputs (gitignored):
