@@ -1000,7 +1000,7 @@ def fig_sota_solvers(plt, out):
         ax.set_xscale('log'); ax.set_yscale('log')
         ax.set_xticks(NFE); ax.set_xticklabels([str(n) for n in NFE]); ax.minorticks_off()
         ax.set_xlabel('network evaluations per sample (log)')
-        ax.set_title(f'{title}\nbaseline: {base}', fontsize=11)
+        ax.set_title(f"{title}\nbaseline: {vstyle(task, base)['label']}", fontsize=11)
         ax.legend(fontsize=10)
     axes[0].set_ylabel('energy distance (log), lower is better')
     fig.suptitle(f'ODE solvers at equal cost, epoch {EPOCH} (mean over {len(SEEDS)} seeds, shading = seed range)', y=1.0)
