@@ -134,18 +134,20 @@ class ContinuousGoalsTaskTest(unittest.TestCase):
 
 
 class JitterTaskTest(unittest.TestCase):
-    def test_same_modes_as_two_orientations_with_noisy_tokens(self):
+    def test_same_modes_as_the_clean_task_with_noisy_tokens(self):
         from utils.pose_task import pose_batch_sampler
-        jitter = load_pose_task(os.path.join(REPO, 'configs', 'pose_tasks', 'corners_two_orientations_jitter.yaml'))
-        clean = load_pose_task(os.path.join(REPO, 'configs', 'pose_tasks', 'corners_two_orientations.yaml'))
-        self.assertEqual(jitter['goal_dist_params'], clean['goal_dist_params'])
-        self.assertEqual(jitter['action_dist_params']['mu'], clean['action_dist_params']['mu'])
-        torch.manual_seed(0)
-        _, _, obs, ids = pose_batch_sampler(jitter)(4096)
-        # the sampler lays the 8 modes out in order, 4096 / 8 rows each
-        clean_obs = torch.tensor(clean['action_dist_params']['mu']).repeat_interleave(4096 // 8, dim=0)
-        self.assertAlmostEqual((obs - clean_obs).std().item(), 0.1, delta=0.005)
-        self.assertEqual(torch.unique(obs.flatten(1), dim=0).shape[0], 4096)  # every condition differs
+        for clean_name in ('corners_two_orientations', 'corners_3sigma'):
+            with self.subTest(clean_name):
+                jitter = load_pose_task(os.path.join(REPO, 'configs', 'pose_tasks', f'{clean_name}_jitter.yaml'))
+                clean = load_pose_task(os.path.join(REPO, 'configs', 'pose_tasks', f'{clean_name}.yaml'))
+                self.assertEqual(jitter['goal_dist_params'], clean['goal_dist_params'])
+                self.assertEqual(jitter['action_dist_params']['mu'], clean['action_dist_params']['mu'])
+                torch.manual_seed(0)
+                _, _, obs, ids = pose_batch_sampler(jitter)(4096)
+                # the sampler lays the 8 modes out in order, 4096 / 8 rows each
+                clean_obs = torch.tensor(clean['action_dist_params']['mu']).repeat_interleave(4096 // 8, dim=0)
+                self.assertAlmostEqual((obs - clean_obs).std().item(), 0.1, delta=0.005)
+                self.assertEqual(torch.unique(obs.flatten(1), dim=0).shape[0], 4096)  # every condition differs
 
 
 class GeneralTaskTest(unittest.TestCase):

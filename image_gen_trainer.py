@@ -6,9 +6,10 @@ import numpy as np
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 
-from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel
+from models.conditional_flow_matching_transformer import COND_MODES, ConditionalFlowMatchingTransformerModel
 from models.flow_matching_transformer import FlowMatchingTransformerModel
-from utils.train_utils import train
+from models.support_models import TIME_EMBEDDINGS
+from utils.train_utils import EMA, T_DISTS, train
 from omegaconf import OmegaConf
 from utils.logging_utils import _Tee
 
@@ -67,13 +68,20 @@ def parse_args():
     parser.add_argument('--conditional', '-C', action='store_true',
                         help='Class-conditional generation on digit labels 0-9')
     parser.add_argument('--n_steps', type=int, default=10,
-                        help='Number of interpolation steps per trajectory')
+                        help='Unused for images: each image gets one training time')
     parser.add_argument('--save_path', type=str, default='checkpoints/')
     parser.add_argument('--data_root', type=str, default='./data')
     parser.add_argument('--no_ot', '-NOOT', action='store_true')
     parser.add_argument('--no_cfg', '-NOCFG', action='store_true')
     parser.add_argument('--num_workers', type=int, default=2)
     parser.add_argument('--seed', type=int, default=42, help='Random seed for torch/numpy/random (for reproducible ablations)')
+    # The contested design choices (ablation axes); every other choice is fixed.
+    parser.add_argument('--t_dist', type=str, default='uniform', choices=T_DISTS,
+                        help='Density of the training flow times')
+    parser.add_argument('--time_emb', type=str, default='sinusoidal', choices=TIME_EMBEDDINGS,
+                        help='Featurisation of the flow time')
+    parser.add_argument('--cond_mode', type=str, default='adaln', choices=COND_MODES,
+                        help='How the class token enters the transformer')
     return parser.parse_args()
 
 
@@ -105,6 +113,7 @@ def build_config(args):
         'num_batches_per_epoch': args.num_batches_per_epoch,
         'batch_size': args.batch_size,
         'n_interp_steps': args.n_steps,
+        't_dist': args.t_dist,
         'seq_len': SEQ_LEN,
         'save_path': save_path,
         'patch_size': PATCH_SIZE,
@@ -112,11 +121,12 @@ def build_config(args):
         'num_classes': NUM_CLASSES,
         'lr': 2e-4,
         'weight_decay': 1e-5,
+        'ema_decay': 0.9999,
+        'grad_clip': 1.0,
     }
     model_config = {
         'input_dim': PATCH_DIM,
         'output_dim': PATCH_DIM,
-        'obs_dim': obs_dim,
         'hidden_dim': 256,
         'num_layers': 6,
         'num_heads': 8,
@@ -127,7 +137,12 @@ def build_config(args):
         # SOTA DiT-style spatial embedding: 2D sin/cos over a (7,7) patch grid.
         'pos_emb_type': '2d_sincos',
         'pos_emb_grid': [GRID_HW, GRID_HW],
+        'manifold': 'euclidean',
+        'time_emb': args.time_emb,
     }
+    if args.conditional:
+        # The digit label is one one-hot token
+        model_config.update({'obs_dim': obs_dim, 'cond_mode': args.cond_mode, 'num_obs_tokens': 1})
     config = OmegaConf.create({'training': training_config, 'model': model_config})
 
     if not os.path.exists(args.save_path):
@@ -171,35 +186,8 @@ if __name__ == "__main__":
     print("TRAINING FLOW MATCHING TRANSFORMER ON MNIST")
     print("=" * 60)
 
-    if args.conditional:
-        model = ConditionalFlowMatchingTransformerModel(
-            input_dim=config.model.input_dim,
-            output_dim=config.model.output_dim,
-            obs_dim=config.model.obs_dim,
-            hidden_dim=config.model.hidden_dim,
-            num_layers=config.model.num_layers,
-            num_heads=config.model.num_heads,
-            mlp_ratio=config.model.mlp_ratio,
-            dropout=config.model.dropout,
-            phase_dim=config.model.phase_dim,
-            max_seq_len=config.model.max_seq_len,
-            pos_emb_type=config.model.pos_emb_type,
-            pos_emb_grid=list(config.model.pos_emb_grid),
-        ).to(device)
-    else:
-        model = FlowMatchingTransformerModel(
-            input_dim=config.model.input_dim,
-            output_dim=config.model.output_dim,
-            hidden_dim=config.model.hidden_dim,
-            num_layers=config.model.num_layers,
-            num_heads=config.model.num_heads,
-            mlp_ratio=config.model.mlp_ratio,
-            dropout=config.model.dropout,
-            phase_dim=config.model.phase_dim,
-            max_seq_len=config.model.max_seq_len,
-            pos_emb_type=config.model.pos_emb_type,
-            pos_emb_grid=list(config.model.pos_emb_grid),
-        ).to(device)
+    ModelClass = ConditionalFlowMatchingTransformerModel if args.conditional else FlowMatchingTransformerModel
+    model = ModelClass(**OmegaConf.to_container(config.model)).to(device)
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
 
@@ -208,6 +196,7 @@ if __name__ == "__main__":
         lr=config.training.lr,
         weight_decay=config.training.weight_decay,
     )
+    ema = EMA(model, config.training.ema_decay)
 
     total_steps = config.training.num_epochs * config.training.num_batches_per_epoch
     scheduler = build_warmup_cosine_scheduler(optimizer, total_steps=total_steps,
@@ -229,9 +218,11 @@ if __name__ == "__main__":
         dataloader=dataloader,
         num_classes=NUM_CLASSES,
         patch_encode=patch_encode,
-        time_sampling='continuous',
         ot_mode='flat',
         scheduler=scheduler,
+        t_dist=config.training.t_dist,
+        ema=ema,
+        grad_clip=config.training.grad_clip,
     )
 
     print("\nLoss history:")

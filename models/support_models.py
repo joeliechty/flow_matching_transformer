@@ -3,32 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-class AdaptiveLayerNorm(nn.Module):
-    """Adaptive Layer Normalization that modulates scale and shift based on phase."""
-    
-    def __init__(self, dim, phase_dim):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        # Project phase to scale and shift parameters
-        self.phase_proj = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(phase_dim, 2 * dim, bias=True)
-        )
-        
-    def forward(self, x, phase_emb):
-        """
-        Args:
-            x: input tensor [batch, seq_len, dim]
-            phase_emb: phase embedding [batch, phase_dim]
-        """
-        # Get modulation parameters
-        phase_params = self.phase_proj(phase_emb)  # [batch, 2*dim]
-        scale, shift = phase_params.chunk(2, dim=-1)  # Each [batch, dim]
-        
-        # Apply layer norm and modulate
-        x = self.norm(x)
-        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-        return x
+
+def modulate(x, shift, scale):
+    """adaLN modulation of a normalised x [batch, seq_len, dim] by per-sample shift and scale [batch, dim]."""
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 class FeedForward(nn.Module):
@@ -49,7 +27,8 @@ class FeedForward(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention mechanism."""
+    """Multi-head self-attention with QK-norm: queries and keys are RMS-normalised per head
+    before the dot product, which bounds the attention logits [SD3, Esser et al. 2024]."""
     
     def __init__(self, dim, num_heads=8, dropout=0.0):
         super().__init__()
@@ -58,45 +37,43 @@ class MultiHeadAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
         
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
         self.proj = nn.Linear(dim, dim)
+        self.attn_dropout = dropout
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
         B, N, C = x.shape
         
-        # Generate Q, K, V
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        # Generate Q, K, V: each [B, heads, N, head_dim]
+        q, k, v = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
+        x = F.scaled_dot_product_attention(self.q_norm(q), self.k_norm(k), v,
+                                           dropout_p=self.attn_dropout if self.training else 0.0)
         
         # Combine heads
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.dropout(x)
-        
-        return x
+        x = x.transpose(1, 2).reshape(B, N, C)
+        return self.dropout(self.proj(x))
 
 
 class CrossAttention(nn.Module):
-    """Cross-attention mechanism for conditioning."""
+    """Cross-attention from the sequence to the condition tokens, with QK-norm."""
     def __init__(self, dim, context_dim=None, num_heads=8, dropout=0.0):
         super().__init__()
         if context_dim is None:
             context_dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
         
         self.q = nn.Linear(dim, dim, bias=False)
         self.kv = nn.Linear(context_dim, dim * 2, bias=False)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
         self.proj = nn.Linear(dim, dim)
+        self.attn_dropout = dropout
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x, context):
@@ -105,44 +82,73 @@ class CrossAttention(nn.Module):
         
         q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         # K and V come from the context (the condition tokens)
-        kv = self.kv(context).reshape(B_c, M, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
+        k, v = self.kv(context).reshape(B_c, M, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
-        
-        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        out = self.proj(out)
-        return self.dropout(out)
+        out = F.scaled_dot_product_attention(self.q_norm(q), self.k_norm(k), v,
+                                             dropout_p=self.attn_dropout if self.training else 0.0)
+        out = out.transpose(1, 2).reshape(B, N, C)
+        return self.dropout(self.proj(out))
     
 
 class TransformerBlock(nn.Module):
-    """Transformer block with Self-Attention, Cross-Attention, and AdaLN."""
+    """Transformer block with adaLN-Zero conditioning [DiT, Peebles & Xie 2023].
+
+    Each branch (self-attention, optional cross-attention to condition tokens, MLP) sees an
+    RMS-normalised input modulated by a per-sample shift and scale, and its output is scaled by
+    a per-sample gate before the residual add. Shift, scale and gate are regressed from the
+    conditioning vector c by a zero-initialised layer (`zero_init`), so the block starts as
+    the identity.
+    """
     
-    def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.0, phase_dim=256):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.0, cond_dim=256, cross_attn=False):
         super().__init__()
-        self.norm1 = AdaptiveLayerNorm(dim, phase_dim)
+        self.norm = nn.RMSNorm(dim, elementwise_affine=False, eps=1e-6)
         self.attn = MultiHeadAttention(dim, num_heads, dropout)
-        self.norm2 = AdaptiveLayerNorm(dim, phase_dim)
-        self.cross_attn = CrossAttention(dim, dim, num_heads, dropout)
-        self.norm3 = AdaptiveLayerNorm(dim, phase_dim)
+        self.cross_attn = CrossAttention(dim, dim, num_heads, dropout) if cross_attn else None
         self.mlp = FeedForward(dim, int(dim * mlp_ratio), dropout)
+        self.num_branches = 3 if cross_attn else 2
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 3 * self.num_branches * dim))
+
+    def zero_init(self):
+        nn.init.zeros_(self.modulation[-1].weight)
+        nn.init.zeros_(self.modulation[-1].bias)
         
-    def forward(self, x, phase_emb, context=None):
+    def forward(self, x, c, context=None):
         """
         Args:
             x: input tensor [batch, seq_len, dim]
-            phase_emb: phase embedding [batch, phase_dim]
+            c: conditioning vector [batch, cond_dim] (time embedding, plus the condition in adaLN mode)
+            context: condition tokens [batch, M, dim] for the cross-attention branch
         """
-        # Self-attention block with residual
-        x = x + self.attn(self.norm1(x, phase_emb))
-        # Cross-attention to inject conditions
-        if context is not None:
-            x = x + self.cross_attn(self.norm2(x, phase_emb), context)
-        # MLP block with residual
-        x = x + self.mlp(self.norm3(x, phase_emb))
+        mods = self.modulation(c).chunk(3 * self.num_branches, dim=-1)
+        branches = [self.attn]
+        if self.cross_attn is not None:
+            branches.append(lambda h: self.cross_attn(h, context))
+        branches.append(self.mlp)
+        for i, branch in enumerate(branches):
+            shift, scale, gate = mods[3 * i:3 * i + 3]
+            x = x + gate.unsqueeze(1) * branch(modulate(self.norm(x), shift, scale))
         return x
+
+
+class FinalLayer(nn.Module):
+    """adaLN-modulated RMSNorm and the output projection, both zero-initialised (`zero_init`),
+    so the model's raw output starts at zero."""
+
+    def __init__(self, dim, cond_dim, output_dim):
+        super().__init__()
+        self.norm = nn.RMSNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, 2 * dim))
+        self.proj = nn.Linear(dim, output_dim)
+
+    def zero_init(self):
+        for layer in (self.modulation[-1], self.proj):
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, x, c):
+        shift, scale = self.modulation(c).chunk(2, dim=-1)
+        return self.proj(modulate(self.norm(x), shift, scale))
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -164,6 +170,42 @@ class SinusoidalPosEmb(nn.Module):
         emb = t[:, None] * emb[None, :]
         emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
         return emb
+
+
+class GaussianFourierProjection(nn.Module):
+    """Random Fourier features of t: sin and cos of 2π·t·w with fixed w ~ N(0, scale²)
+    [Tancik et al. 2020; Song et al. 2021]. w is a buffer, so it is saved with the model."""
+
+    def __init__(self, dim, scale=16.0):
+        super().__init__()
+        self.register_buffer('W', torch.randn(dim // 2) * scale)
+
+    def forward(self, t):
+        proj = 2 * math.pi * t[:, None] * self.W[None, :]
+        return torch.cat([proj.sin(), proj.cos()], dim=-1)
+
+
+# Featurisations of the flow time t in [0, 1] (an ablation axis):
+#   sinusoidal        sinusoids of t itself; the highest frequency is 1 rad per unit of t
+#   sinusoidal_x1000  sinusoids of 1000·t, the scale DiT trains at and SD3 / Flux use
+#   fourier           Gaussian Fourier features, scale 16
+TIME_EMBEDDINGS = ('sinusoidal', 'sinusoidal_x1000', 'fourier')
+
+
+class TimeEmbedding(nn.Module):
+    """Flow time t [batch] -> [batch, dim]: a fixed featurisation (`TIME_EMBEDDINGS`), then a
+    two-layer MLP."""
+
+    def __init__(self, dim, kind='sinusoidal'):
+        super().__init__()
+        if kind not in TIME_EMBEDDINGS:
+            raise ValueError(f"Unknown time embedding: {kind!r}. Expected one of {TIME_EMBEDDINGS}.")
+        self.scale = 1000.0 if kind == 'sinusoidal_x1000' else 1.0
+        self.features = GaussianFourierProjection(dim) if kind == 'fourier' else SinusoidalPosEmb(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+
+    def forward(self, t):
+        return self.mlp(self.features(t * self.scale))
 
 
 def _sincos_1d(embed_dim, positions):

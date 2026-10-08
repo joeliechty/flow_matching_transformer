@@ -6,10 +6,12 @@ import unittest
 
 import torch
 
-from utils.tf_utils import sample_random_twist
-from utils.train_utils import (PAIRINGS, Pairer, _batch_cost, _build_cond_mask, _mode_condition_ids,
+from utils.tf_utils import convert_twist_to_pose, sample_random_twist
+from utils.train_utils import (EMA, PAIRINGS, Pairer, _batch_cost, _build_cond_mask, _mode_condition_ids,
                                _pair_within_conditions, admissible_ratio, c2ot_weight,
-                               condition_aware_pairing, flat_ot_pairing, sequence_ot_pairing)
+                               condition_aware_pairing, flat_ot_pairing, generate_interpolated_states,
+                               pose_normalizer_stats, sample_pose_batch, sample_times,
+                               sequence_ot_pairing)
 
 
 def se3_pair(start, goal):
@@ -205,6 +207,56 @@ class CondMaskTest(unittest.TestCase):
             torch.manual_seed(7)
             self.assertTrue(torch.equal(_build_cond_mask(4096, num_tokens, use_cfg=True, device='cpu'),
                                         expected))
+
+
+
+class TimeSamplingTest(unittest.TestCase):
+    def test_densities(self):
+        torch.manual_seed(0)
+        for dist, mean in (('uniform', 0.5), ('logit_normal', 0.5), ('beta', 0.999 * 0.4)):
+            with self.subTest(dist):
+                t = sample_times(200_000, dist)
+                self.assertTrue(bool(((t >= 0) & (t <= 1)).all()))
+                self.assertAlmostEqual(t.mean().item(), mean, delta=0.005)
+        # π0's density puts about 65% of the times in the noisier half
+        self.assertGreater((sample_times(200_000, 'beta') < 0.5).float().mean().item(), 0.6)
+
+    def test_se3_paths_run_from_start_to_goal(self):
+        torch.manual_seed(0)
+        start, goal = sample_random_twist(16), sample_random_twist(16, mu=[5, 5, 5, 0, 0, 1.5])
+        t = torch.tensor([[0.0, 1.0]]).repeat(16, 1)
+        interp, _, _ = generate_interpolated_states(start, goal, manifold='se3', t=t)
+        for k, end in ((0, start), (1, goal)):
+            pose = convert_twist_to_pose(end, dt=1.0, return_representation='quat')
+            self.assertTrue(torch.allclose(interp[:, k, :3], pose[:, :3], atol=1e-4))
+            self.assertTrue(torch.allclose((interp[:, k, 3:] * pose[:, 3:]).sum(-1).abs(),
+                                           torch.ones(16), atol=1e-4))
+
+
+class EMATest(unittest.TestCase):
+    def test_the_first_update_uses_the_warmup_decay(self):
+        model = torch.nn.Linear(2, 2)
+        ema = EMA(model, 0.999)
+        old = model.weight.detach().clone()
+        with torch.no_grad():
+            model.weight.add_(1.0)
+        ema.update(model)
+        decay = 2 / 11  # min(0.999, (1 + 1) / (10 + 1))
+        self.assertTrue(torch.allclose(ema.shadow['weight'], decay * old + (1 - decay) * (old + 1)))
+
+
+class NormalizerStatsTest(unittest.TestCase):
+    def test_stats_leave_the_training_rng_untouched(self):
+        start = {'mu': [[0] * 6], 'sigma': [[1] * 6]}
+        goal = {'mu': [[[5, 5, 5, 0, 0, 1.5]], [[5, -5, 5, 0, 0, -1.5]]], 'sigma': [[[0.1] * 6]] * 2}
+        sampler = lambda n: sample_pose_batch(n, start, goal, None)
+        torch.manual_seed(3)
+        expected = torch.rand(5)
+        torch.manual_seed(3)
+        stats = pose_normalizer_stats(sampler, n=4096)
+        self.assertTrue(torch.equal(torch.rand(5), expected))
+        self.assertEqual([v.shape[0] for v in stats.values()], [3, 3, 6, 6])
+        self.assertAlmostEqual(stats['vel_mean'][0].item(), 5.0, delta=0.1)  # the goals sit at x = 5
 
 
 if __name__ == '__main__':

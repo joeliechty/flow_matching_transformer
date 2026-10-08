@@ -323,13 +323,16 @@ class Pairer:
         return ''.join(f", {k}: {v:.3g}" for k, v in self.info.items())
 
 
-def generate_interpolated_states(start, goal, n_steps=10, manifold='se3'):
+def generate_interpolated_states(start, goal, n_steps=10, manifold='se3', t=None):
     """
     Build an interpolation between start and goal samples, plus a per-step target velocity.
 
     For manifold='se3': start/goal are twists [B, 6], interpolated states are quaternion
     poses [B, n_steps, 7], target velocity is twist [B, n_steps, 6].
     For manifold='euclidean': start/goal/interpolated/target all share dim D.
+
+    t: optional times [B, n_steps] to interpolate at, one row per pair (default: the same
+       n_steps evenly spaced times in [0, 1] for every pair).
 
     Returns:
         interp:   [B, n_steps, state_dim]
@@ -340,7 +343,9 @@ def generate_interpolated_states(start, goal, n_steps=10, manifold='se3'):
     device = start.device
     dtype = start.dtype
 
-    t = torch.linspace(0, 1, n_steps, device=device, dtype=dtype)
+    if t is None:
+        t = torch.linspace(0, 1, n_steps, device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1)
+    n_steps = t.shape[1]
 
     if manifold == 'se3':
         start_pose = convert_twist_to_pose(start, dt=1.0, return_representation='quat')  # [B, 7]
@@ -349,7 +354,7 @@ def generate_interpolated_states(start, goal, n_steps=10, manifold='se3'):
 
         start_flat = start_pose.repeat_interleave(n_steps, dim=0)                          # [B*n_steps, 7]
         twist_flat = twist_s_to_g.repeat_interleave(n_steps, dim=0)                        # [B*n_steps, 6]
-        t_flat = t.repeat(batch_size).unsqueeze(-1)                                        # [B*n_steps, 1]
+        t_flat = t.reshape(-1, 1)                                                          # [B*n_steps, 1]
 
         interp_flat = add_twist_to_pose(start_flat, twist_flat, t_flat)                    # [B*n_steps, 7]
         interp = interp_flat.reshape(batch_size, n_steps, 7)
@@ -358,15 +363,13 @@ def generate_interpolated_states(start, goal, n_steps=10, manifold='se3'):
     elif manifold == 'euclidean':
         # Linear interp: x_t = start + t*(goal - start);  v_target = goal - start (constant in t)
         diff = compute_velocity_between_states(start, goal, dt=1.0)                        # [B, D]
-        # Broadcast t against batch: [B, n_steps, D] = start[:,None,:] + t[None,:,None]*diff[:,None,:]
-        t_b = t.view(1, n_steps, 1)
-        interp = start.unsqueeze(1) + t_b * diff.unsqueeze(1)                              # [B, n_steps, D]
+        # Broadcast t against batch: [B, n_steps, D] = start[:,None,:] + t[:,:,None]*diff[:,None,:]
+        interp = start.unsqueeze(1) + t.unsqueeze(-1) * diff.unsqueeze(1)                  # [B, n_steps, D]
         v_target = diff.unsqueeze(1).repeat(1, n_steps, 1)                                 # [B, n_steps, D]
     else:
         raise ValueError(f"Unknown manifold: {manifold!r}.")
 
-    t_out = t.unsqueeze(0).repeat(batch_size, 1)                                            # [B, n_steps]
-    return interp, t_out, v_target
+    return interp, t, v_target
 
 
 # Backward-compat alias preserving the original signature/name
@@ -390,10 +393,78 @@ def _build_cond_mask(batch_size, num_tokens, use_cfg, device):
     return indep_mask & ~indep_mask.all(dim=-1, keepdim=True)
 
 
+# Training-time densities of the flow time t in [0, 1] (t = 0 is noise, t = 1 data), an
+# ablation axis:
+#   uniform       Rectified Flow / I-CFM
+#   logit_normal  sigmoid of N(0, 1), weighting the middle of the path [SD3, Esser et al. 2024]
+#   beta          π0's density, weighting the noisy end: t = 0.999·(1 − u), u ~ Beta(1.5, 1)
+#                 [Black et al. 2024]
+T_DISTS = ('uniform', 'logit_normal', 'beta')
+
+
+def sample_times(n, dist='uniform', device='cpu', dtype=torch.float32):
+    """`n` training times drawn from one of `T_DISTS`."""
+    if dist == 'uniform':
+        return torch.rand(n, device=device, dtype=dtype)
+    if dist == 'logit_normal':
+        return torch.sigmoid(torch.randn(n, device=device, dtype=dtype))
+    if dist == 'beta':
+        u = torch.distributions.Beta(torch.tensor(1.5, device=device),
+                                     torch.tensor(1.0, device=device)).sample((n,))
+        return (0.999 * (1 - u)).to(dtype)
+    raise ValueError(f"Unknown time distribution: {dist!r}. Expected one of {T_DISTS}.")
+
+
+class EMA:
+    """Exponential moving average of a model's parameters, the weights to sample from [as in
+    DiT, SiT, EDM and SD3]. The decay warms up as min(decay, (1 + n) / (10 + n)) over the first
+    updates, so the average isn't dominated by the random initialisation."""
+
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.num_updates = 0
+        self.shadow = {name: p.detach().clone() for name, p in model.named_parameters()}
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        for name, p in model.named_parameters():
+            self.shadow[name].lerp_(p.detach(), 1 - decay)
+
+    def state_dict(self, model):
+        """`model`'s state_dict with every parameter replaced by its average."""
+        return {**model.state_dict(), **self.shadow}
+
+
+def pose_normalizer_stats(sampler, n=50_000, seed=0, chunk=1024):
+    """Position and velocity statistics for an SE(3) model's `set_normalizer`: the per-axis mean
+    and std of the positions on the training paths (uniform t) and of the twist targets, over
+    `n` randomly paired (start, goal) draws from `sampler(m) -> (start, goal, obs, cond_ids)`.
+
+    Drawn under `seed` inside a forked RNG, so the training run's random stream is unchanged.
+    """
+    devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        starts, goals, have = [], [], 0
+        while have < n:
+            start, goal, _, _ = sampler(chunk)
+            starts.append(start.reshape(-1, 6))
+            goals.append(goal.reshape(-1, 6))
+            have += starts[-1].shape[0]
+        start, goal = torch.cat(starts)[:n], torch.cat(goals)[:n]
+        t = torch.rand(start.shape[0], 1, device=start.device, dtype=start.dtype)
+        interp, _, v = generate_interpolated_states(start, goal, manifold='se3', t=t)
+    pos, vel = interp[:, 0, :3], v[:, 0]
+    return {'pos_mean': pos.mean(0).cpu(), 'pos_std': pos.std(0).clamp_min(1e-3).cpu(),
+            'vel_mean': vel.mean(0).cpu(), 'vel_std': vel.std(0).clamp_min(1e-3).cpu()}
+
+
 def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
                             state_dim, vel_dim, manifold, use_ot, use_cfg, device,
-                            time_sampling='grid', ot_mode='per_frame', scheduler=None,
-                            cond_ids=None):
+                            ot_mode='per_frame', scheduler=None, cond_ids=None,
+                            t_dist='uniform', ema=None, grad_clip=None):
     """
     Shared core: interpolate -> forward+loss -> backprop.
 
@@ -403,16 +474,15 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
     cond_ids:   [B] condition index per sample (conditional models), or None. With OT,
                 pairing then stays within each condition.
 
-    time_sampling:
-        'grid'       — legacy: builds n_steps interpolated states per sample,
-                       fans the batch out to [B*n_steps, S, D] for one forward pass
-                       per minibatch. Used by the SE(3) pose trainer.
-        'continuous' — Rectified Flow / I-CFM standard: sample one t ~ U(0,1) per
-                       image and only evaluate the loss there. Euclidean only.
+    Flow times are drawn from `t_dist` (`T_DISTS`). SE(3) pairs each get n_steps times, so the
+    batch fans out to [B*n_steps, S, D] and every geodesic is reused n_steps times; Euclidean
+    samples get one time each.
     ot_mode:
         'per_frame' — independent OT permutation per sequence index (SE(3) trainer).
         'flat'      — single permutation across the flattened [B, S*D] sample
                       so spatial coherence is preserved (image trainer).
+    ema:        an `EMA` to update after the optimiser step, or None.
+    grad_clip:  max gradient norm, or None.
     """
     B, S, _ = start.shape
 
@@ -428,10 +498,8 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
         else:
             start = _pair_within_conditions(start, goal, cond_ids, pair_fn)
 
-    if time_sampling == 'continuous':
-        if manifold != 'euclidean':
-            raise ValueError("time_sampling='continuous' currently requires manifold='euclidean'.")
-        t_input = torch.rand(B, device=device, dtype=start.dtype)        # [B]
+    if manifold == 'euclidean':
+        t_input = sample_times(B, t_dist, device=device, dtype=start.dtype)  # [B]
         diff = goal - start                                              # [B, S, D]
         x_t = start + t_input.view(B, 1, 1) * diff                        # [B, S, D]
         v_target = diff                                                   # [B, S, D]
@@ -440,23 +508,24 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
             cond_mask = _build_cond_mask(B, obs.shape[1], use_cfg, device)
         else:
             cond_mask = None
-    elif time_sampling == 'grid':
+    elif manifold == 'se3':
         flat_start = start.reshape(B * S, start.shape[-1])
         flat_goal = goal.reshape(B * S, goal.shape[-1])
+        # One set of times per sample, shared by its sequence positions
+        t = sample_times(B * n_steps, t_dist, device=device, dtype=start.dtype).view(B, n_steps)
 
         interp_flat, t_flat, v_flat = generate_interpolated_states(
-            flat_start, flat_goal, n_steps=n_steps, manifold=manifold
+            flat_start, flat_goal, manifold=manifold, t=t.repeat_interleave(S, dim=0)
         )
         # interp_flat: [B*S, n_steps, state_dim]
         # v_flat:      [B*S, n_steps, vel_dim]
 
         x_t = interp_flat.view(B, S, n_steps, state_dim).transpose(1, 2)   # [B, n_steps, S, state_dim]
         v_target = v_flat.view(B, S, n_steps, vel_dim).transpose(1, 2)     # [B, n_steps, S, vel_dim]
-        t = t_flat.view(B, S, n_steps).transpose(1, 2)                     # [B, n_steps, S]
 
         x_t = x_t.reshape(B * n_steps, S, state_dim)
         v_target = v_target.reshape(B * n_steps, S, vel_dim)
-        t_input = t[:, :, 0].reshape(B * n_steps)
+        t_input = t.reshape(B * n_steps)
 
         if obs is not None:
             obs = obs.repeat_interleave(n_steps, dim=0)
@@ -464,7 +533,7 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
         else:
             cond_mask = None
     else:
-        raise ValueError(f"Unknown time_sampling: {time_sampling!r}")
+        raise ValueError(f"Unknown manifold: {manifold!r}.")
 
     if isinstance(model, ConditionalFlowMatchingTransformerModel):
         loss = model.cfm_loss(x_t, t_input, v_target, obs, cond_mask=cond_mask, reduction='mean')
@@ -473,16 +542,20 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
 
     optimizer.zero_grad()
     loss.backward()
+    if grad_clip is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
     if scheduler is not None:
         scheduler.step()
+    if ema is not None:
+        ema.update(model)
 
     return loss.item()
 
 
 def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params, goal_dist_params,
                         action_dist_params, seq_len=1, use_ot=True, use_cfg=True, device='cpu',
-                        scheduler=None):
+                        scheduler=None, t_dist='uniform', ema=None, grad_clip=None):
     """Pose-flow minibatch: samples start/goal twists from mode distributions (manifold='se3')."""
     model.train()
 
@@ -496,15 +569,16 @@ def train_one_minibatch(model, optimizer, batch_size, n_steps, start_dist_params
         n_steps=n_steps,
         state_dim=7, vel_dim=6,
         manifold='se3', use_ot=use_ot, use_cfg=use_cfg, device=device,
-        time_sampling='grid', ot_mode='per_frame', scheduler=scheduler,
-        cond_ids=cond_ids,
+        ot_mode='per_frame', scheduler=scheduler, cond_ids=cond_ids,
+        t_dist=t_dist, ema=ema, grad_clip=grad_clip,
     )
 
 
 def train_one_paired_minibatch(model, optimizer, pairer, n_steps, use_cfg=True, device='cpu',
-                               scheduler=None, manifold='se3', time_sampling='grid'):
+                               scheduler=None, manifold='se3', t_dist='uniform', ema=None,
+                               grad_clip=None):
     """One step on the next network batch from `pairer` (already paired). SE(3) pose flows use
-    the grid time sampling of `train_one_minibatch`; Euclidean ones may sample t continuously."""
+    n_steps times per pair, as in `train_one_minibatch`; Euclidean ones one time per sample."""
     model.train()
     start, goal, obs = pairer.next_batch()
     dim = goal.shape[-1]
@@ -512,7 +586,8 @@ def train_one_paired_minibatch(model, optimizer, pairer, n_steps, use_cfg=True, 
     return _run_flow_matching_step(
         model, optimizer, start=start, goal=goal, obs=obs, n_steps=n_steps,
         state_dim=state_dim, vel_dim=vel_dim, manifold=manifold, use_ot=False, use_cfg=use_cfg,
-        device=device, time_sampling=time_sampling, ot_mode=pairer.ot_mode, scheduler=scheduler,
+        device=device, ot_mode=pairer.ot_mode, scheduler=scheduler,
+        t_dist=t_dist, ema=ema, grad_clip=grad_clip,
     )
 
 
@@ -581,8 +656,8 @@ def sample_pose_batch(batch_size, start_dist_params, goal_dist_params, action_di
 
 def train_one_minibatch_image(model, optimizer, dataloader_iter, n_steps,
                               num_classes=10, use_ot=True, use_cfg=True, device='cpu',
-                              patch_encode=None, time_sampling='continuous', ot_mode='flat',
-                              scheduler=None):
+                              patch_encode=None, ot_mode='flat', scheduler=None,
+                              t_dist='uniform', ema=None, grad_clip=None):
     """
     Image-flow minibatch: pulls a batch from `dataloader_iter`, builds Gaussian noise as
     the start, and runs the shared training step on the Euclidean manifold.
@@ -629,8 +704,8 @@ def train_one_minibatch_image(model, optimizer, dataloader_iter, n_steps,
         n_steps=n_steps,
         state_dim=D, vel_dim=D,
         manifold='euclidean', use_ot=use_ot, use_cfg=use_cfg, device=device,
-        time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler,
-        cond_ids=labels if is_conditional else None,
+        ot_mode=ot_mode, scheduler=scheduler, cond_ids=labels if is_conditional else None,
+        t_dist=t_dist, ema=ema, grad_clip=grad_clip,
     )
     return loss, dataloader_iter
 
@@ -638,10 +713,11 @@ def train_one_minibatch_image(model, optimizer, dataloader_iter, n_steps,
 def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_dist_params,
                     goal_dist_params, action_dist_params, seq_len=1, use_ot=True, use_cfg=True,
                     device='cpu', manifold='se3', dataloader=None, num_classes=10,
-                    patch_encode=None, time_sampling='continuous', ot_mode='flat',
-                    scheduler=None, pairer=None):
+                    patch_encode=None, ot_mode='flat', scheduler=None, pairer=None,
+                    t_dist='uniform', ema=None, grad_clip=None):
     total_loss = 0.0
     completed = 0
+    step_opts = {'scheduler': scheduler, 't_dist': t_dist, 'ema': ema, 'grad_clip': grad_clip}
 
     if manifold == 'euclidean':
         if dataloader is None:
@@ -652,7 +728,7 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
                 model, optimizer, data_iter, n_steps,
                 num_classes=num_classes, use_ot=use_ot, use_cfg=use_cfg,
                 device=device, patch_encode=patch_encode,
-                time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler,
+                ot_mode=ot_mode, **step_opts,
             )
             if loss is None:
                 # Iterator exhausted — restart and retry this batch index
@@ -661,7 +737,7 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
                     model, optimizer, data_iter, n_steps,
                     num_classes=num_classes, use_ot=use_ot, use_cfg=use_cfg,
                     device=device, patch_encode=patch_encode,
-                    time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler,
+                    ot_mode=ot_mode, **step_opts,
                 )
             total_loss += loss
             completed += 1
@@ -677,12 +753,12 @@ def train_one_epoch(model, optimizer, num_batches, batch_size, n_steps, start_di
                     model, optimizer, batch_size, n_steps,
                     start_dist_params, goal_dist_params, action_dist_params,
                     seq_len=seq_len, use_ot=use_ot, use_cfg=use_cfg, device=device,
-                    scheduler=scheduler,
+                    **step_opts,
                 )
             else:
                 loss = train_one_paired_minibatch(
                     model, optimizer, pairer, n_steps, use_cfg=use_cfg, device=device,
-                    scheduler=scheduler,
+                    **step_opts,
                 )
             total_loss += loss
             completed += 1
@@ -697,11 +773,15 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
           start_dist_params=None, goal_dist_params=None, action_dist_params=None,
           seq_len=1, use_ot=True, use_cfg=True, device='cpu', save_path=None,
           manifold='se3', dataloader=None, num_classes=10, patch_encode=None,
-          time_sampling='continuous', ot_mode='flat', scheduler=None, pairer=None):
+          ot_mode='flat', scheduler=None, pairer=None, t_dist='uniform', ema=None,
+          grad_clip=None):
     """
     Full training loop. SE(3) (default) trains from distribution params; 'euclidean' trains
     from a torch DataLoader yielding (images, labels). An SE(3) run given a `Pairer` draws
     its (already paired) batches from it instead of from the distribution params.
+
+    t_dist: training-time density (`T_DISTS`); ema: an `EMA` of the weights, saved with every
+    checkpoint as 'ema_state_dict'; grad_clip: max gradient norm.
     """
     loss_history = []
 
@@ -721,7 +801,8 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
             seq_len=seq_len, use_ot=use_ot, use_cfg=use_cfg, device=device,
             manifold=manifold, dataloader=dataloader, num_classes=num_classes,
             patch_encode=patch_encode,
-            time_sampling=time_sampling, ot_mode=ot_mode, scheduler=scheduler, pairer=pairer,
+            ot_mode=ot_mode, scheduler=scheduler, pairer=pairer,
+            t_dist=t_dist, ema=ema, grad_clip=grad_clip,
         )
 
         loss_history.append(avg_loss)
@@ -733,11 +814,13 @@ def train(model, optimizer, num_epochs, num_batches_per_epoch, batch_size, n_ste
                 os.makedirs(checkpoint_dir, exist_ok=True)
                 print(f"Created checkpoint directory: {checkpoint_dir}")
             checkpoint_path = f"{save_path}_epoch_{epoch + 1}.pt"
+            extra = {'ema_state_dict': ema.state_dict(model)} if ema is not None else {}
             model.save_checkpoint(
                 filepath=checkpoint_path,
                 optimizer=optimizer,
                 epoch=epoch + 1,
-                loss=avg_loss
+                loss=avg_loss,
+                **extra,
             )
             print(f"Checkpoint saved to {checkpoint_path}\n")
 

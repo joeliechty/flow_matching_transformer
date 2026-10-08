@@ -3,17 +3,22 @@
 # OT x CFG + 2 unconditional OT / no-OT) for every seed, then evaluate them. Identical
 # hyperparameters across variants — only the OT/CFG/conditional knobs differ.
 #
-#   ./mnist_ablations.sh [train|eval|all]       (default: all)
+#   ./mnist_ablations.sh [train|eval|all|ablate|solver|guidance]       (default: all)
 #
-# Layout:
-#   eval_assets/mnist_cnn.pt                        classifier oracle (shared by all seeds)
-#   checkpoints/mnist/seed_<N>/                     checkpoints (every 10 epochs), configs, logs
-#   experiments/results/mnist/epoch_<E>/seed_<N>/   metrics, CFG + sampling-steps sweeps, grids
-#   experiments/results/mnist/epoch_<E>/            *_summary.csv + plots, mean ± std over seeds
+# ablate, solver, guidance: as in pose_ablations.sh (single-axis ablations of ABLATE_BASE under
+# ablate/<arm>/; solvers at equal network evaluations; guidance intervals). See docs/mnist_todo.md.
+#
+# Layout (runs from before the current model and training framework are in checkpoints/mnist/
+# and checkpoints/pre_ablation/; this code can't load them, see tag pose-continuous-v1):
+#   eval_assets/mnist_cnn.pt                             classifier oracle (shared by all seeds)
+#   checkpoints/sota/mnist/seed_<N>/                     checkpoints (every 10 epochs), configs, logs
+#   experiments/results/sota/mnist/epoch_<E>/seed_<N>/   metrics, CFG + sampling-steps sweeps, grids
+#   experiments/results/sota/mnist/epoch_<E>/            *_summary.csv + plots, mean ± std over seeds
 #
 # Env overrides: SEEDS="1 2 3 4 5" JOBS=1 EPOCHS=400 PYTHON=python CLASSIFIER=...
 #                EVAL_EPOCH=<EPOCHS>  evaluate the checkpoints saved at this epoch
-#                CKPT_ROOT, RESULTS_ROOT (relative to the repo root), FMT_REPO_ROOT
+#                CKPT_ROOT, RESULTS_BASE (the per-task results folder), RESULTS_ROOT (relative to
+#                the repo root), FMT_REPO_ROOT
 # Cost: one 400-epoch run is ~26 min on an RTX 4090, so the default 5 seeds x 6
 # variants is ~13 h at JOBS=1 (parallel speedup for MNIST hasn't been measured).
 # Runs whose final-epoch checkpoint already exists are skipped, so re-running resumes.
@@ -31,13 +36,14 @@ export MPLBACKEND="${MPLBACKEND:-Agg}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${FMT_REPO_ROOT:-$SCRIPT_DIR}"
-CKPT_ROOT="${CKPT_ROOT:-checkpoints/mnist}"
-RESULTS_ROOT="${RESULTS_ROOT:-experiments/results/mnist/epoch_$EVAL_EPOCH}"
+CKPT_ROOT="${CKPT_ROOT:-checkpoints/sota/mnist}"
+RESULTS_BASE="${RESULTS_BASE:-experiments/results/sota/mnist}"
+RESULTS_ROOT="${RESULTS_ROOT:-$RESULTS_BASE/epoch_$EVAL_EPOCH}"
 CLASSIFIER="${CLASSIFIER:-eval_assets/mnist_cnn.pt}"
 
 case "$STAGE" in
-  train|eval|all) ;;
-  *) echo "usage: $0 [train|eval|all]" >&2; exit 2 ;;
+  train|eval|all|ablate|solver|guidance) ;;
+  *) echo "usage: $0 [train|eval|all|ablate|solver|guidance]" >&2; exit 2 ;;
 esac
 
 if (( EVAL_EPOCH % 10 != 0 )); then
@@ -65,6 +71,17 @@ VARIANTS=(
   "cond_image_flow_matching_model_NOOT_NOCFG|--conditional --no_ot --no_cfg"
   "image_flow_matching_model_OT_CFG|"
   "image_flow_matching_model_NOOT_CFG|--no_ot"
+)
+
+# Single-axis ablation arms: "<arm>|<trainer flags>", each changing one contested choice
+ABLATION_ARMS=(
+  "t_logit_normal|--t_dist logit_normal"
+  "t_beta|--t_dist beta"
+  "time_x1000|--time_emb sinusoidal_x1000"
+  "time_fourier|--time_emb fourier"
+  "cond_cross_attn|--cond_mode cross_attn"
+  "cond_joint|--cond_mode joint"
+  "cfg|"
 )
 
 trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
@@ -140,6 +157,87 @@ eval_stage() {
   "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT"
 }
 
+train_pool() {  # <root> <"setting|checkpoint name|trainer flags">...
+  # Every setting x seed from one job pool, into <root>/<setting>/seed_<N>/.
+  local root=$1; shift
+  local entry setting rest name flags seed running=0 failed=0
+  for entry in "$@"; do
+    setting="${entry%%|*}"; rest="${entry#*|}"; name="${rest%%|*}"; flags="${rest#*|}"
+    for seed in $SEEDS; do
+      mkdir -p "$root/$setting/seed_$seed"
+      if [[ -f "$root/$setting/seed_$seed/${name}_epoch_${EPOCHS}.pt" ]]; then
+        echo "  skip    $setting seed $seed (already trained)"
+        continue
+      fi
+      if (( running >= JOBS )); then
+        wait -n || failed=1
+        running=$(( running - 1 ))
+      fi
+      # shellcheck disable=SC2086  # flags are intentionally word-split
+      ( CKPT_ROOT="$root/$setting"; train_one "$seed" "$name" $flags ) &
+      running=$(( running + 1 ))
+    done
+  done
+  while (( running > 0 )); do
+    wait -n || failed=1
+    running=$(( running - 1 ))
+  done
+  if (( failed )); then
+    echo "ERROR: some training runs failed (see above)" >&2
+    exit 1
+  fi
+}
+
+ablate_stage() {
+  local base="${ABLATE_BASE:?set ABLATE_BASE=\"<checkpoint name>|<trainer flags>\" (the baseline variant)}"
+  local base_name="${base%%|*}" base_flags="${base#*|}" root="$CKPT_ROOT/ablate"
+  local wanted=" ${ABLATE_ARMS:-t_logit_normal t_beta time_x1000 time_fourier cond_cross_attn cond_joint} "
+  local entries=() arms=() entry arm
+  for entry in "${ABLATION_ARMS[@]}"; do
+    arm="${entry%%|*}"
+    [[ "$wanted" == *" $arm "* ]] || continue
+    arms+=("$arm")
+    if [[ "$arm" == cfg ]]; then  # the baseline, trained with CFG
+      entries+=("cfg|${base_name/_NOCFG/_CFG}|${base_flags/--no_cfg/}")
+    else
+      entries+=("$arm|$base_name|$base_flags ${entry#*|}")
+    fi
+  done
+  echo "=== MNIST ablations: base $base_name, arms [${arms[*]}], seeds [$SEEDS], $JOBS at a time ==="
+  train_pool "$root" "${entries[@]}"
+  for arm in "${arms[@]}"; do
+    CKPT_ROOT="$root/$arm"
+    RESULTS_ROOT="$RESULTS_BASE/ablate/$arm/epoch_$EVAL_EPOCH"
+    echo "=== Ablation eval: $arm ==="
+    eval_stage
+  done
+}
+
+solver_stage() {
+  echo "=== MNIST solvers at equal network evaluations: seeds [$SEEDS], epoch $EVAL_EPOCH ==="
+  local seed
+  for seed in $SEEDS; do
+    "$PYTHON" experiments/steps_sweep.py --checkpoint_dir "$CKPT_ROOT/seed_$seed" --epoch "$EVAL_EPOCH" \
+      --classifier_path "$CLASSIFIER" --cfg_scale 1.0 --method euler midpoint heun \
+      --steps 2 4 6 10 18 40 100 --output "$RESULTS_ROOT/seed_$seed/solver_sweep.csv"
+  done
+  "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT"
+}
+
+guidance_stage() {
+  echo "=== MNIST guidance intervals: CFG models in $CKPT_ROOT, seeds [$SEEDS], epoch $EVAL_EPOCH ==="
+  local seed
+  for seed in $SEEDS; do
+    "$PYTHON" experiments/cfg_sweep.py --checkpoint_dir "$CKPT_ROOT/seed_$seed" --epoch "$EVAL_EPOCH" \
+      --classifier_path "$CLASSIFIER" --scales 1 1.5 3 --intervals full 0-0.5 0.25-0.75 0.5-1 \
+      --num_steps 9 100 --output "$RESULTS_ROOT/seed_$seed/guidance_sweep.csv"
+  done
+  "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT"
+}
+
+if [[ "$STAGE" == ablate ]]; then ablate_stage; exit 0; fi
+if [[ "$STAGE" == solver ]]; then solver_stage; exit 0; fi
+if [[ "$STAGE" == guidance ]]; then guidance_stage; exit 0; fi
 if [[ "$STAGE" == train || "$STAGE" == all ]]; then train_stage; fi
 if [[ "$STAGE" == eval  || "$STAGE" == all ]]; then eval_stage; fi
 echo "Done. Summaries in $RESULTS_ROOT/"

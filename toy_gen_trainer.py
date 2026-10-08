@@ -69,7 +69,7 @@ def main():
     dim = DIM[args.toy]
     model_config = {'input_dim': dim, 'output_dim': dim, 'obs_dim': 1, 'hidden_dim': 128,
                     'num_layers': 4, 'num_heads': 4, 'mlp_ratio': 4.0, 'dropout': 0.0,
-                    'phase_dim': 128, 'max_seq_len': 1}
+                    'phase_dim': 128, 'max_seq_len': 1, 'manifold': 'euclidean', 'num_obs_tokens': 1}
     training_config = {'toy': args.toy, 'pairing': args.pairing, 'r_tar': args.r_tar,
                        'ot_batch_mult': args.ot_batch_mult, 'num_clusters': args.num_clusters,
                        'cond_scale': args.cond_scale,
@@ -88,8 +88,7 @@ def main():
     running = 0.0
     for it in range(1, args.iterations + 1):
         running += train_one_paired_minibatch(model, optimizer, pairer, n_steps=1, use_cfg=False,
-                                              device=device, manifold='euclidean',
-                                              time_sampling='continuous')
+                                              device=device, manifold='euclidean')
         if it % 500 == 0:
             print(f"  Iteration {it}/{args.iterations}, Loss: {running / 500:.5f}{pairer.describe()}")
             running = 0.0

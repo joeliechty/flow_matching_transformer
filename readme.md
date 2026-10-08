@@ -11,13 +11,14 @@ This repository is designed to teach several advanced concepts in generative mod
 
 ### 1. Flow Matching on SE(3) [1,4]
 Standard flow matching learns a vector field that transports a simple base distribution (e.g., a standard Gaussian) to a complex data distribution. In this repository, our "data" consists of 3D poses.
-* State Representation: The network state is tracked as poses (represented using quaternions or Ortho6D).
+* State Representation: The integrator state is a pose (position + quaternion). The network sees it as a position and an Ortho6D rotation (section 2).
 * Network Output: The network predicts Twists (v in R^6), representing linear and angular velocities.
 * Integration: ODE integration uses the twist exponential map (`add_twist_to_pose` in [utils/tf_utils.py](utils/tf_utils.py)) to ensure the generated samples stay strictly on the SE(3) manifold.
 
 ### 2. SE(3) Lie Algebra: Ortho6D and the Twist Exponential Map [8]
-The SE(3) flow relies on two interlocking representation choices that decouple network output from manifold state.
-* Network output uses **Ortho6D** (the first two columns of the rotation matrix, re-orthogonalized via Gram-Schmidt). It avoids the antipodal ambiguity of quaternions and is differentiable everywhere, which makes it a more stable regression target than raw quaternions. Conversions live in [utils/tf_utils.py](utils/tf_utils.py) (`_ortho6d_to_quat`, `_quat_to_ortho6d`).
+The SE(3) flow keeps three representations apart: what the network reads, what it predicts, and the state the integrator carries.
+* Network input uses **Ortho6D** (two rows of the rotation matrix) alongside the position. Ortho6D is continuous and the same for q and −q, whereas a quaternion input shows the network every rotation twice (q and −q), with a jump between them. The model converts each pose on the fly (`_quat_to_ortho6d` in [utils/tf_utils.py](utils/tf_utils.py)), so `forward` still takes 7-D poses.
+* Network output is a **twist** (a tangent vector), the standard target on Lie groups [1].
 * Manifold state stays as **quaternions + position** (7D). Integration uses the axis-angle exponential map: the angular velocity ω is converted to a quaternion via `[cos(½‖ω‖dt), (ω/‖ω‖) sin(½‖ω‖dt)]` and composed with the current orientation, while linear velocity integrates additively (`add_twist_to_pose` in [utils/tf_utils.py](utils/tf_utils.py)).
 
 ### 3. Tokenized Flow Matching (Action Chunks) [7]
@@ -51,27 +52,40 @@ Three practical points, from this repo's experiments ([ablations_summary.md](abl
 
 The comparison of these pairings on continuous-condition pose tasks is in [ablations_summary.md](ablations_summary.md#part-2-continuous-conditioning).
 
-### 7. Time Sampling: Grid vs Continuous (Rectified Flow) [4]
-Flow matching has freedom in how the time variable `t ∈ [0, 1]` is sampled during training; both regimes are implemented in `_run_flow_matching_step` ([utils/train_utils.py](utils/train_utils.py)).
-* **Grid sampling** pre-computes `n_steps` interpolated states per sample and fans the batch out to `[B*n_steps, S, D]` for one minibatch. This is the SE(3) trainer's default — it amortizes the cost of geodesic interpolation across many `t` values per pose pair.
-* **Continuous sampling** (Rectified Flow / I-CFM standard) samples a single `t ~ U(0, 1)` per example and evaluates the loss only there. This is the image trainer's default — it scales better to large batches and avoids overcommitting compute to redundant `t` values when the manifold is Euclidean.
+### 7. Time Sampling [4, 16, 17]
+Training draws the flow time `t ∈ [0, 1]` (t = 0 is noise, t = 1 data) continuously, so the network sees every time it is queried at during sampling (`_run_flow_matching_step` in [utils/train_utils.py](utils/train_utils.py)).
+* **SE(3)** draws `--n_steps` times per (noise, goal) pair and fans the batch out to `[B*n_steps, S, D]`. Each geodesic is reused for several times, and the batch, OT batch and compute match the fixed 10-point grid this repository used to train on.
+* **Euclidean** (images) draws one time per sample.
+* **The density** is a contested choice, so it is a flag (`--t_dist`, `sample_times`): `uniform` (Rectified Flow / I-CFM, the default), `logit_normal` (weights the middle of the path; SD3's choice [16]) or `beta` (π0's, weights the noisy end [17]).
 
-### 8. Transformer Backbone and AdaLN [5]
-The core architecture ([models/flow_matching_transformer.py](models/flow_matching_transformer.py)) relies on a sequence-to-sequence Transformer.
-* Timestep Conditioning: The continuous time variable t in [0, 1] is embedded using sinusoidal positional encodings and injected into every layer via Adaptive Layer Normalization (AdaLN). This modulates the scale and shift of the features based on the current integration phase.
+### 8. Transformer Backbone: adaLN-Zero and the Training Recipe [5, 16]
+The core architecture ([models/flow_transformer_base.py](models/flow_transformer_base.py), shared by both models) is a DiT-style sequence-to-sequence Transformer. These choices are settled in current flow-matching and diffusion models, so they have no flags:
+* **adaLN-Zero time conditioning.** The flow time is embedded and regresses, for every branch of every block, a shift, a scale and a gate: `x + gate · branch(modulate(norm(x)))`. The regressing layers start at zero, so every block starts as the identity and the output layer at zero [5].
+* **RMSNorm and QK-norm.** Blocks normalise with RMSNorm, and attention RMS-normalises each head's queries and keys, which bounds the attention logits [16]. Attention runs through `F.scaled_dot_product_attention`.
+* **Normalisation.** On SE(3) the network sees standardised positions and predicts a standardised twist; the trainer measures the statistics from the task (`pose_normalizer_stats`), and the loss is computed in standardised units. Without it, the translation to the goals (about 5 units) dominates the loss over the rotation.
+* **EMA weights and gradient clipping.** Training keeps an exponential moving average of the weights (decay 0.999 for pose, 0.9999 for MNIST), checkpoints save it, and the loaders sample from it. Gradients are clipped at norm 1.
+* **Solvers.** Sampling integrates with Euler, midpoint or Heun steps (`method`). On SE(3), midpoint and Heun apply their twists through the exponential map, so they stay on the manifold.
+
+The flow time's featurisation is a contested choice, so it is a flag (`--time_emb`): sinusoids of t (the default), of 1000·t (DiT's training scale, used by SD3 and Flux), or Gaussian Fourier features [19].
+
+Models from before this framework (tag `pose-continuous-v1` and earlier) can't be loaded by the current code; check out that tag to evaluate or plot them.
 
 ### 9. 2D Sin-Cos Positional Embeddings and Learned Null Tokens [2]
 Two small architectural details are worth calling out because they materially affect conditional image generation.
 * **2D sin-cos positional embeddings** (`get_2d_sincos_pos_embed` in [models/support_models.py](models/support_models.py)) give each of the 49 MNIST patches a position encoding that splits row and column into separate sinusoidal halves. This DiT-style spatial inductive bias outperforms a single learned 1D embedding when the token grid has a known 2D layout.
-* **Learned null token** ([models/conditional_flow_matching_transformer.py:121](models/conditional_flow_matching_transformer.py#L121)) is a trainable `[1, 1, hidden_dim]` parameter that replaces observation embeddings on the unconditional path (training dropout and CFG inference). Unlike zero-masking, the network learns an explicit representation of "no condition," which is what makes the double-pass CFG extrapolation in section 11 numerically well-behaved.
+* **Learned null token** ([models/conditional_flow_matching_transformer.py:79](models/conditional_flow_matching_transformer.py#L79)) is a trainable `[1, 1, hidden_dim]` parameter that replaces observation embeddings on the unconditional path (training dropout and CFG inference). Unlike zero-masking, the network learns an explicit representation of "no condition," which is what makes the double-pass CFG extrapolation in section 11 numerically well-behaved.
 
-### 10. Cross-Attention for Multimodal Conditioning [9]
-The `ConditionalFlowMatchingTransformerModel` extends the architecture to support goal-directed generation. Discrete actions or observations (e.g., "top", "left") are embedded and passed as context to a Cross-Attention mechanism, allowing the vector field to split into multimodal trajectories based on the specified condition.
+### 10. Conditioning Pathways [5, 9, 16]
+The `ConditionalFlowMatchingTransformerModel` extends the architecture to support goal-directed generation. Discrete actions or observations (e.g., "top", "left") are embedded as condition tokens, each with a learned embedding for its slot, so the model also knows which slots are nulled. How the tokens reach the transformer is a contested choice, so it is a flag (`--cond_mode`, `COND_MODES`):
+* `adaln` (default): the tokens are flattened, projected and added to the time embedding, so they drive every block's adaLN modulation. This is how DiT conditions on class labels [5].
+* `cross_attn`: every block gets a cross-attention branch to the tokens [9]. With a single token this collapses to adding one vector per sample, because attention over one key always has weight 1.
+* `joint`: the tokens join the sequence, so self-attention mixes them in (DiT's in-context conditioning; SD3 [16] and π0 [17] attend jointly too, with separate weights per stream).
 
 ### 11. Classifier-Free Guidance (CFG) [3]
 Classifier-free guidance lets a single conditional model trade off sample diversity for stronger adherence to its conditioning at inference time, without training a separate classifier.
 * Training: With probability ~10% (see `_run_flow_matching_step` in [utils/train_utils.py](utils/train_utils.py)), conditioning tokens are replaced with a learned null embedding. The model therefore learns both the conditional vector field v(x, t | c) and the unconditional vector field v(x, t | ∅) simultaneously.
 * Inference: At each ODE step, two forward passes are run — one with the real condition, one with the null condition — and the result is extrapolated as `v = v_uncond + cfg_scale * (v_cond - v_uncond)` (see `inference` in [models/conditional_flow_matching_transformer.py](models/conditional_flow_matching_transformer.py)). `cfg_scale = 1.0` recovers the standard conditional flow; higher values push the trajectory more aggressively toward the conditioned mode at the cost of diversity.
+* Guidance intervals: `cfg_interval=(lo, hi)` applies guidance only at flow times `lo <= t < hi` and the plain conditional velocity elsewhere [18].
 
 ## Installation
 
@@ -104,6 +118,8 @@ The repository ships two reference applications that exercise the same flow matc
 
 `pose_gen_trainer.py` trains on the built-in multimodal goal distribution.
 
+The model and training recipe are fixed (section 8); only the contested choices have flags.
+
 Train an Unconditional Pose Model (with Optimal Transport and CFG):
 ```bash
 python pose_gen_trainer.py --num_epochs 50 --batch_size 128
@@ -116,7 +132,7 @@ python pose_gen_trainer.py --conditional --num_epochs 50
 ```
 
 Useful Flags:
-* `--conditional` / `-C`: Trains the conditional model variant with action-token cross-attention; omit for the unconditional model.
+* `--conditional` / `-C`: Trains the conditional model variant with action-token conditioning; omit for the unconditional model.
 * `--no_ot` / `-NOOT`: Disables Optimal Transport pairing (useful for seeing how OT improves flow straightness).
 * `--no_cfg` / `-NOCFG`: Disables classifier-free guidance (no unconditional dropout during training).
 * `--pairing`: How noise is paired with data (section 6). `ot` (default) runs OT within each condition, or over the whole batch for unconditional models; `independent` is the same as `--no_ot`; `global`, `c2ot`, `c2ot_fixed` and `cluster` are the pairings for continuous conditions. The checkpoint suffix follows the pairing (`_OT`, `_NOOT`, `_GOT`, `_C2OT`, `_C2OTFIX`, `_CLUSTER`).
@@ -124,7 +140,10 @@ Useful Flags:
 * `--ot_batch_mult`: Pairs over this many network batches at once, then splits them (default 1).
 * `--num_clusters`: For `cluster`, the number of K-means clusters (default: the OT batch size).
 * `--task_config`: Pose task file in [configs/pose_tasks/](configs/pose_tasks/) (goal modes and conditioning).
-* `--n_steps`: Number of interpolation steps per trajectory during training.
+* `--n_steps`: Training times drawn per (noise, goal) pair (section 7).
+* `--t_dist`: Training-time density: `uniform` (default), `logit_normal` or `beta` (section 7).
+* `--time_emb`: Flow-time featurisation: `sinusoidal` (default), `sinusoidal_x1000` or `fourier` (section 8).
+* `--cond_mode`: How the condition tokens enter: `adaln` (default), `cross_attn` or `joint` (section 10).
 * `--seq_len` / `-S`: Sequence length per trajectory (action chunk size).
 * `--save_path`: Directory to save `.pt` checkpoints and `.yaml` config files.
 
@@ -173,7 +192,8 @@ python image_gen_trainer.py --conditional --num_epochs 10
 
 Useful Flags:
 * `--conditional` / `-C`: Trains a class-conditional model on digit labels 0–9; omit for the unconditional model.
-* `--no_ot` / `-NOOT`, `--no_cfg` / `-NOCFG`, `--n_steps`, `--save_path`: Same semantics as the pose trainer.
+* `--no_ot` / `-NOOT`, `--no_cfg` / `-NOCFG`, `--save_path`: Same semantics as the pose trainer.
+* `--t_dist`, `--time_emb`, `--cond_mode`: The contested choices, as in the pose trainer.
 * `--num_batches_per_epoch` / `-BE`: Minibatches drawn per epoch.
 * `--data_root`: MNIST download/cache location (default `./data`).
 * `--num_workers`: DataLoader worker count.
@@ -220,12 +240,21 @@ export TASK_CONFIG=configs/pose_tasks/continuous_goals.yaml
 ./pose_ablations.sh               # train every pairing x 5 seeds with the calibrated knobs, then evaluate
 SENS_PAIRING=c2ot ./pose_ablations.sh sensitivity   # retrain one pairing with its knob and OT batch varied
 ```
+
+**Single-axis ablations.** `ablate` retrains one baseline variant with one contested choice changed per arm (t density, time embedding, conditioning pathway, or CFG training), and `solver` and `guidance` compare ODE solvers at equal network evaluations and guidance intervals without retraining:
+```bash
+export TASK_CONFIG=configs/pose_tasks/corners_3sigma.yaml
+ABLATE_BASE="cond_pose_flow_matching_model_OT_NOCFG|--conditional --no_cfg" ./pose_ablations.sh ablate
+./pose_ablations.sh solver
+./pose_ablations.sh guidance      # the CFG-trained models in CKPT_ROOT
+```
 Run `calibrate` before training. The published defaults (`--r_tar 0.01`, `--cond_scale 10`) barely change the pairing when one large offset (here the 5-unit translation to the goals) dominates every pairing cost. `experiments/pairing_diagnostics.py` measures this without training.
 
 ## Code Structure
 
 * `models/`: Neural network architectures.
-  * `support_models.py`: Core components (Multi-Head Attention, Cross-Attention, AdaLN, FeedForward).
+  * `support_models.py`: Core components (QK-normed self- and cross-attention, the adaLN-Zero block and final layer, time embeddings, FeedForward).
+  * `flow_transformer_base.py`: What both models share: input embedding and normalisation, the transformer trunk, checkpoints, and the ODE solvers.
   * `flow_matching_transformer.py`: The unconditional base model natively supporting temporal sequences.
   * `conditional_flow_matching_transformer.py`: The action-conditioned sequence model.
 * `utils/`: Mathematical and operational utilities.
@@ -236,7 +265,7 @@ Run `calibrate` before training. The published defaults (`--r_tar 0.01`, `--cond
   * `pose_task.py`: Pose task files (`configs/pose_tasks/`): discrete goal modes named by tokens, or goals that vary continuously with the condition (`ContinuousGoalTask`).
   * `toy_tasks.py`: The 2-D toys (moons, fork) used to check the continuous-condition pairings.
 * `pose_gen_trainer.py`: SE(3) pose-generation training loop with the built-in multimodal goal distribution, minibatch sequence formatting, loss computation, and checkpointing.
-* `pose_gen_inference.py`: ODE solver (Euler integration) for sampling SE(3) pose action chunks from the trained vector field, plus 3D trajectory visualization.
+* `pose_gen_inference.py`: ODE sampling (Euler, midpoint or Heun) for SE(3) pose action chunks from the trained vector field, plus 3D trajectory visualization.
 * `image_gen_trainer.py`: MNIST training entrypoint. Tokenizes images into 7×7 patch grids and reuses the shared training loop for Euclidean flow matching.
 * `image_gen_inference.py`: MNIST sampling entrypoint. Integrates patch-space noise back to images and tiles the noise → denoised trajectory.
 * `toy_gen_trainer.py`: Trains a conditional flow on a 2-D toy with one pairing.
@@ -275,3 +304,11 @@ Run `calibrate` before training. The published defaults (`--r_tar 0.01`, `--cond
 [14] Mousavi-Hosseini, A., Zhang, S. Y., Klein, M., & Cuturi, M. (2026). Flow Matching with Semidiscrete Couplings. International Conference on Learning Representations (ICLR 2026). https://arxiv.org/abs/2509.25519
 
 [15] Generale, A. P., Robertson, A. E., & Kalidindi, S. R. (2024). Conditional Variable Flow Matching: Transforming Conditional Densities with Amortized Conditional Optimal Transport. arXiv. https://arxiv.org/abs/2411.08314
+
+[16] Esser, P., Kulal, S., Blattmann, A., Entezari, R., Müller, J., Saini, H., Levi, Y., Lorenz, D., Sauer, A., Boesel, F., Podell, D., Dockhorn, T., English, Z., Lacey, K., Goodwin, A., Marek, Y., & Rombach, R. (2024). Scaling Rectified Flow Transformers for High-Resolution Image Synthesis. International Conference on Machine Learning (ICML 2024). https://arxiv.org/abs/2403.03206
+
+[17] Black, K., Brown, N., Driess, D., Esmail, A., Equi, M., Finn, C., Fusai, N., Groom, L., Hausman, K., Ichter, B., et al. (2024). π0: A Vision-Language-Action Flow Model for General Robot Control. arXiv. https://arxiv.org/abs/2410.24164
+
+[18] Kynkäänniemi, T., Aittala, M., Karras, T., Laine, S., Aila, T., & Lehtinen, J. (2024). Applying Guidance in a Limited Interval Improves Sample and Distribution Quality in Diffusion Models. Advances in Neural Information Processing Systems 37 (NeurIPS 2024). https://arxiv.org/abs/2404.07724
+
+[19] Tancik, M., Srinivasan, P. P., Mildenhall, B., Fridovich-Keil, S., Raghavan, N., Singhal, U., Ramamoorthi, R., Barron, J. T., & Ng, R. (2020). Fourier Features Let Networks Learn High Frequency Functions in Low Dimensional Domains. Advances in Neural Information Processing Systems 33 (NeurIPS 2020). https://arxiv.org/abs/2006.10739

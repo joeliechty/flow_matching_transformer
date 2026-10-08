@@ -99,10 +99,16 @@ def summarize(rows, keys):
                 s[f'{metric}_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
         out.append(s)
 
+    def number_or_text(v):
+        try:
+            return float(v)
+        except ValueError:
+            return v
+
     def sort_key(s):
         v = s.get('variant')
         rank = _VARIANT_ORDER.index(v) if v in _VARIANT_ORDER else len(_VARIANT_ORDER)
-        sweep_x = (float(s[k]) for k in keys if k not in ('task', 'epoch', 'variant'))
+        sweep_x = (number_or_text(s[k]) for k in keys if k not in ('task', 'epoch', 'variant'))
         return (s.get('task', ''), float(s.get('epoch') or 0), rank, *sweep_x)
     return sorted(out, key=sort_key)
 
@@ -208,6 +214,16 @@ def main():
         write_csv(sweep, results_dir / f'{name}_summary.csv', summary_fieldnames(sweep, keys))
         plot_sweep(sweep, x_key, xlabel, title, results_dir / f'{name}.png', log_x=log_x,
                    reference=reference)
+
+    # Solver and guidance-interval sweeps: summaries only (figures: summary_figures.py)
+    for name, keys in (
+        ('solver_sweep', ('task', 'epoch', 'variant', 'method', 'nfe')),
+        ('guidance_sweep', ('task', 'epoch', 'variant', 'num_steps', 'cfg_interval',
+                            'cfg_scale_at_inference')),
+    ):
+        sweep = summarize(load_rows(results_dir, f'{name}.csv'), keys)
+        if sweep:
+            write_csv(sweep, results_dir / f'{name}_summary.csv', summary_fieldnames(sweep, keys))
 
 
 if __name__ == '__main__':

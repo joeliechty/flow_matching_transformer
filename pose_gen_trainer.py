@@ -3,9 +3,11 @@ import os
 import random
 import numpy as np
 from utils.tf_utils import sample_random_twist, convert_twist_to_pose, compute_twist_between_poses, add_twist_to_pose
-from models.conditional_flow_matching_transformer import ConditionalFlowMatchingTransformerModel
+from models.conditional_flow_matching_transformer import COND_MODES, ConditionalFlowMatchingTransformerModel
 from models.flow_matching_transformer import FlowMatchingTransformerModel
-from utils.train_utils import PAIRINGS, Pairer, generate_interpolated_poses, sample_pose_batch, train
+from models.support_models import TIME_EMBEDDINGS
+from utils.train_utils import (EMA, PAIRINGS, T_DISTS, Pairer, generate_interpolated_poses,
+                               pose_normalizer_stats, sample_pose_batch, train)
 from omegaconf import OmegaConf
 from utils.logging_utils import _Tee, git_commit
 from utils.pose_task import ContinuousGoalTask, load_pose_task
@@ -24,7 +26,8 @@ def parse_args():
     parser.add_argument('--num_batches_per_epoch', '-BE', type=int, default=100, help='Number of minibatches per epoch')
     parser.add_argument('--batch_size', '-B', type=int, default=None, help='Number of samples in each minibatch')
     parser.add_argument('--conditional', '-C', action='store_true', help='Whether to train conditional model (with observations)')
-    parser.add_argument('--n_steps', type=int, default=10, help='Number of interpolation steps per trajectory')
+    parser.add_argument('--n_steps', type=int, default=10,
+                        help='Training times drawn per (noise, goal) pair, each from --t_dist')
     parser.add_argument('--save_path', type=str, default='checkpoints/', help='Path to save model checkpoints')
     parser.add_argument('--seq_len', '-S', type=int, default=1, help='Sequence length per trajectory')
     parser.add_argument('--no_ot', '-NOOT', action='store_true', help='Disable optimal transport pairing during training')
@@ -44,6 +47,13 @@ def parse_args():
     parser.add_argument('--cond_scale', type=float, default=10.0,
                         help='c2ot_fixed / cluster: condition weight as a multiple of mean sample '
                              'cost / mean condition distance (papers: 10)')
+    # The contested design choices (ablation axes); every other choice is fixed.
+    parser.add_argument('--t_dist', type=str, default='uniform', choices=T_DISTS,
+                        help='Density of the training flow times')
+    parser.add_argument('--time_emb', type=str, default='sinusoidal', choices=TIME_EMBEDDINGS,
+                        help='Featurisation of the flow time')
+    parser.add_argument('--cond_mode', type=str, default='adaln', choices=COND_MODES,
+                        help='How the condition tokens enter the transformer')
     args = parser.parse_args()
     if args.pairing is None:
         args.pairing = 'independent' if args.no_ot else 'ot'
@@ -88,11 +98,22 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         batch_size = args.batch_size
 
     save_path = os.path.join(args.save_path, run_name(args))
-    # action token size (6 for twist actions)
+    # action token size (6 for twist actions) and tokens per condition
     if continuous:
-        obs_dim = task['obs_dim']
+        obs_dim, num_obs_tokens = task['obs_dim'], 1
+    elif args.conditional:
+        obs_dim, num_obs_tokens = len(action_dist_params['mu'][0][0]), len(action_dist_params['mu'][0])
     else:
-        obs_dim = len(action_dist_params['mu'][0][0]) if args.conditional else None
+        obs_dim = num_obs_tokens = None
+
+    # Position and velocity statistics for the model's normalisation, from random pairs
+    if continuous:
+        sampler = ContinuousGoalTask(task['spec']).batch_sampler(start_dist_params, seq_len=args.seq_len)
+    else:
+        sampler = lambda n: sample_pose_batch(n, start_dist_params, goal_dist_params,
+                                              action_dist_params if args.conditional else None,
+                                              seq_len=args.seq_len)
+    normalizer = {k: v.tolist() for k, v in pose_normalizer_stats(sampler).items()}
 
     # make a config object
     training_config = {
@@ -114,26 +135,34 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         'num_batches_per_epoch': args.num_batches_per_epoch,
         'batch_size': batch_size,
         'n_interp_steps': args.n_steps,
+        't_dist': args.t_dist,
         'seq_len': args.seq_len,
         'save_path': save_path,
         'start_dist_params': start_dist_params,
         'goal_dist_params': goal_dist_params,
         'action_dist_params': action_dist_params if args.conditional else None,
+        'normalizer': normalizer,
         'lr': 1e-4,
-        'weight_decay': 1e-5
+        'weight_decay': 1e-5,
+        'ema_decay': 0.999,
+        'grad_clip': 1.0,
     }
     model_config = {
         'input_dim': 7,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
         'output_dim': 6,  # twist representation (vx, vy, vz, wx, wy, wz)
-        'obs_dim': obs_dim,  # action representation (vx, vy, vz, wx, wy, wz)
         'hidden_dim': 128,
         'num_layers': 4,
         'num_heads': 4,
         'mlp_ratio': 4.0,
-        'dropout': 0.1,
+        'dropout': 0.0,
         'phase_dim': 128,
-        'max_seq_len': args.seq_len
+        'max_seq_len': args.seq_len,
+        'manifold': 'se3',
+        'time_emb': args.time_emb,
     }
+    if args.conditional:
+        model_config.update({'obs_dim': obs_dim, 'cond_mode': args.cond_mode,
+                             'num_obs_tokens': num_obs_tokens})
     config_dict = {
         'training': training_config,
         'model': model_config
@@ -203,38 +232,17 @@ if __name__ == "__main__":
     print(f"Input Dimension: {config.model.input_dim}")
     print(f"Number of Epochs: {config.training.num_epochs}")
 
-    if args.conditional:
-        model = ConditionalFlowMatchingTransformerModel(
-            input_dim=config.model.input_dim,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
-            output_dim=config.model.output_dim,  # twist representation (vx, vy, vz, wx, wy, wz)
-            obs_dim=config.model.obs_dim,  # action representation (vx, vy, vz, wx, wy, wz)
-            hidden_dim=config.model.hidden_dim,
-            num_layers=config.model.num_layers,
-            num_heads=config.model.num_heads,
-            mlp_ratio=config.model.mlp_ratio,
-            dropout=config.model.dropout,
-            phase_dim=config.model.phase_dim,
-            max_seq_len=config.model.max_seq_len
-        ).to(device)
-    else:
-        model = FlowMatchingTransformerModel(
-            input_dim=config.model.input_dim,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
-            output_dim=config.model.output_dim,  # twist representation (vx, vy, vz, wx, wy, wz)
-            hidden_dim=config.model.hidden_dim,
-            num_layers=config.model.num_layers,
-            num_heads=config.model.num_heads,
-            mlp_ratio=config.model.mlp_ratio,
-            dropout=config.model.dropout,
-            phase_dim=config.model.phase_dim,
-            max_seq_len=config.model.max_seq_len
-        ).to(device)
+    ModelClass = ConditionalFlowMatchingTransformerModel if args.conditional else FlowMatchingTransformerModel
+    model = ModelClass(**OmegaConf.to_container(config.model)).to(device)
+    model.set_normalizer(**config.training.normalizer)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print()
     
-    # Optimizer
+    # Optimizer, and the moving average of the weights that sampling uses
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr, weight_decay=config.training.weight_decay)
+    ema = EMA(model, config.training.ema_decay)
 
-    # The original 'ot' / 'independent' runs keep their exact training path (and RNG stream);
+    # The 'ot' / 'independent' runs on discrete tasks draw batches from the distribution params;
     # every other pairing, or a bigger OT batch, draws paired batches from a Pairer.
     pairer = None
     t = config.training
@@ -266,6 +274,9 @@ if __name__ == "__main__":
         device=device,
         save_path=config.training.save_path,
         pairer=pairer,
+        t_dist=config.training.t_dist,
+        ema=ema,
+        grad_clip=config.training.grad_clip,
     )
     
     # Plot loss history

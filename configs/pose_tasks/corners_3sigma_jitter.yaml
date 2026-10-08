@@ -1,0 +1,54 @@
+# corners_3sigma with Gaussian noise (std 0.1) on every conditioning token, so every training
+# sample's condition is slightly different: the 3-sigma goal distribution under continuous
+# conditioning. The corners stay far apart in token space (two corners' token pairs are at
+# least 2 apart; two noisy copies of one corner about 0.5), so conditions still cluster by
+# corner, but exact per-condition pairing breaks down: each condition is a single sample.
+# Same modes as corners_3sigma.yaml, built the way corners_two_orientations_jitter.yaml is
+# built from corners_two_orientations.yaml (see utils/pose_task.py, token_sigma).
+name: corners_3sigma_jitter
+
+token_sigma: 0.1
+
+start:
+  mu: [0, 0, 0, 0, 0, 0]
+  sigma: [1, 1, 1, 1, 1, 1]
+
+tokens:
+  top:    [0, 0, 1, 0, 0, 0]
+  bottom: [0, 0, -1, 0, 0, 0]
+  right:  [0, 1, 0, 0, 0, 0]
+  left:   [0, -1, 0, 0, 0, 0]
+
+modes:
+  - name: top_right_ccw
+    tokens: [top, right]
+    mu: [5, 0.106066, 0.106066, 0, 0, 1.7208]
+    sigma: 0.1
+  - name: top_right_cw
+    tokens: [top, right]
+    mu: [5, 0.106066, 0.106066, 0, 0, 1.4208]
+    sigma: 0.1
+  - name: bottom_right_ccw
+    tokens: [bottom, right]
+    mu: [5, 0.106066, -0.106066, 0, 0, 1.7208]
+    sigma: 0.1
+  - name: bottom_right_cw
+    tokens: [bottom, right]
+    mu: [5, 0.106066, -0.106066, 0, 0, 1.4208]
+    sigma: 0.1
+  - name: top_left_ccw
+    tokens: [top, left]
+    mu: [5, -0.106066, 0.106066, 0, 0, 1.7208]
+    sigma: 0.1
+  - name: top_left_cw
+    tokens: [top, left]
+    mu: [5, -0.106066, 0.106066, 0, 0, 1.4208]
+    sigma: 0.1
+  - name: bottom_left_ccw
+    tokens: [bottom, left]
+    mu: [5, -0.106066, -0.106066, 0, 0, 1.7208]
+    sigma: 0.1
+  - name: bottom_left_cw
+    tokens: [bottom, left]
+    mu: [5, -0.106066, -0.106066, 0, 0, 1.4208]
+    sigma: 0.1

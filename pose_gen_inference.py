@@ -42,7 +42,7 @@ def load_model(checkpoint_path, device='cpu', model_config=None, conditional=Fal
     )
     model.eval()
 
-    print(f"Loaded model from {checkpoint_path}")
+    print(f"Loaded model from {checkpoint_path} ({'EMA' if 'ema_state_dict' in checkpoint else 'raw'} weights)")
     if 'epoch' in checkpoint:
         print(f"  Epoch: {checkpoint['epoch']}")
     if 'loss' in checkpoint:
@@ -51,7 +51,7 @@ def load_model(checkpoint_path, device='cpu', model_config=None, conditional=Fal
     return model, checkpoint
 
 def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, return_trajectory=False, cfg_scale=3.0, device='cpu',
-                              obs_mask=None):
+                              obs_mask=None, method='euler', cfg_interval=None):
     """
     Generate goal poses from start poses using the trained model.
 
@@ -63,6 +63,8 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
         num_steps: number of ODE integration steps
         return_trajectory: if True, return full trajectory
         device: device to run on
+        method: ODE solver, 'euler', 'midpoint' or 'heun'
+        cfg_interval: optional (lo, hi) flow-time range to apply guidance in
 
     Returns:
         goal_poses: generated goal poses [batch, 7]
@@ -93,9 +95,10 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
         try:
             if is_conditional:
                 result = model.inference(x0, obs, num_steps=num_steps, return_trajectory=return_trajectory, cfg_scale=cfg_scale,
-                                         obs_mask=obs_mask)
+                                         obs_mask=obs_mask, method=method, cfg_interval=cfg_interval)
             else:
-                result = model.inference(x0, num_steps=num_steps, return_trajectory=return_trajectory)
+                result = model.inference(x0, num_steps=num_steps, return_trajectory=return_trajectory,
+                                         method=method)
         except Exception as e:
             print("Error during model inference:", e)
             raise e
@@ -103,7 +106,8 @@ def generate_from_start_poses(model, start_poses, obs=None, num_steps=100, retur
     return result
 
 def generate_from_distribution(model, distribution_params, batch_size, obs=None, num_steps=100,
-                               return_trajectory=False, cfg_scale=3.0, device='cpu', obs_mask=None):
+                               return_trajectory=False, cfg_scale=3.0, device='cpu', obs_mask=None,
+                               method='euler', cfg_interval=None):
     """
     Sample start poses from a distribution and generate goal poses.
 
@@ -116,6 +120,7 @@ def generate_from_distribution(model, distribution_params, batch_size, obs=None,
         num_steps: number of ODE integration steps
         return_trajectory: if True, return full trajectory
         device: device to run on
+        method, cfg_interval: as in `generate_from_start_poses`
 
     Returns:
         start_poses: sampled start poses [batch, 7]
@@ -137,7 +142,7 @@ def generate_from_distribution(model, distribution_params, batch_size, obs=None,
     result = generate_from_start_poses(
         model, start_poses, obs, num_steps=num_steps,
         return_trajectory=return_trajectory, cfg_scale=cfg_scale, device=device,
-        obs_mask=obs_mask,
+        obs_mask=obs_mask, method=method, cfg_interval=cfg_interval,
     )
 
     if return_trajectory:

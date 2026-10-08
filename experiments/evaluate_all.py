@@ -40,6 +40,7 @@ from utils.eval_utils import (
 )
 from utils.logging_utils import git_commit
 from utils.mnist_classifier import load_classifier
+from models.flow_transformer_base import SOLVER_EVALS
 from utils.pose_task import ContinuousGoalTask, task_conditions
 from utils.tf_utils import convert_twist_to_pose
 from pose_gen_inference import (
@@ -107,6 +108,13 @@ def effective_cfg_scale(meta, cfg_scale):
     unconditional dropout, so guiding them would test an untrained null branch —
     sample them unguided (1.0) instead."""
     return cfg_scale if meta["cfg"] == "_CFG" else 1.0
+
+
+def sampler_columns(num_steps, method, cfg_interval):
+    """The sampler's CSV columns: solver, network evaluations per sample (before CFG's second
+    pass) and the guidance interval ('full' when guidance, if any, runs at every step)."""
+    interval = 'full' if cfg_interval is None else f"{cfg_interval[0]:g}-{cfg_interval[1]:g}"
+    return {'method': method, 'nfe': num_steps * SOLVER_EVALS[method], 'cfg_interval': interval}
 
 
 def variant_name(meta):
@@ -190,7 +198,8 @@ def _partial_metrics(conditions, sample_sets, mode_poses, ref, ref_idx):
     }
 
 
-def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, eval_seed=0):
+def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, eval_seed=0,
+                  method='euler', cfg_interval=None):
     conditional = meta["prefix"] == "cond_"
     cfg_scale = effective_cfg_scale(meta, cfg_scale)
     config = OmegaConf.load(_config_path_for(meta["path"]))
@@ -214,6 +223,7 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
         'cfg': meta['cfg'] == '_CFG' if conditional else None,
         'cfg_scale_at_inference': cfg_scale if conditional else None,
         'num_steps': num_steps, 'num_samples': num_samples, 'epoch': meta['epoch'],
+        **sampler_columns(num_steps, method, cfg_interval),
         'mode_accuracy': None, 'mode_distance': None, 'mode_coverage_kl': None,
         'class_accuracy': None, 'class_marginal_kl': None,
     }
@@ -228,7 +238,7 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
                 model, start_dist_flat, batch_size=per_cond,
                 obs=_eval_obs(cond, per_cond, device, token_sigma, i),
                 num_steps=num_steps, return_trajectory=True,
-                cfg_scale=cfg_scale, device=device,
+                cfg_scale=cfg_scale, device=device, method=method, cfg_interval=cfg_interval,
             )
             all_traj.append(traj)
             all_targets.append(_condition_targets(traj[:, -1], cond, mode_poses))
@@ -248,7 +258,7 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
     else:
         _, trajectory = generate_from_distribution(
             model, start_dist_flat, batch_size=num_samples, obs=None,
-            num_steps=num_steps, return_trajectory=True, device=device,
+            num_steps=num_steps, return_trajectory=True, device=device, method=method,
         )
         samples = trajectory[:, -1]
         row['mode_distance'] = pose_mode_distance(samples, mode_poses)
@@ -269,6 +279,7 @@ def evaluate_pose(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0, e
                 obs=_eval_obs(cond, per_cond, device, token_sigma, len(full) + i),
                 obs_mask=cond.obs_mask(per_cond, device),
                 num_steps=num_steps, return_trajectory=False, cfg_scale=cfg_scale, device=device,
+                method=method, cfg_interval=cfg_interval,
             )
             partial.append(partial_samples)
         row.update(_partial_metrics(partial_conditions, partial, mode_poses, ref, ref_idx))
@@ -309,7 +320,7 @@ def _continuous_metrics(task, conds, sample_sets, device):
 
 
 def evaluate_pose_continuous(meta, device, num_samples=1024, num_steps=100, cfg_scale=3.0,
-                             eval_seed=0):
+                             eval_seed=0, method='euler', cfg_interval=None):
     """Pose metrics for a continuous-condition task: num_samples spread evenly over the task's
     fixed test conditions."""
     cfg_scale = effective_cfg_scale(meta, cfg_scale)
@@ -329,13 +340,15 @@ def evaluate_pose_continuous(meta, device, num_samples=1024, num_steps=100, cfg_
         _, traj = generate_from_distribution(
             model, start_dist_flat, batch_size=per_cond,
             obs=task.obs(c.reshape(1, 2)).repeat(per_cond, 1, 1), num_steps=num_steps,
-            return_trajectory=True, cfg_scale=cfg_scale, device=device)
+            return_trajectory=True, cfg_scale=cfg_scale, device=device, method=method,
+            cfg_interval=cfg_interval)
         trajectories.append(traj)
     row = {
         'task': 'pose', 'variant': variant_name(meta), 'conditional': True,
         'ot': meta['ot'] == '_OT', 'pairing': SUFFIX_PAIRING[meta['ot']],
         'cfg': meta['cfg'] == '_CFG', 'cfg_scale_at_inference': cfg_scale,
         'num_steps': num_steps, 'num_samples': per_cond * len(conds), 'epoch': meta['epoch'],
+        **sampler_columns(num_steps, method, cfg_interval),
     }
     row.update(_continuous_metrics(task, conds, [t[:, -1] for t in trajectories], device))
     row['path_straightness'], row['transport_cost'] = path_straightness(torch.cat(trajectories))
@@ -404,7 +417,7 @@ def evaluate_pose_reference(config_path, epoch, device, num_samples=256):
 
 
 def evaluate_image(meta, device, classifier, num_samples=256, num_steps=100, cfg_scale=3.0,
-                   eval_seed=0):
+                   eval_seed=0, method='euler', cfg_interval=None):
     conditional = meta["prefix"] == "cond_"
     cfg_scale = effective_cfg_scale(meta, cfg_scale)
     config = OmegaConf.load(_config_path_for(meta["path"]))
@@ -419,6 +432,7 @@ def evaluate_image(meta, device, classifier, num_samples=256, num_steps=100, cfg
         'ot': meta['ot'] == '_OT', 'cfg': meta['cfg'] == '_CFG' if conditional else None,
         'cfg_scale_at_inference': cfg_scale if conditional else None,
         'num_steps': num_steps, 'num_samples': num_samples, 'epoch': meta['epoch'],
+        **sampler_columns(num_steps, method, cfg_interval),
         'mode_accuracy': None, 'mode_distance': None, 'mode_coverage_kl': None,
         'class_accuracy': None, 'class_marginal_kl': None,
     }
@@ -431,6 +445,7 @@ def evaluate_image(meta, device, classifier, num_samples=256, num_steps=100, cfg
             imgs = generate_from_noise(
                 model, per_class, obs=obs, num_steps=num_steps,
                 return_trajectory=False, cfg_scale=cfg_scale, device=device,
+                method=method, cfg_interval=cfg_interval,
             )
             all_imgs.append(imgs)
             all_labels.append(torch.full((per_class,), digit, dtype=torch.long))
@@ -443,7 +458,7 @@ def evaluate_image(meta, device, classifier, num_samples=256, num_steps=100, cfg
     else:
         imgs = generate_from_noise(
             model, num_samples, obs=None, num_steps=num_steps,
-            return_trajectory=False, device=device,
+            return_trajectory=False, device=device, method=method,
         )
         kl, _ = mnist_class_marginal_kl(imgs, classifier)
         row['class_marginal_kl'] = kl
@@ -508,6 +523,10 @@ def main():
     parser.add_argument('--num_samples', type=int, default=256)
     parser.add_argument('--num_steps', type=int, default=100)
     parser.add_argument('--cfg_scale', type=float, default=3.0)
+    parser.add_argument('--method', type=str, default='euler', choices=tuple(SOLVER_EVALS),
+                        help='ODE solver')
+    parser.add_argument('--cfg_interval', type=float, nargs=2, default=None, metavar=('LO', 'HI'),
+                        help='Apply guidance only at flow times LO <= t < HI')
     parser.add_argument('--eval_seed', type=int, default=0,
                         help='Seed for the sampling noise, shared across all variants')
     parser.add_argument('--output', type=str, default='experiments/results/metrics.csv')
@@ -531,7 +550,8 @@ def main():
         try:
             row = evaluate(meta, device, classifier,
                            num_samples=args.num_samples, num_steps=args.num_steps,
-                           cfg_scale=args.cfg_scale, eval_seed=args.eval_seed)
+                           cfg_scale=args.cfg_scale, eval_seed=args.eval_seed,
+                           method=args.method, cfg_interval=args.cfg_interval)
         except Exception as e:
             print(f"ERROR evaluating {tag}: {e}")
             continue
