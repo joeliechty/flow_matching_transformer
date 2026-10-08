@@ -6,6 +6,10 @@ writes the PNGs that ablations_summary.md embeds:
 
     python experiments/summary_figures.py                    # Part 1 (discrete) -> docs/ablations/
     python experiments/summary_figures.py --part continuous  # Part 2 (continuous conditions)
+    python experiments/summary_figures.py --part sota        # Part 3 (current framework, 3σ task)
+
+Parts 1 and 2 read pre-framework results; their per-sample figures load pre-framework checkpoints,
+which need tag pose-continuous-v1.
 
 Part 1: colour = OT (blue) or no OT (orange); dashed lines / open markers = CFG-trained models
 sampled at guidance 3; grey = real data. Part 2: one colour and marker per pairing
@@ -104,12 +108,17 @@ def results(task, name):
     return {s: read(REPO_ROOT / f'experiments/results/{task}/epoch_{EPOCH}/seed_{s}/{name}.csv') for s in SEEDS}
 
 
+def _matches(cell, value):
+    """A CSV cell equals `value`: numerically for numbers, else as text."""
+    return float(cell) == float(value) if not isinstance(value, str) else cell == value
+
+
 def per_seed(rows_by_seed, variant, metric, **match):
     """One value per seed for `variant`, from the row matching `match` (e.g. num_steps=3)."""
     out = []
     for rows in rows_by_seed.values():
         row = [r for r in rows if r['variant'] == variant
-               and all(float(r[k]) == float(v) for k, v in match.items())]
+               and all(_matches(r[k], v) for k, v in match.items())]
         if len(row) != 1:
             raise ValueError(f'{variant} {match}: {len(row)} rows')
         out.append(float(row[0][metric]))
@@ -782,13 +791,272 @@ def fig_sensitivity(plt, out, task='pose_continuous_goals', variant='cond_C2OTFI
     plt.close(fig)
 
 
+# -- Part 3: the current model and training framework ---------------------------------------
+
+SOTA_TASKS = [  # (results folder, panel title)
+    ('sota/pose_corners_3sigma', 'Discrete conditions (clean tokens)'),
+    ('sota/pose_corners_3sigma_jitter', 'Continuous conditions (noisy tokens)'),
+]
+OLD_FRAMEWORK = {'sota/pose_corners_3sigma': 'pose_corners_3sigma'}  # the same task's pre-framework runs
+# Phase 3's baseline candidates: conditional, no CFG; for noisy tokens neither global OT nor the
+# per-corner oracle, which uses the clean corner ids.
+BASELINE_EXCLUDE = ('cond_GOT_NOCFG', 'cond_OT_NOCFG')
+ABLATION_AXES = [  # (title, [(arm, label)]); arm None = the baseline itself
+    ('Training-time density', [(None, 'uniform (baseline)'), ('t_logit_normal', 'logit-normal (SD3)'),
+                               ('t_beta', 'Beta, noisy end (π0)')]),
+    ('Time embedding', [(None, 'sinusoids of t (baseline)'), ('time_x1000', 'sinusoids of 1000·t'),
+                        ('time_fourier', 'Gaussian Fourier features')]),
+    ('Condition pathway', [(None, 'adaLN (baseline)'), ('cond_cross_attn', 'cross-attention'),
+                           ('cond_joint', 'joint attention')]),
+]
+ARM_COLORS = (INK2, BLUE, '#eda100')
+ARM_STYLE = (dict(ls='--', marker='s'), dict(ls='-', marker='o'), dict(ls='-', marker='^'))
+SOLVERS = [('euler', 'Euler', INK2, 's'), ('midpoint', 'midpoint', BLUE, 'o'), ('heun', 'Heun', '#eda100', '^')]
+NFE = (2, 4, 6, 10, 18, 40, 100)
+INTERVALS = [('full', 'whole path', INK2), ('0-0.5', 't < 0.5 (noisy half)', BLUE),
+             ('0.25-0.75', '0.25 ≤ t < 0.75', '#1baf7a'), ('0.5-1', 't ≥ 0.5 (data half)', '#eda100')]
+GUIDANCE_SCALES = (1.0, 1.5, 3.0)
+
+
+def is_discrete(task):
+    return not task.endswith('_jitter')
+
+
+def vstyle(task, variant):
+    """Line style of a variant: Part 1's for clean tokens, Part 2's per pairing for noisy ones."""
+    if is_discrete(task):
+        st = style(variant)
+        return dict(color=st['color'], ls=st['ls'], marker=st['marker'], mfc=st['mfc'], label=LABEL[variant])
+    st = pstyle(variant)
+    return dict(color=st['color'], ls=st['ls'], marker=st['marker'], mfc=st['color'], label=st['label'])
+
+
+def sota_variants(task):
+    return COND if is_discrete(task) else present(task)
+
+
+def baseline(task):
+    """Phase 3's baseline variant, by the rule set before the results: among the conditional
+    no-CFG candidates, the lowest mean over seeds of (log10 ED at 3 steps + log10 ED at 100) / 2.
+    Returns (variant, {candidate: score})."""
+    steps_rows, main_rows = results(task, 'steps_sweep'), results(task, 'metrics')
+    scores = {}
+    for v in sota_variants(task):
+        if not v.endswith('_NOCFG') or (not is_discrete(task) and v in BASELINE_EXCLUDE):
+            continue
+        three = np.log10(per_seed(steps_rows, v, 'energy_distance', num_steps=3))
+        hundred = np.log10(per_seed(main_rows, v, 'energy_distance'))
+        scores[v] = float(((three + hundred) / 2).mean())
+    return min(scores, key=scores.get), scores
+
+
+def ablation_rows(task, arm, name):
+    """{seed: rows} of one ablation arm's <name>.csv (arm None = the task's own results)."""
+    if arm is None:
+        return results(task, name)
+    d = REPO_ROOT / f'experiments/results/{task}/ablate/{arm}/epoch_{EPOCH}'
+    return {s: read(d / f'seed_{s}/{name}.csv') for s in SEEDS}
+
+
+def fig_sota_framework(plt, out, task='sota/pose_corners_3sigma'):
+    """The new framework against the old one on the same task: sampling steps, spread, training."""
+    old = OLD_FRAMEWORK[task]
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5.2))
+    for v in ('cond_OT_NOCFG', 'cond_NOOT_NOCFG'):
+        color = style(v)['color']
+        for t, framework, ls, mfc in ((task, 'current', '-', color), (old, 'old', ':', SURFACE)):
+            label = f'{LABEL[v]}, {framework} framework'
+            kw = dict(color=color, ls=ls, marker=style(v)['marker'], mfc=mfc, mec=color, lw=1.8, ms=6, label=label)
+            rows = results(t, 'steps_sweep')
+            for ax, metric in zip(axes[:2], ('energy_distance', 'spread_ratio_trans')):
+                vals = np.stack([per_seed(rows, v, metric, num_steps=s) for s in STEPS], 1)
+                ax.fill_between(STEPS, vals.min(0), vals.max(0), color=color, alpha=0.08, lw=0)
+                ax.plot(STEPS, vals.mean(0), **kw)
+            x, vals = curve(t, v, 'energy_distance', 100)
+            axes[2].fill_between(x, vals.min(0), vals.max(0), color=color, alpha=0.08, lw=0)
+            axes[2].plot(x, vals.mean(0), **kw)
+    data_line(axes[0], data_value(task, 'energy_distance'))
+    data_line(axes[1], data_value(task, 'spread_ratio_trans'))
+    data_line(axes[2], data_value(task, 'energy_distance'))
+    for ax in axes[:2]:
+        ax.set_xscale('log'); ax.set_xticks(STEPS); ax.set_xticklabels([str(s) for s in STEPS]); ax.minorticks_off()
+        ax.set_xlabel('Euler steps at sampling (log)')
+    axes[0].set_yscale('log'); axes[2].set_yscale('log')
+    axes[0].set_ylabel('energy distance (log), lower is better')
+    axes[1].set_ylabel('position spread ÷ real data')
+    axes[2].set_ylabel('energy distance at 100 steps (log)')
+    axes[2].set_xlabel('training epoch')
+    axes[0].set_title('Sampling steps, epoch 100'); axes[1].set_title('Spread around the mode, epoch 100')
+    axes[2].set_title('Training')
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=10, bbox_to_anchor=(0.5, -0.06))
+    fig.suptitle('Every mode within 3σ, discrete conditions: current vs. old model and training framework '
+                 f'(mean over {len(SEEDS)} seeds, shading = seed range)', y=1.0)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    save(fig, out, 'sota_framework.png')
+    plt.close(fig)
+
+
+def fig_sota_overview(plt, out):
+    """Energy distance per configuration at 1, 3 and 100 steps, both conditioning types."""
+    steps_list = (1, 3, 100)
+    fig, axes = plt.subplots(len(SOTA_TASKS), 3, figsize=(16, 4.3 * len(SOTA_TASKS)), squeeze=False)
+    for r, (task, title) in enumerate(SOTA_TASKS):
+        steps_rows, main_rows = results(task, 'steps_sweep'), results(task, 'metrics')
+        variants = sota_variants(task)
+        for c, steps in enumerate(steps_list):
+            ax = axes[r, c]
+            for i, v in enumerate(variants):
+                vals = (per_seed(main_rows, v, 'energy_distance') if steps == 100
+                        else per_seed(steps_rows, v, 'energy_distance', num_steps=steps))
+                st = vstyle(task, v)
+                ax.scatter(i + np.linspace(-0.12, 0.12, len(vals)), vals, s=36, marker=st['marker'],
+                           facecolors=st['mfc'], edgecolors=st['color'], linewidths=1.5, zorder=3)
+                ax.plot([i - 0.25, i + 0.25], [vals.mean()] * 2, color=st['color'], lw=2.5, zorder=4)
+                ax.text(i, vals.max() * 1.35, f'{vals.mean():.3g}', ha='center', va='bottom', fontsize=9,
+                        color=INK2)
+            data_line(ax, data_value(task, 'energy_distance'), where='left')
+            ax.set_yscale('log')
+            ax.set_ylim(None, ax.get_ylim()[1] * 2.5)
+            ax.set_xticks(range(len(variants)))
+            ax.set_xticklabels([LABEL[v].replace(' (', '\n(').replace(', ', '\n', 1) if is_discrete(task)
+                                else SHORT[v] for v in variants], fontsize=9)
+            ax.set_xlim(-0.5, len(variants) - 0.5)
+            ax.grid(axis='x', visible=False)
+            ax.set_title(f'{title}\n{steps} sampling step{"s" if steps > 1 else ""}', fontsize=11)
+            if c == 0:
+                ax.set_ylabel('energy distance to real data (log)\nlower is better')
+    fig.suptitle(f'Every mode within 3σ, current framework, epoch {EPOCH}: one dot per seed, bar = mean '
+                 f'(CFG models at guidance {GUIDANCE:g})', y=1.0)
+    fig.tight_layout()
+    save(fig, out, 'sota_overview.png')
+    plt.close(fig)
+
+
+def fig_sota_steps(plt, out):
+    """Energy distance vs. Euler steps, every configuration, both conditioning types."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5.4))
+    for ax, (task, title) in zip(axes, SOTA_TASKS):
+        rows = results(task, 'steps_sweep')
+        for v in sota_variants(task):
+            st = vstyle(task, v)
+            vals = np.stack([per_seed(rows, v, 'energy_distance', num_steps=s) for s in STEPS], 1)
+            ax.fill_between(STEPS, vals.min(0), vals.max(0), color=st['color'], alpha=0.10, lw=0)
+            ax.plot(STEPS, vals.mean(0), color=st['color'], ls=st['ls'], marker=st['marker'], mfc=st['mfc'],
+                    mec=st['color'], lw=1.8, ms=6, label=st['label'])
+        data_line(ax, data_value(task, 'energy_distance'))
+        ax.set_xscale('log'); ax.set_yscale('log')
+        ax.set_xticks(STEPS); ax.set_xticklabels([str(s) for s in STEPS]); ax.minorticks_off()
+        ax.set_xlabel('Euler steps at sampling (log)')
+        ax.set_title(title)
+        ax.legend(fontsize=9, loc='lower left')
+    axes[0].set_ylabel('energy distance (log), lower is better')
+    fig.suptitle(f'Sampling steps, current framework, epoch {EPOCH}: mean over {len(SEEDS)} seeds, shading = seed range',
+                 y=1.0)
+    fig.tight_layout()
+    save(fig, out, 'sota_steps_sweep.png')
+    plt.close(fig)
+
+
+def fig_sota_ablations(plt, out):
+    """Single-axis ablations: energy distance vs. Euler steps for the baseline and each arm."""
+    fig, axes = plt.subplots(len(SOTA_TASKS), 3, figsize=(17, 4.5 * len(SOTA_TASKS)), sharex=True, squeeze=False)
+    for r, (task, title) in enumerate(SOTA_TASKS):
+        base, _ = baseline(task)
+        for c, (axis_title, arms) in enumerate(ABLATION_AXES):
+            ax = axes[r, c]
+            for (arm, label), color, st in zip(arms, ARM_COLORS, ARM_STYLE):
+                rows = ablation_rows(task, arm, 'steps_sweep')
+                vals = np.stack([per_seed(rows, base, 'energy_distance', num_steps=s) for s in STEPS], 1)
+                ax.fill_between(STEPS, vals.min(0), vals.max(0), color=color, alpha=0.10, lw=0)
+                ax.plot(STEPS, vals.mean(0), color=color, lw=1.8, ms=6, label=label, **st)
+            data_line(ax, data_value(task, 'energy_distance'))
+            ax.set_xscale('log'); ax.set_yscale('log')
+            ax.set_xticks(STEPS); ax.set_xticklabels([str(s) for s in STEPS]); ax.minorticks_off()
+            ax.set_title(f'{axis_title}\n{title}', fontsize=11)
+            ax.legend(fontsize=9, loc='upper right')
+            if c == 0:
+                ax.set_ylabel('energy distance (log), lower is better')
+            if r == len(SOTA_TASKS) - 1:
+                ax.set_xlabel('Euler steps at sampling (log)')
+    fig.suptitle(f'Single-axis ablations, epoch {EPOCH}: each arm changes one choice of the baseline '
+                 f'(mean over {len(SEEDS)} seeds, shading = seed range)', y=1.0)
+    fig.tight_layout()
+    save(fig, out, 'sota_ablations.png')
+    plt.close(fig)
+
+
+def fig_sota_solvers(plt, out):
+    """ODE solvers at equal network evaluations, on each task's baseline (unguided)."""
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2), sharey=True)
+    for ax, (task, title) in zip(axes, SOTA_TASKS):
+        base, _ = baseline(task)
+        rows = results(task, 'solver_sweep')
+        for method, label, color, marker in SOLVERS:
+            vals = np.stack([per_seed(rows, base, 'energy_distance', method=method, nfe=n) for n in NFE], 1)
+            ax.fill_between(NFE, vals.min(0), vals.max(0), color=color, alpha=0.10, lw=0)
+            ax.plot(NFE, vals.mean(0), color=color, marker=marker, lw=1.8, ms=6, label=label)
+        data_line(ax, data_value(task, 'energy_distance'))
+        ax.set_xscale('log'); ax.set_yscale('log')
+        ax.set_xticks(NFE); ax.set_xticklabels([str(n) for n in NFE]); ax.minorticks_off()
+        ax.set_xlabel('network evaluations per sample (log)')
+        ax.set_title(f'{title}\nbaseline: {base}', fontsize=11)
+        ax.legend(fontsize=10)
+    axes[0].set_ylabel('energy distance (log), lower is better')
+    fig.suptitle(f'ODE solvers at equal cost, epoch {EPOCH} (mean over {len(SEEDS)} seeds, shading = seed range)', y=1.0)
+    fig.tight_layout()
+    save(fig, out, 'sota_solvers.png')
+    plt.close(fig)
+
+
+def fig_sota_guidance(plt, out):
+    """Guidance over the whole path or only within a flow-time interval, CFG-trained models."""
+    fig, axes = plt.subplots(len(SOTA_TASKS), 3, figsize=(17, 4.5 * len(SOTA_TASKS)), squeeze=False)
+    for r, (task, title) in enumerate(SOTA_TASKS):
+        base, _ = baseline(task)
+        if is_discrete(task):
+            variant, rows = base.replace('_NOCFG', '_CFG'), results(task, 'guidance_sweep')
+        else:
+            variant, rows = base.replace('_NOCFG', '_CFG'), ablation_rows(task, 'cfg', 'guidance_sweep')
+        panels = (('energy_distance', 9), ('energy_distance', 100), ('mode_accuracy', 100))
+        for c, (metric, steps) in enumerate(panels):
+            ax = axes[r, c]
+            unguided = per_seed(rows, variant, metric, num_steps=steps, cfg_interval='full',
+                                cfg_scale_at_inference=1.0)
+            for interval, label, color in INTERVALS:
+                vals = np.stack([unguided] + [per_seed(rows, variant, metric, num_steps=steps,
+                                                       cfg_interval=interval, cfg_scale_at_inference=g)
+                                              for g in GUIDANCE_SCALES[1:]], 1)
+                ax.fill_between(GUIDANCE_SCALES, vals.min(0), vals.max(0), color=color, alpha=0.10, lw=0)
+                ax.plot(GUIDANCE_SCALES, vals.mean(0), color=color, marker='o', lw=1.8, ms=6, label=label)
+            data_line(ax, data_value(task, metric))
+            if metric == 'energy_distance':
+                ax.set_yscale('log')
+                ax.set_ylabel('energy distance (log), lower is better')
+            else:
+                ax.set_ylabel('corner accuracy (data = ceiling;\nhigher over-separates)')
+            ax.set_xticks(GUIDANCE_SCALES); ax.set_xticklabels([f'{g:g}' for g in GUIDANCE_SCALES])
+            ax.set_title(f'{title}\n{steps} steps', fontsize=11)
+            if r == len(SOTA_TASKS) - 1:
+                ax.set_xlabel('guidance scale')
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=10, bbox_to_anchor=(0.5, -0.03),
+               title='guidance applied over')
+    fig.suptitle(f'Guidance intervals, CFG-trained baselines, epoch {EPOCH} '
+                 f'(mean over {len(SEEDS)} seeds, shading = seed range)', y=1.0)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    save(fig, out, 'sota_guidance.png')
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out', default='docs/ablations')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--part', choices=('discrete', 'continuous'), default='discrete')
+    parser.add_argument('--part', choices=('discrete', 'continuous', 'sota'), default='discrete')
     parser.add_argument('--only', nargs='+', default=None,
-                        help='continuous part: just these figures (calibration toys overview steps violins sensitivity)')
+                        help='continuous part: just these figures (calibration toys overview steps violins sensitivity); '
+                             'sota part: baseline framework overview steps ablations solvers guidance')
     args = parser.parse_args()
     out = REPO_ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -800,6 +1068,22 @@ def main():
                 'steps': lambda: fig_continuous_steps(plt, out),
                 'violins': lambda: fig_continuous_violins(plt, out, args.device),
                 'sensitivity': lambda: fig_sensitivity(plt, out)}
+        for name in args.only or figs:
+            figs[name]()
+        return
+    if args.part == 'sota':
+        def print_baselines():
+            for task, _ in SOTA_TASKS:
+                choice, scores = baseline(task)
+                print(f'{task}: baseline {choice}; mean (log10 ED@3 + log10 ED@100) / 2: '
+                      + ', '.join(f'{v} {s:.3f}' for v, s in sorted(scores.items(), key=lambda kv: kv[1])))
+        figs = {'baseline': print_baselines,
+                'framework': lambda: fig_sota_framework(plt, out),
+                'overview': lambda: fig_sota_overview(plt, out),
+                'steps': lambda: fig_sota_steps(plt, out),
+                'ablations': lambda: fig_sota_ablations(plt, out),
+                'solvers': lambda: fig_sota_solvers(plt, out),
+                'guidance': lambda: fig_sota_guidance(plt, out)}
         for name in args.only or figs:
             figs[name]()
         return

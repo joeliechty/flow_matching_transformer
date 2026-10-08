@@ -8,6 +8,10 @@
 - [Part 2](#part-2-continuous-conditioning), **continuous conditioning:** every sample's condition is
   different (noisy tokens, or a goal position anywhere on a disk). The question there is how to pair noise
   with data for minibatch OT.
+- [Part 3](#part-3-the-current-model-and-training-framework), **the current framework:** Parts 1 and 2 used the
+  original model and training recipe. Part 3 moves both to current flow-matching practice, repeats the OT,
+  guidance and pairing comparisons on the 3σ task under both kinds of conditioning, and ablates the design
+  choices the field hasn't settled.
 
 MNIST (image generation, class conditioning) hasn't been run yet, so none of this is verified for images.
 
@@ -232,6 +236,9 @@ components fixes it. Candidates to try next, cheapest first:
 - **Continuous training times.** Training only sees 10 fixed time values (multiples of 1/9), so the velocity
   field between them is interpolated.
 
+**Update:** the current framework fixes this on the 3σ task (0.93–0.95× at 100 steps, data 0.91). EMA weights
+and continuous training times are both part of it. See [Part 3](#1-the-current-framework-beats-the-old-one-at-every-step-count).
+
 ## Part 2: Continuous conditioning
 
 **Question:** when no two training samples share a condition, how should noise be paired with data?
@@ -419,6 +426,118 @@ condition weight. Mean over seeds; shading = seed range.*
   space and the network fits it less accurately. Few-step samples gain from the commitment; long integrations
   expose the fitting error.
 
+## Part 3: The current model and training framework
+
+**Question:** does moving the model and training recipe to current flow-matching practice change the answers
+above, and which of the design choices the field still disagrees on work best here?
+
+Parts 1 and 2 used the original model: a transformer with plain adaLN and LayerNorm, quaternion pose input, a
+fixed grid of 10 training times, dropout 0.1, and no EMA. The framework now follows what current flow-matching
+and diffusion models agree on ([readme section 8](readme.md#8-transformer-backbone-adaln-zero-and-the-training-recipe-5-16)):
+- adaLN-Zero blocks with RMSNorm and QK-normed attention
+- an Ortho6D pose input
+- standardised positions and twists
+- continuous training times
+- EMA weights and gradient clipping
+- no dropout
+
+Choices the field still disagrees on became flags, and sections 4–6 ablate them one at a time.
+
+### Tasks and setup
+
+One goal distribution under both kinds of conditioning: Part 1's **every mode within 3σ** task (real data sorts
+into the right corner only 73.4% of the time).
+
+- **Discrete conditions:** `configs/pose_tasks/corners_3sigma.yaml`, clean tokens. Part 1's variants: OT × CFG,
+  plus unconditional models.
+- **Continuous conditions:** `configs/pose_tasks/corners_3sigma_jitter.yaml`.
+  - The same modes, with Gaussian noise (std 0.1) on every token, as in Part 2's noisy-token task.
+  - Part 2's pairings, with the OT batch equal to the network batch (Part 2's recommendation) and the knobs
+    calibrated at that batch.
+- **Training:** 5 seeds × 100 epochs, batch 128, AdamW at a constant LR of 1e-4, EMA decay 0.999, gradients
+  clipped at norm 1.
+- **Evaluation:** as in Parts 1–2, sampled from the EMA weights.
+- **Old-framework reference:** Part 1's 3σ results. Pre-framework checkpoints can't be loaded by the current
+  code (tag `pose-continuous-v1` can).
+
+### 1. The current framework beats the old one at every step count
+
+![Current vs. old framework](docs/ablations/sota_framework.png)
+
+*3σ task, discrete conditions, models trained without CFG. Solid = current framework, dotted = old (Part 1). Left:
+energy distance vs. Euler steps. Middle: position spread relative to real data's. Right: energy distance at 100
+steps during training. Mean over 5 seeds; shading = seed range.*
+
+- **At 100 steps the samples reach the metric's floor.**
+  - With OT: energy distance 0.0010 ± 0.0001, against 0.0082 ± 0.0018 before.
+  - Without OT: 0.0009 ± 0.0005, against 0.0119 ± 0.0034.
+  - Real data scores 0.0008.
+- **With OT, few-step sampling is 2–2.6× better.**
+  - 3 steps: 0.0071 vs. 0.015.
+  - 1 step: 0.010 vs. 0.026.
+  - Without OT, few steps don't improve (3 steps: 0.098 vs. 0.118), because the paths still cross.
+- **Part 1's over-dispersion is gone.** Position spread at 100 steps is 0.95× (OT) and 0.93× (no OT) the data's,
+  against 1.04× and 1.15× before. Real data scores 0.91×.
+- **The seeds agree:** the seed range shrinks about tenfold.
+- **Training converges by about epoch 20** (right panel). The old framework's energy distance wandered between
+  0.006 and 0.02 and never settled.
+- **One regression:** at a single step, samples spread 2.5× too widely in rotation (old: 1.0×). Energy distance
+  at one step is still 2.6× better.
+
+The settled practices were adopted together, so which of them produces the gain isn't measured.
+
+### 2. OT and guidance on the current framework (discrete conditions)
+
+![Overview](docs/ablations/sota_overview.png)
+
+*Energy distance per configuration at 1, 3 and 100 Euler steps. Top: discrete conditions; bottom: continuous
+conditions (section 3). One dot per seed; bar = mean. CFG-trained models are sampled at guidance 3. Epoch 100.*
+
+![Sampling steps](docs/ablations/sota_steps_sweep.png)
+
+*Energy distance vs. Euler steps. Mean over 5 seeds; shading = seed range.*
+
+- **OT still buys fast sampling, and costs nothing in quality at 100 steps.**
+  - At 3 steps: 0.0071 with OT, 0.098 without (14×).
+  - At 100 steps both are at the floor: 0.0010 vs. 0.0009, within seed noise.
+  - OT runs took 1.43× as long to train (817 s vs. 569 s, 6 runs sharing the GPU).
+- **Guidance 3 is still the worst choice.**
+  - 0.071–0.076 at 100 steps, 70× the unguided models.
+  - Corner accuracy 1.00 against the data's 0.73: guidance pulls the overlapping corners apart.
+  - Section 6 tries guidance on part of the path only.
+- **Baseline for sections 4–6: OT, no CFG.** The rule was fixed before the results: the conditional no-CFG
+  variant with the lowest mean of log₁₀ energy distance at 3 and 100 steps (−2.57, vs. −2.04 without OT).
+
+### 3. Pairings on the current framework (continuous conditions)
+
+The bottom rows of the two figures above.
+
+- **C²OT matches the per-corner oracle.**
+  - At 3 steps: 0.0069 vs. the oracle's 0.0071; random pairing gets 0.096.
+  - At 100 steps: 0.0014 vs. 0.0011.
+- **Random pairing still catches up and is best at 100 steps** (0.0010 ± 0.0004). The best pairings are within
+  1.4× of it, close to the floor. With the OT batch equal to the network batch, Part 2's 1.5–2.3× gap at 100 steps
+  shrinks.
+- **Global OT still fails.** 0.033 at 100 steps, with corner accuracy 0.36 against the data's 0.73.
+- **Calibration couldn't tell the settings apart here, and its choice hurt.**
+  - Because the modes overlap, every setting on the calibration grid kept the prior skew under the 0.02 bound.
+  - So calibration picked the loosest value on the grid: `--cond_scale 0.01` for the fixed weight and cluster,
+    `--r_tar 0.3` for C²OT.
+  - At that setting the fixed weight and cluster under-separate the corners: corner accuracy 0.62–0.63 against the
+    data's 0.73, and 100-step energy distance 3× C²OT's (0.0039 and 0.0035).
+  - This is a concrete case of Part 2's caveat that the skew statistic is only a lower bound on the harm.
+- **Baseline for sections 4–6: C²OT.** Same rule; global OT and the oracle are excluded.
+
+### 4. Single-axis ablations
+
+*In progress.* Each arm changes one choice of the section 2–3 baseline:
+- the training-time density (logit-normal, π0's Beta)
+- the flow-time embedding (sinusoids of 1000·t, Gaussian Fourier features)
+- the condition pathway (cross-attention, joint attention)
+
+Sections 5 and 6 compare ODE solvers at equal network evaluations, and guidance on part of the path, without
+retraining.
+
 ## Caveats
 
 ### Part 1
@@ -448,6 +567,23 @@ condition weight. Mean over seeds; shading = seed range.*
 - **Recorded commits:** several Part 2 runs record their commit with a "-dirty" suffix. Uncommitted documentation
   and figure-script edits were in the working tree when they started. The training code didn't change:
   `git diff 0ec96f8 HEAD` is empty for `utils/`, `models/`, `configs/` and both trainers.
+
+### Part 3
+
+- **5 seeds, 64 samples per condition.** At 100 steps the best models sit at the metric's floor: real data scores
+  0.0008, and single seeds land below it. Differences there are unresolved; more evaluation samples would be
+  needed to separate them.
+- **The settled practices were adopted together**, so the gain over the old framework isn't attributed to any
+  one of them.
+- **The old-framework comparison covers discrete conditions only.** The noisy-token 3σ task is new, and has no
+  pre-framework runs.
+- **The calibration chose the edge of its grid** (section 3), so the fixed weight and cluster ran at a setting the
+  calibration didn't really select.
+- **Training times** were measured with 6 runs sharing the GPU. The noisy-token runs shared it with 6 more, so
+  their times aren't quoted.
+- **Recorded commits:** the Part 3 runs record `d727163`, most with a "-dirty" suffix, because the figure script
+  was being edited while they trained. The training code didn't change: `git diff d727163` is empty for
+  `utils/`, `models/`, `configs/`, both trainers and `pose_ablations.sh`.
 
 ## Reproducing
 
@@ -484,3 +620,13 @@ Toy results are in `experiments/results/toy_<toy>/`, the pose results and calibr
 `experiments/results/pose_<task>/`, and the sensitivity runs under `sensitivity/<setting>/`. The toys were trained at
 `ba943ac` to `2567ead` (identical training code), the pose tasks at `0ec96f8`, and evaluated at `0e6ce65`
 (sensitivity: `d255f62`).
+
+Part 3 (current framework; Parts 1–2 need tag `pose-continuous-v1`, whose code can load their checkpoints):
+
+```bash
+export TASK_CONFIG=configs/pose_tasks/corners_3sigma.yaml
+./pose_ablations.sh && ./pose_ablations.sh curves             # OT x CFG, 5 seeds; results in experiments/results/sota/
+export TASK_CONFIG=configs/pose_tasks/corners_3sigma_jitter.yaml OT_BATCH_MULT=1
+./pose_ablations.sh calibrate && ./pose_ablations.sh && ./pose_ablations.sh curves   # every pairing, 5 seeds
+python experiments/summary_figures.py --part sota --only baseline framework overview steps
+```
