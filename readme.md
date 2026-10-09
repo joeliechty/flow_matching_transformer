@@ -45,12 +45,12 @@ The way out is to let noise move only between *nearby* conditions. If the condit
 * **Fixed large weight (`c2ot_fixed`) [12, 13].** The same cost with one large w, fixed at the start of training. This is the minibatch form of dynamic conditional OT (COT-FM) and Bayesian OT flow matching; their theory shows that the weighted problem recovers the conditional OT plan as w → ∞.
 * **Cluster, then match (`cluster`) [11].** COT Policy quantizes the conditions with K-means (K about the batch size, with PCA first for image observations) and adds `γ · ‖c̄_i − c̄_j‖²` on the cluster centroids. γ is set per batch so the condition term outweighs the sample term about 10× (`--cond_scale`, default 10). The network still sees the raw condition.
 
-Three practical points, from this repo's experiments ([ablations_summary.md](ablations_summary.md#part-2-continuous-conditioning)):
+Three practical points, from this repo's experiments ([ablations_summary.md](ablations_summary.md#part-2-original-model-continuous-conditioning)):
 * **Calibrate the knob per task.** The published defaults (`--r_tar 0.01`, `--cond_scale 10`) work on 2-D toys, but on the pose tasks they barely change the pairing. There, a 5-unit translation shared by every pair dominates the cost. `experiments/pairing_diagnostics.py --calibrate` picks the loosest setting whose prior skew stays within a bound, without training.
 * **The OT batch size sets a trade-off.** C²OT solves one assignment over an OT batch several times the network batch and splits it into network batches (`--ot_batch_mult`). That gives each sample more partners with nearby conditions and makes one-step samples better. Here it also made 20–100-step samples worse than random pairing. With the OT batch equal to the network batch, the pairing beat random pairing at 1–5 steps and matched it beyond.
 * **Beyond minibatches.** Semidiscrete flow matching (SD-FM) [14] pairs fresh noise with the whole dataset through a learned dual potential, which removes the minibatch limit. Conditional variable flow matching [15] amortizes conditional OT across continuous conditions. Neither is implemented here.
 
-The comparison of these pairings on continuous-condition pose tasks is in [ablations_summary.md](ablations_summary.md#part-2-continuous-conditioning).
+The comparison of these pairings on continuous-condition pose tasks is in [ablations_summary.md](ablations_summary.md#2-pairings-continuous-conditions), with the original model's results in its [Part 2](ablations_summary.md#part-2-original-model-continuous-conditioning).
 
 ### 7. Time Sampling [4, 16, 17]
 Training draws the flow time `t ∈ [0, 1]` (t = 0 is noise, t = 1 data) continuously, so the network sees every time it is queried at during sampling (`_run_flow_matching_step` in [utils/train_utils.py](utils/train_utils.py)).
@@ -223,7 +223,7 @@ With `--return_trajectory`, the script tiles intermediate timesteps so you can s
 
 ### 5. Pairing Experiments with Continuous Conditions
 
-These experiments compare the pairings of section 6. The results are in [ablations_summary.md](ablations_summary.md#part-2-continuous-conditioning).
+These experiments compare the pairings of section 6. The results are in [ablations_summary.md](ablations_summary.md#2-pairings-continuous-conditions).
 
 **Toys first.** `toy_gen_trainer.py` trains a conditional flow on one of two 2-D toys (`utils/toy_tasks.py`). `moons` is C²OT's 8 Gaussians → moons, conditioned on the target's x-coordinate. `fork` is COT Policy's fork: y given x, with two branches for x > 0. Hyperparameters follow C²OT's toy setup.
 ```bash

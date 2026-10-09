@@ -6,7 +6,7 @@
 #   ./pose_ablations.sh [train|eval|all|curves|diagnostics|calibrate|sensitivity|ablate|solver|guidance]
 #                                                             (default: all = train + eval)
 #
-# curves: main metrics (100 and 3 sampling steps) at every saved epoch, for training plots.
+# curves: main metrics (100 and 3 Euler steps, 5 midpoint steps) at every saved epoch, for training plots.
 # diagnostics: pairing statistics at several OT batch sizes, no training (pairing_diagnostics.py).
 # calibrate: choose each condition-aware pairing's knob for this task without training (the
 #            loosest setting whose prior skew stays <= MAX_SKEW, default 0.02), written to
@@ -43,7 +43,8 @@
 #   checkpoints/<dir>/seed_<N>/                     checkpoints (every 10 epochs), configs, logs
 #   experiments/results/<dir>/epoch_<E>/seed_<N>/   metrics, CFG + sampling-steps sweeps, grids
 #   experiments/results/<dir>/epoch_<E>/            *_summary.csv + plots, mean ± std over seeds
-#   experiments/results/<dir>/training_curves/seed_<N>/metrics_epoch<E>_steps<S>.csv   (curves)
+#   experiments/results/<dir>/training_curves/seed_<N>/metrics_epoch<E>_steps<S>.csv   (curves; Euler)
+#   experiments/results/<dir>/training_curves/seed_<N>/metrics_epoch<E>_midpoint<S>.csv (curves; midpoint)
 #   <dir>/sensitivity/<setting>/ and <dir>/ablate/<arm>/ hold the same layout per setting / arm
 #
 # Env overrides: SEEDS="1 2 3 4 5" JOBS=6 EPOCHS=100 PYTHON=python VARIANT_SET OT_BATCH_MULT
@@ -256,29 +257,32 @@ eval_stage() {
   "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT"
 }
 
-curve_one() {  # <seed> <epoch> <steps>
-  local seed=$1 epoch=$2 steps=$3 out="$CURVES_ROOT/seed_$1"
-  local csv="$out/metrics_epoch${epoch}_steps${steps}.csv"
+curve_one() {  # <seed> <epoch> <steps> [solver]
+  local seed=$1 epoch=$2 steps=$3 method=${4:-euler} out="$CURVES_ROOT/seed_$1"
+  local name="steps${steps}"
+  [[ "$method" == euler ]] || name="${method}${steps}"
+  local csv="$out/metrics_epoch${epoch}_${name}.csv"
   [[ -f "$csv" ]] && return 0
   mkdir -p "$out"
   "$PYTHON" experiments/evaluate_all.py --checkpoint_dir "$CKPT_ROOT/seed_$seed" --epoch "$epoch" \
-    --num_steps "$steps" --num_samples "$NUM_SAMPLES" --output "$csv" \
-    > "$out/metrics_epoch${epoch}_steps${steps}_console.txt" 2>&1 \
-    || { echo "  FAILED  seed $seed epoch $epoch, $steps steps" >&2; return 1; }
+    --num_steps "$steps" --method "$method" --num_samples "$NUM_SAMPLES" --output "$csv" \
+    > "$out/metrics_epoch${epoch}_${name}_console.txt" 2>&1 \
+    || { echo "  FAILED  seed $seed epoch $epoch, $steps $method steps" >&2; return 1; }
 }
 
 curves_stage() {
   CURVES_ROOT="$RESULTS_BASE/training_curves"
   echo "=== Training curves ($TASK): seeds [$SEEDS], every 10 epochs to $EPOCHS, $JOBS at a time ==="
-  local running=0 failed=0 seed epoch steps
+  local running=0 failed=0 seed epoch run
   for seed in $SEEDS; do
     for (( epoch = 10; epoch <= EPOCHS; epoch += 10 )); do
-      for steps in 100 3; do
+      for run in "100 euler" "3 euler" "5 midpoint"; do
         if (( running >= JOBS )); then
           wait -n || failed=1
           running=$(( running - 1 ))
         fi
-        curve_one "$seed" "$epoch" "$steps" &
+        # shellcheck disable=SC2086  # run is "<steps> <solver>"
+        curve_one "$seed" "$epoch" $run &
         running=$(( running + 1 ))
       done
     done

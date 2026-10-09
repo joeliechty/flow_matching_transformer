@@ -131,12 +131,13 @@ def data_value(task, metric):
     return float(next(r for r in rows if r['variant'] == 'data')[metric])
 
 
-def curve(task, variant, metric, steps):
+def curve(task, variant, metric, steps, solver='euler'):
     """[seeds, epochs] of `metric` from the curves stage; returns (epochs, values)."""
     root = REPO_ROOT / f'experiments/results/{task}/training_curves'
-    epochs = sorted({int(m.group(1)) for p in root.glob(f'seed_{SEEDS[0]}/metrics_epoch*_steps{steps}.csv')
+    name = f'steps{steps}' if solver == 'euler' else f'{solver}{steps}'
+    epochs = sorted({int(m.group(1)) for p in root.glob(f'seed_{SEEDS[0]}/metrics_epoch*_{name}.csv')
                      for m in [re.search(r'epoch(\d+)_', p.name)]})
-    vals = np.array([[float(next(r for r in read(root / f'seed_{s}/metrics_epoch{e}_steps{steps}.csv')
+    vals = np.array([[float(next(r for r in read(root / f'seed_{s}/metrics_epoch{e}_{name}.csv')
                                  if r['variant'] == variant)[metric]) for e in epochs] for s in SEEDS])
     return np.array(epochs), vals
 
@@ -1049,6 +1050,37 @@ def fig_sota_guidance(plt, out):
     plt.close(fig)
 
 
+TRAINING_SAMPLERS = [(3, 'euler', '3 Euler steps', '#eda100', '^'), (5, 'midpoint', '5 midpoint steps', BLUE, 'o'),
+                     (100, 'euler', '100 Euler steps', INK2, 's')]
+
+
+def fig_sota_training(plt, out):
+    """Each task's baseline during training, at three sampling budgets."""
+    fig, axes = plt.subplots(2, len(SOTA_TASKS), figsize=(6.8 * len(SOTA_TASKS), 8.4), sharex=True, squeeze=False)
+    for c, (task, title) in enumerate(SOTA_TASKS):
+        base, _ = baseline(task)
+        for r, (metric, ylabel) in enumerate((('energy_distance', 'energy distance (log), lower is better'),
+                                               ('spread_ratio_trans', 'position spread ÷ real data'))):
+            ax = axes[r, c]
+            for steps, solver, label, color, marker in TRAINING_SAMPLERS:
+                x, vals = curve(task, base, metric, steps, solver)
+                ax.fill_between(x, vals.min(0), vals.max(0), color=color, alpha=0.12, lw=0)
+                ax.plot(x, vals.mean(0), color=color, marker=marker, lw=1.8, ms=6, label=label)
+            data_line(ax, data_value(task, metric))
+            if metric == 'energy_distance':
+                ax.set_yscale('log')
+                ax.set_title(f"{title}\nbaseline: {vstyle(task, base)['label']}", fontsize=11)
+            ax.set_ylabel(ylabel)
+            if r == 1:
+                ax.set_xlabel('training epoch')
+        axes[0, c].legend(fontsize=10)
+    fig.suptitle(f'Training length: each baseline sampled at three budgets every 10 epochs '
+                 f'(mean over {len(SEEDS)} seeds, shading = seed range)', y=1.0)
+    fig.tight_layout()
+    save(fig, out, 'sota_training.png')
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out', default='docs/ablations')
@@ -1056,7 +1088,7 @@ def main():
     parser.add_argument('--part', choices=('discrete', 'continuous', 'sota'), default='discrete')
     parser.add_argument('--only', nargs='+', default=None,
                         help='continuous part: just these figures (calibration toys overview steps violins sensitivity); '
-                             'sota part: baseline framework overview steps ablations solvers guidance')
+                             'sota part: baseline framework overview steps ablations solvers guidance training')
     args = parser.parse_args()
     out = REPO_ROOT / args.out
     out.mkdir(parents=True, exist_ok=True)
@@ -1083,7 +1115,8 @@ def main():
                 'steps': lambda: fig_sota_steps(plt, out),
                 'ablations': lambda: fig_sota_ablations(plt, out),
                 'solvers': lambda: fig_sota_solvers(plt, out),
-                'guidance': lambda: fig_sota_guidance(plt, out)}
+                'guidance': lambda: fig_sota_guidance(plt, out),
+                'training': lambda: fig_sota_training(plt, out)}
         for name in args.only or figs:
             figs[name]()
         return
