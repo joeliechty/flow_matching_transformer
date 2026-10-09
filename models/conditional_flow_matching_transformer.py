@@ -1,3 +1,5 @@
+from typing import NamedTuple
+
 import torch
 import torch.nn as nn
 
@@ -17,6 +19,24 @@ COND_MODES = ('adaln', 'cross_attn', 'joint')
 #   embedding    integer ids [batch, M] from a vocabulary of obs_vocab (ACRONYM category and object)
 #   point_patch  a point cloud [batch, P, 3], tokenised into M = num_obs_tokens patches
 OBS_ENCODERS = ('mlp', 'embedding', 'point_patch')
+
+
+class SharedTokens(NamedTuple):
+    """Condition tokens stored once per distinct condition: `unique` [U, M, hidden_dim] and
+    each sample's row `index` [batch]. A batch of point clouds holds a few objects many times
+    over, so cross-attention computes keys and values once per object."""
+    unique: torch.Tensor
+    index: torch.Tensor
+
+    @property
+    def shape(self):
+        return (len(self.index), *self.unique.shape[1:])
+
+    def repeat_interleave(self, repeats, dim=0):
+        return SharedTokens(self.unique, self.index.repeat_interleave(repeats, dim=dim))
+
+    def twice(self):
+        return SharedTokens(self.unique, torch.cat([self.index, self.index]))
 
 
 class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
@@ -124,9 +144,13 @@ class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
                 'obs_vocab': self.obs_vocab}
 
     def encode_obs(self, obs):
-        """Condition tokens [batch, M, hidden_dim] of obs, before any are nulled. Encode once
-        per sample and reuse them across flow times and integration steps."""
+        """Condition tokens [batch, M, hidden_dim] of obs, before any are nulled (point clouds:
+        `SharedTokens`, one set per distinct cloud). Encode once per sample and reuse them
+        across flow times and integration steps."""
         with self._autocast(obs):
+            if self.obs_encoder == 'point_patch':
+                unique, index = self.obs_emb.encode_unique(obs)
+                return SharedTokens(unique.float(), index)
             o = self.obs_emb(obs.long() if self.obs_encoder == 'embedding' else obs)
         return o.float()
 
@@ -135,7 +159,14 @@ class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
         (`encode_obs`)."""
         B, N, _ = x.shape
         o = tokens
-        if cond_mask is not None:
+        if isinstance(o, SharedTokens):
+            # point clouds are nulled whole: nulled samples point at one all-null context
+            unique, index = o
+            if cond_mask is not None:
+                unique = torch.cat([unique, self.null_token.expand(1, unique.shape[1], -1)])
+                index = torch.where(cond_mask[:, 0], len(unique) - 1, index)
+            o = (unique, index) if self.cond_mode == 'cross_attn' else unique[index]
+        elif cond_mask is not None:
             # cond_mask is a boolean [batch, M]. True means replace with NULL token
             expanded_null = self.null_token.expand(B, o.shape[1], -1)
             o = torch.where(cond_mask.unsqueeze(-1), expanded_null, o)
@@ -253,8 +284,9 @@ class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
         def velocity(x, t):
             if guide and lo <= t[0].item() < hi:
                 # double forward pass for CFG
+                both = tokens.twice() if isinstance(tokens, SharedTokens) else torch.cat([tokens, tokens])
                 v_double = self._denormalize(self._predict(
-                    torch.cat([x, x]), torch.cat([tokens, tokens]), torch.cat([t, t]),
+                    torch.cat([x, x]), both, torch.cat([t, t]),
                     cond_mask=torch.cat([cond_mask, uncond_mask])))
                 v_cond, v_uncond = v_double.chunk(2, dim=0)
                 return v_uncond + cfg_scale * (v_cond - v_uncond)  # Amplify the difference

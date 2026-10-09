@@ -102,10 +102,29 @@ class ConditionEncoderTest(unittest.TestCase):
                 self.assertEqual(model.inference(x, obs, num_steps=2, cfg_scale=2.0).shape, (6, 1, 7))
                 self.assertEqual(model.inference(x, None, num_steps=1).shape, (6, 1, 7))
 
+    def test_shared_contexts_match_per_sample_tokens(self):
+        # keys and values computed once per cloud give the same velocity as per-sample tokens,
+        # with and without nulled samples, in every pathway
+        torch.manual_seed(0)
+        x = torch.cat([torch.randn(8, 1, 3), random_rotations(8).unsqueeze(1)], -1)
+        t, clouds = torch.rand(8), torch.randn(2, 256, 3).repeat_interleave(4, dim=0)
+        mask = torch.tensor([0, 1, 0, 0, 1, 0, 0, 0], dtype=torch.bool).unsqueeze(1).expand(8, 8)
+        for cond_mode in ('adaln', 'cross_attn', 'joint'):
+            model = _model('point_patch', cond_mode, num_obs_tokens=8, obs_dim=3)
+            for p in model.parameters():  # leave the zero-initialised start, so the condition matters
+                torch.nn.init.normal_(p, std=0.05)
+            shared = model.encode_obs(clouds)
+            per_sample = shared.unique[shared.index]
+            for m in (None, mask):
+                a, b = model._predict(x, shared, t, m), model._predict(x, per_sample, t, m)
+                self.assertTrue(torch.allclose(a, b, atol=1e-5), cond_mode)
+
     def test_identical_clouds_are_encoded_once(self):
         model = _model('point_patch', 'cross_attn', num_obs_tokens=8, obs_dim=3)
         cloud = torch.randn(2, 256, 3)
-        tokens = model.encode_obs(cloud.repeat_interleave(3, dim=0))
+        shared = model.encode_obs(cloud.repeat_interleave(3, dim=0))
+        self.assertEqual(len(shared.unique), 2)
+        tokens = shared.unique[shared.index]
         self.assertTrue(torch.equal(tokens[0], tokens[2]))
         self.assertFalse(torch.equal(tokens[0], tokens[3]))
 

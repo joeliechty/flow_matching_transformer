@@ -77,6 +77,10 @@ class CrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x, context):
+        """context: [batch, M, context_dim], or a (contexts [U, M, context_dim], index [batch])
+        pair when many samples share a few contexts (`index` picks each sample's)."""
+        if isinstance(context, tuple):
+            return self._shared_context(x, *context)
         B, N, C = x.shape
         B_c, M, C_c = context.shape
         
@@ -87,6 +91,24 @@ class CrossAttention(nn.Module):
         out = F.scaled_dot_product_attention(self.q_norm(q), self.k_norm(k), v,
                                              dropout_p=self.attn_dropout if self.training else 0.0)
         out = out.transpose(1, 2).reshape(B, N, C)
+        return self.dropout(self.proj(out))
+
+    def _shared_context(self, x, contexts, index):
+        """Attention to contexts[index[b]] with the keys and values computed once per context:
+        scores and outputs are taken against every context and the sample's one picked out,
+        which is cheap for few contexts and keeps no per-sample keys or values."""
+        B, N, C = x.shape
+        U, M, _ = contexts.shape
+        h, d = self.num_heads, self.head_dim
+        q = self.q_norm(self.q(x).reshape(B, N, h, d).transpose(1, 2))         # [B, h, N, d]
+        k, v = self.kv(contexts).reshape(U, M, 2, h, d).permute(2, 0, 3, 1, 4)  # [U, h, M, d]
+        pick = index.view(B, 1, 1, 1, 1)
+        scores = torch.einsum('bhnd,uhmd->bhnum', q, self.k_norm(k)) * d ** -0.5
+        attn = scores.gather(3, pick.expand(B, h, N, 1, M)).squeeze(3).softmax(-1)
+        if self.training and self.attn_dropout > 0:
+            attn = F.dropout(attn, self.attn_dropout)
+        out = torch.einsum('bhnm,uhmd->bhnud', attn, v).gather(3, pick.expand(B, h, N, 1, d))
+        out = out.squeeze(3).transpose(1, 2).reshape(B, N, C)
         return self.dropout(self.proj(out))
     
 
@@ -299,6 +321,13 @@ class PointPatchEncoder(nn.Module):
         return self.norm(h)
 
     def forward(self, points):
+        """Tokens of each cloud [batch, num_patches, dim]."""
+        tokens, index = self.encode_unique(points)
+        return tokens[index]
+
+    def encode_unique(self, points):
+        """Tokens of each distinct cloud [U, num_patches, dim] and each sample's index into them
+        [batch]."""
         # Group the clouds by their first few points (distinct random surface samplings never
         # share them), check the grouping on the whole clouds, and encode one of each group
         _, inverse = torch.unique(points[:, :4].flatten(1), dim=0, return_inverse=True)
@@ -308,4 +337,4 @@ class PointPatchEncoder(nn.Module):
             _, inverse = torch.unique(points.flatten(1), dim=0, return_inverse=True)
             first = torch.empty(int(inverse.max()) + 1, dtype=torch.long, device=points.device)
             first.scatter_(0, inverse, torch.arange(len(points), device=points.device))
-        return self._encode(points[first])[inverse]
+        return self._encode(points[first]), inverse
