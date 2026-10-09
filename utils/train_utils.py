@@ -109,13 +109,25 @@ def _mode_condition_ids(action_mu):
     return ids
 
 
-def _pair_within_conditions(start, goal, cond_ids, pair_fn):
+def _pair_within_conditions(start, goal, cond_ids, pair_fn, manifold=None):
     """OT-pair `start` to `goal` separately within each condition.
 
     Pairing across the whole batch would hand each condition only the noise samples
     nearest its own goals, so a conditional model would never see the rest of the noise
     distribution for that condition, while sampling draws from all of it.
+
+    Given the manifold, single-frame batches take one cost matrix and one transfer to the
+    CPU for all conditions (the same costs and assignments as `pair_fn` on each one).
     """
+    if manifold is not None and start.shape[1] == 1:
+        cost = _pairwise_cost(start[:, 0], goal[:, 0], manifold).detach().cpu().numpy()
+        ids = cond_ids.cpu().numpy()
+        perm = np.empty(len(ids), dtype=np.int64)
+        for c in np.unique(ids):
+            idx = np.nonzero(ids == c)[0]
+            row, col = linear_sum_assignment(cost[np.ix_(idx, idx)])
+            perm[idx] = idx[row[np.argsort(col)]]
+        return start[torch.as_tensor(perm, device=start.device)]
     paired = torch.empty_like(start)
     for c in torch.unique(cond_ids):
         idx = (cond_ids == c).nonzero(as_tuple=True)[0]
@@ -235,7 +247,8 @@ def condition_aware_pairing(start, goal, method, cond=None, cond_ids=None, manif
             pair_fn = lambda s, g: sequence_ot_pairing(s, g, manifold=manifold)
         if cond_ids is None:
             return pair_fn(start, goal), {}
-        return _pair_within_conditions(start, goal, cond_ids, pair_fn), {}
+        return _pair_within_conditions(start, goal, cond_ids, pair_fn,
+                                       manifold if ot_mode == 'per_frame' else None), {}
 
     base = _batch_cost(start, goal, manifold, ot_mode)
     info = {}
@@ -501,7 +514,8 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
         if cond_ids is None:
             start = pair_fn(start, goal)
         else:
-            start = _pair_within_conditions(start, goal, cond_ids, pair_fn)
+            start = _pair_within_conditions(start, goal, cond_ids, pair_fn,
+                                            manifold if ot_mode == 'per_frame' else None)
 
     if manifold == 'euclidean':
         t_input = sample_times(B, t_dist, device=device, dtype=start.dtype)  # [B]

@@ -47,6 +47,16 @@ class PairWithinConditionsTest(unittest.TestCase):
                                         self.start[idx].flatten(1).sort(0).values))
             self.assertTrue(torch.equal(paired[idx], se3_pair(self.start[idx], self.goal[idx])))
 
+    def test_one_cost_matrix_path_matches_per_condition_pairing(self):
+        # the fast path (one cost matrix for every condition) must give the same pairing,
+        # including for shuffled, unequal groups
+        perm = torch.randperm(64)
+        start, goal, cond = self.start[perm], self.goal[perm], self.cond[perm].clone()
+        cond[cond == 3] = 2
+        self.assertTrue(torch.equal(
+            _pair_within_conditions(start, goal, cond, se3_pair, manifold='se3'),
+            _pair_within_conditions(start, goal, cond, se3_pair)))
+
     def test_single_condition_equals_global_pairing(self):
         one = torch.zeros(len(self.cond), dtype=torch.long)
         self.assertTrue(torch.equal(_pair_within_conditions(self.start, self.goal, one, se3_pair),

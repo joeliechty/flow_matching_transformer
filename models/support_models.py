@@ -299,5 +299,13 @@ class PointPatchEncoder(nn.Module):
         return self.norm(h)
 
     def forward(self, points):
-        unique, inverse = torch.unique(points.flatten(1), dim=0, return_inverse=True)
-        return self._encode(unique.view(-1, *points.shape[1:]))[inverse]
+        # Group the clouds by their first few points (distinct random surface samplings never
+        # share them), check the grouping on the whole clouds, and encode one of each group
+        _, inverse = torch.unique(points[:, :4].flatten(1), dim=0, return_inverse=True)
+        first = torch.empty(int(inverse.max()) + 1, dtype=torch.long, device=points.device)
+        first.scatter_(0, inverse, torch.arange(len(points), device=points.device))
+        if not torch.equal(points[first][inverse], points):
+            _, inverse = torch.unique(points.flatten(1), dim=0, return_inverse=True)
+            first = torch.empty(int(inverse.max()) + 1, dtype=torch.long, device=points.device)
+            first.scatter_(0, inverse, torch.arange(len(points), device=points.device))
+        return self._encode(points[first])[inverse]
