@@ -92,12 +92,27 @@ class PathAndRotationTest(unittest.TestCase):
     def test_training_interpolation_is_perfectly_straight(self):
         torch.manual_seed(0)
         start = convert_twist_to_pose(torch.randn(32, 6), dt=1.0, return_representation='quat')
-        twist = torch.randn(32, 6)
+        goal = convert_twist_to_pose(2 * torch.randn(32, 6), dt=1.0, return_representation='quat')
+        twist = compute_twist_between_poses(start, goal, dt=1.0)  # the training interpolation
         traj = torch.stack([add_twist_to_pose(start, twist, torch.full((32, 1), float(t)))
                             for t in torch.linspace(0, 1, 21)], dim=1)
         ratio, chord = path_straightness(traj)
         self.assertAlmostEqual(ratio, 1.0, delta=1e-3)
         self.assertAlmostEqual(chord, twist.norm(dim=-1).mean().item(), delta=1e-3)
+
+    def test_twist_between_poses_is_the_geodesic(self):
+        # q and -q are one rotation: the twist must take the short way round (angle <= π)
+        # and still land on the goal, whatever sign the stored quaternions have.
+        torch.manual_seed(0)
+        start = convert_twist_to_pose(3 * torch.randn(256, 6), dt=1.0, return_representation='quat')
+        goal = convert_twist_to_pose(3 * torch.randn(256, 6), dt=1.0, return_representation='quat')
+        goal[::2, 3:] *= -1
+        twist = compute_twist_between_poses(start, goal, dt=1.0)
+        self.assertLessEqual(twist[:, 3:].norm(dim=-1).max().item(), torch.pi + 1e-4)
+        reached = add_twist_to_pose(start, twist, torch.ones(256, 1))
+        self.assertTrue(torch.allclose(reached[:, :3], goal[:, :3], atol=1e-4))
+        same = (reached[:, 3:] * goal[:, 3:]).sum(-1).abs()  # |<q, q'>| = 1 for one rotation
+        self.assertTrue(torch.allclose(same, torch.ones(256), atol=1e-4))
 
     def test_out_and_back_detour_is_long(self):
         # Go far out, then come back to near the start: long path, short chord.

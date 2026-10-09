@@ -10,6 +10,7 @@ from utils.train_utils import (EMA, PAIRINGS, T_DISTS, Pairer, generate_interpol
                                pose_normalizer_stats, sample_pose_batch, train)
 from omegaconf import OmegaConf
 from utils.logging_utils import _Tee, git_commit
+from utils.acronym import ROT_PRIORS, load_acronym_task
 from utils.pose_task import ContinuousGoalTask, load_pose_task
 
 DEFAULT_TASK = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -54,6 +55,16 @@ def parse_args():
                         help='Featurisation of the flow time')
     parser.add_argument('--cond_mode', type=str, default='adaln', choices=COND_MODES,
                         help='How the condition tokens enter the transformer')
+    # Backbone size (the time embedding width follows hidden_dim)
+    parser.add_argument('--hidden_dim', type=int, default=128, help='Transformer width')
+    parser.add_argument('--num_layers', type=int, default=4, help='Transformer blocks')
+    parser.add_argument('--num_heads', type=int, default=4, help='Attention heads')
+    # ACRONYM tasks: overrides of the task file's prior and batch layout (ablation arms)
+    parser.add_argument('--rot_prior', type=str, default=None, choices=ROT_PRIORS,
+                        help="ACRONYM: the prior's rotation (default: the task file's)")
+    parser.add_argument('--grasps_per_object', type=int, default=None,
+                        help='ACRONYM: grasps of each object per batch, at the same batch size '
+                             "(default: the task file's)")
     args = parser.parse_args()
     if args.pairing is None:
         args.pairing = 'independent' if args.no_ot else 'ot'
@@ -77,9 +88,25 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def generate_training_and_model_config(args, start_dist_params=None, goal_dist_params=None, action_dist_params=None):
+def acronym_task(args, device='cpu'):
+    """The ACRONYM task of args.task_config with the command line's overrides applied."""
+    spec = OmegaConf.to_container(OmegaConf.load(args.task_config), resolve=True)
+    if args.rot_prior is not None:
+        spec['start']['rotation'] = args.rot_prior
+    if args.grasps_per_object is not None:
+        batch = spec['batch']
+        size = batch['objects'] * batch['grasps_per_object']
+        if size % args.grasps_per_object:
+            raise ValueError(f"--grasps_per_object must divide the batch size {size}")
+        batch['objects'], batch['grasps_per_object'] = size // args.grasps_per_object, args.grasps_per_object
+    return load_acronym_task(spec, device)
+
+
+def generate_training_and_model_config(args, start_dist_params=None, goal_dist_params=None,
+                                       action_dist_params=None, device='cpu'):
     # Distribution parameters (twist representation) come from the task file unless given.
-    task = load_pose_task(args.task_config)
+    acronym = OmegaConf.load(args.task_config).get('type') == 'acronym'
+    task = acronym_task(args, device) if acronym else load_pose_task(args.task_config)
     continuous = task['type'] == 'continuous'
     if continuous and not args.conditional:
         raise ValueError(f"{args.task_config} is a continuous-condition task; add --conditional")
@@ -93,7 +120,8 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         action_dist_params = task['action_dist_params']
 
     if args.batch_size is None:
-        batch_size = 128 if continuous else len(goal_dist_params['mu'])*32
+        batch_size = (task['task'].batch_size if acronym else
+                      128 if continuous else len(goal_dist_params['mu'])*32)
     else:
         batch_size = args.batch_size
 
@@ -101,6 +129,8 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
     # action token size (6 for twist actions) and tokens per condition
     if continuous:
         obs_dim, num_obs_tokens = task['obs_dim'], 1
+    elif acronym:
+        obs_dim, num_obs_tokens = task['obs_dim'], task['task'].num_obs_tokens
     elif args.conditional:
         obs_dim, num_obs_tokens = len(action_dist_params['mu'][0][0]), len(action_dist_params['mu'][0])
     else:
@@ -109,6 +139,8 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
     # Position and velocity statistics for the model's normalisation, from random pairs
     if continuous:
         sampler = ContinuousGoalTask(task['spec']).batch_sampler(start_dist_params, seq_len=args.seq_len)
+    elif acronym:
+        sampler = task['task'].batch_sampler(seq_len=args.seq_len)
     else:
         sampler = lambda n: sample_pose_batch(n, start_dist_params, goal_dist_params,
                                               action_dist_params if args.conditional else None,
@@ -129,7 +161,7 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
         'git_commit': git_commit(),
         'task': task_name,
         'task_type': task['type'],
-        'task_spec': task['spec'] if continuous else None,
+        'task_spec': task['spec'] if continuous or acronym else None,
         'mode_names': mode_names,
         'num_epochs': args.num_epochs,
         'num_batches_per_epoch': args.num_batches_per_epoch,
@@ -150,12 +182,12 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
     model_config = {
         'input_dim': 7,  # quaternion pose representation (x, y, z, qw, qx, qy, qz)
         'output_dim': 6,  # twist representation (vx, vy, vz, wx, wy, wz)
-        'hidden_dim': 128,
-        'num_layers': 4,
-        'num_heads': 4,
+        'hidden_dim': args.hidden_dim,
+        'num_layers': args.num_layers,
+        'num_heads': args.num_heads,
         'mlp_ratio': 4.0,
         'dropout': 0.0,
-        'phase_dim': 128,
+        'phase_dim': args.hidden_dim,
         'max_seq_len': args.seq_len,
         'manifold': 'se3',
         'time_emb': args.time_emb,
@@ -163,6 +195,9 @@ def generate_training_and_model_config(args, start_dist_params=None, goal_dist_p
     if args.conditional:
         model_config.update({'obs_dim': obs_dim, 'cond_mode': args.cond_mode,
                              'num_obs_tokens': num_obs_tokens})
+        if acronym:
+            model_config.update({'obs_encoder': task['task'].obs_encoder,
+                                 'obs_vocab': task['task'].obs_vocab})
     config_dict = {
         'training': training_config,
         'model': model_config
@@ -227,7 +262,7 @@ if __name__ == "__main__":
     print("TRAINING FLOW MATCHING TRANSFORMER")
     print("=" * 60)
     
-    config = generate_training_and_model_config(args)
+    config = generate_training_and_model_config(args, device=device)
 
     print(f"Input Dimension: {config.model.input_dim}")
     print(f"Number of Epochs: {config.training.num_epochs}")
@@ -246,9 +281,15 @@ if __name__ == "__main__":
     # every other pairing, or a bigger OT batch, draws paired batches from a Pairer.
     pairer = None
     t = config.training
-    if t.task_type == 'continuous':
-        sampler = ContinuousGoalTask(OmegaConf.to_container(t.task_spec)).batch_sampler(
-            t.start_dist_params, seq_len=t.seq_len, device=device)
+    if t.task_type in ('continuous', 'acronym'):
+        if t.task_type == 'continuous':
+            sampler = ContinuousGoalTask(OmegaConf.to_container(t.task_spec)).batch_sampler(
+                t.start_dist_params, seq_len=t.seq_len, device=device)
+        else:
+            sampler = load_acronym_task(OmegaConf.to_container(t.task_spec), device)[
+                'task'].batch_sampler(seq_len=t.seq_len)
+            if not t.conditional:  # the unconditional reference: no condition, OT over the batch
+                sampler = (lambda draw: lambda n: (*draw(n)[:2], None, None))(sampler)
         pairer = Pairer(t.pairing, sampler, t.batch_size, ot_batch_mult=t.ot_batch_mult,
                         r_tar=t.r_tar, num_clusters=t.num_clusters, cond_scale=t.cond_scale)
     elif t.pairing not in ('ot', 'independent') or t.ot_batch_mult > 1:

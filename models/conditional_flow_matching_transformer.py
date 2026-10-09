@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from models.flow_transformer_base import FlowTransformerBase
+from models.support_models import PointPatchEncoder
 
 # How the condition tokens reach the transformer (an ablation axis):
 #   adaln       flattened and added to the time embedding, so they drive every block's adaLN
@@ -10,6 +11,12 @@ from models.flow_transformer_base import FlowTransformerBase
 #   joint       appended to the sequence, so self-attention mixes them in [DiT's in-context
 #               conditioning; SD3's MM-DiT and π0 also attend jointly, with separate weights]
 COND_MODES = ('adaln', 'cross_attn', 'joint')
+
+# What a condition token is made from:
+#   mlp          continuous token vectors [batch, M, obs_dim] (the synthetic tasks, MNIST)
+#   embedding    integer ids [batch, M] from a vocabulary of obs_vocab (ACRONYM category and object)
+#   point_patch  a point cloud [batch, P, 3], tokenised into M = num_obs_tokens patches
+OBS_ENCODERS = ('mlp', 'embedding', 'point_patch')
 
 
 class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
@@ -40,6 +47,8 @@ class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
         time_emb='sinusoidal',
         cond_mode='adaln',
         num_obs_tokens=1,
+        obs_encoder='mlp',
+        obs_vocab=None,
     ):
         """
         Initialize the Flow Matching Transformer model.
@@ -58,62 +67,101 @@ class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
             time_emb: featurisation of the flow time, one of `models.support_models.TIME_EMBEDDINGS`
             cond_mode: how the condition tokens enter, one of `COND_MODES`
             num_obs_tokens: number of condition tokens M per sample
+            obs_encoder: what the tokens are made from, one of `OBS_ENCODERS`
+            obs_vocab: vocabulary size of the 'embedding' encoder
         """
         if cond_mode not in COND_MODES:
             raise ValueError(f"Unknown cond_mode: {cond_mode!r}. Expected one of {COND_MODES}.")
+        if obs_encoder not in OBS_ENCODERS:
+            raise ValueError(f"Unknown obs_encoder: {obs_encoder!r}. Expected one of {OBS_ENCODERS}.")
         super().__init__(input_dim, output_dim, hidden_dim, num_layers, num_heads, mlp_ratio,
                          dropout, phase_dim, max_seq_len, pos_emb_type, pos_emb_grid, manifold,
                          time_emb, cross_attn=cond_mode == 'cross_attn')
         self.obs_dim = obs_dim
         self.cond_mode = cond_mode
         self.num_obs_tokens = num_obs_tokens
+        self.obs_encoder = obs_encoder
+        self.obs_vocab = obs_vocab
+        # A point cloud's patches are one condition, nulled together; token vectors and ids
+        # are dropped one at a time too (partial conditioning)
+        self.token_dropout = obs_encoder != 'point_patch'
 
-        # Observation embedding: [batch, M, obs_dim] -> [batch, M, hidden_dim]
-        self.obs_emb = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        # Condition embedding -> [batch, M, hidden_dim]
+        if obs_encoder == 'mlp':
+            self.obs_emb = nn.Sequential(
+                nn.Linear(obs_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim)
+            )
+        elif obs_encoder == 'embedding':
+            self.obs_emb = nn.Embedding(obs_vocab, hidden_dim)
+        else:  # point_patch: patch tokens carry their centre's position
+            self.obs_emb = PointPatchEncoder(hidden_dim, num_patches=num_obs_tokens,
+                                             num_heads=num_heads)
 
         # Learnable NULL token for unconditional generation/masking
         self.null_token = nn.Parameter(torch.rand(1, 1, hidden_dim))
 
         # Which slot each condition token fills, added after the null-token swap so the model
-        # also knows which slots are nulled
-        self.obs_pos_emb = nn.Parameter(torch.zeros(1, num_obs_tokens, hidden_dim))
+        # also knows which slots are nulled (point patches are a set, so they have none)
+        if self.token_dropout:
+            self.obs_pos_emb = nn.Parameter(torch.zeros(1, num_obs_tokens, hidden_dim))
 
         if cond_mode == 'adaln':
-            self.cond_proj = nn.Linear(num_obs_tokens * hidden_dim, phase_dim)
+            # point patches are pooled (mean and max), being an unordered set; slots are flattened
+            in_dim = 2 * hidden_dim if obs_encoder == 'point_patch' else num_obs_tokens * hidden_dim
+            self.cond_proj = nn.Linear(in_dim, phase_dim)
 
         self._init_weights()
-        nn.init.normal_(self.obs_pos_emb, std=0.02)
+        if obs_encoder == 'embedding':
+            nn.init.normal_(self.obs_emb.weight, std=0.02)
+        if self.token_dropout:
+            nn.init.normal_(self.obs_pos_emb, std=0.02)
 
     def model_config(self):
         return {**super().model_config(), 'obs_dim': self.obs_dim, 'cond_mode': self.cond_mode,
-                'num_obs_tokens': self.num_obs_tokens}
+                'num_obs_tokens': self.num_obs_tokens, 'obs_encoder': self.obs_encoder,
+                'obs_vocab': self.obs_vocab}
 
-    def _predict(self, x, obs, phase, cond_mask=None):
-        """Normalised velocity [batch, seq_len, output_dim]."""
+    def encode_obs(self, obs):
+        """Condition tokens [batch, M, hidden_dim] of obs, before any are nulled. Encode once
+        per sample and reuse them across flow times and integration steps."""
+        with self._autocast(obs):
+            o = self.obs_emb(obs.long() if self.obs_encoder == 'embedding' else obs)
+        return o.float()
+
+    def _predict(self, x, tokens, phase, cond_mask=None):
+        """Normalised velocity [batch, seq_len, output_dim] from condition tokens
+        (`encode_obs`)."""
         B, N, _ = x.shape
-        c = self._time(phase)  # [batch, phase_dim]
-        h = self._embed(x)     # [batch, seq_len, hidden_dim]
-
-        o = self.obs_emb(obs)  # [batch, M, hidden_dim]
+        o = tokens
         if cond_mask is not None:
             # cond_mask is a boolean [batch, M]. True means replace with NULL token
             expanded_null = self.null_token.expand(B, o.shape[1], -1)
             o = torch.where(cond_mask.unsqueeze(-1), expanded_null, o)
-        o = o + self.obs_pos_emb[:, :o.shape[1]]
+        if self.token_dropout:
+            o = o + self.obs_pos_emb[:, :o.shape[1]]
 
-        context = None
-        if self.cond_mode == 'adaln':
-            c = c + self.cond_proj(o.flatten(1))
-        elif self.cond_mode == 'cross_attn':
-            context = o
-        else:  # joint: the condition tokens join the sequence and are dropped at the output
-            h = torch.cat([h, o], dim=1)
-        h = self._trunk(h, c, context=context)
-        return self.final_layer(h[:, :N], c)
+        with self._autocast(x):
+            c = self._time(phase)  # [batch, phase_dim]
+            h = self._embed(x)     # [batch, seq_len, hidden_dim]
+            context = None
+            if self.cond_mode == 'adaln':
+                pooled = (torch.cat([o.mean(1), o.amax(1)], dim=-1)
+                          if self.obs_encoder == 'point_patch' else o.flatten(1))
+                c = c + self.cond_proj(pooled)
+            elif self.cond_mode == 'cross_attn':
+                context = o
+            else:  # joint: the condition tokens join the sequence and are dropped at the output
+                h = torch.cat([h, o], dim=1)
+            h = self._trunk(h, c, context=context)
+            out = self.final_layer(h[:, :N], c)
+        return out.float()
+
+    def _null_tokens(self, batch, device):
+        """Placeholder tokens and an all-True mask: every token nulled (unconditional)."""
+        tokens = torch.zeros(batch, self.num_obs_tokens, self.hidden_dim, device=device)
+        return tokens, torch.ones(batch, self.num_obs_tokens, dtype=torch.bool, device=device)
 
     def forward(self, x, obs, phase, cond_mask=None):
         """
@@ -129,9 +177,9 @@ class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
         Returns:
             output: predicted vector field [batch, seq_len, output_dim]
         """
-        return self._denormalize(self._predict(x, obs, phase, cond_mask))
+        return self._denormalize(self._predict(x, self.encode_obs(obs), phase, cond_mask))
 
-    def cfm_loss(self, x_t, t, v_target, obs, cond_mask=None, reduction='mean'):
+    def cfm_loss(self, x_t, t, v_target, obs, cond_mask=None, reduction='mean', tokens=None):
         """
         Conditional flow matching loss: MSE between the predicted and target velocity at the
         path states x_t, in normalised units.
@@ -143,8 +191,11 @@ class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
             obs: condition tokens [batch, M, obs_dim]
             cond_mask: optional boolean mask [batch, M] of tokens replaced by the null token
             reduction: 'mean', 'sum', or 'none'
+            tokens: obs already encoded (`encode_obs`), in which case obs is ignored
         """
-        return self._velocity_loss(self._predict(x_t, obs, t, cond_mask), v_target, reduction)
+        if tokens is None:
+            tokens = self.encode_obs(obs)
+        return self._velocity_loss(self._predict(x_t, tokens, t, cond_mask), v_target, reduction)
 
     @torch.no_grad()
     def sample(self, x0, obs, num_steps=100, method='euler', manifold=None):
@@ -183,15 +234,16 @@ class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
         self.eval()
         B, device = start_poses.shape[0], start_poses.device
 
-        # When obs is None, use a dummy obs and replace all tokens with null (unconditional)
+        # The condition is encoded once for the whole integration. When obs is None, every
+        # token is the null token (unconditional)
         if obs is None:
-            obs = torch.zeros(B, self.num_obs_tokens, self.obs_dim, device=device)
-            cond_mask = torch.ones(B, self.num_obs_tokens, dtype=torch.bool, device=device)
+            tokens, cond_mask = self._null_tokens(B, device)
             uncond_mask = cond_mask  # both passes identical; CFG is a no-op
         else:
-            uncond_mask = torch.ones(B, obs.shape[1], dtype=torch.bool, device=device)
+            tokens = self.encode_obs(obs)
+            uncond_mask = torch.ones(B, tokens.shape[1], dtype=torch.bool, device=device)
             if obs_mask is None:
-                cond_mask = torch.zeros(B, obs.shape[1], dtype=torch.bool, device=device)
+                cond_mask = torch.zeros(B, tokens.shape[1], dtype=torch.bool, device=device)
             else:
                 cond_mask = obs_mask.to(device=device, dtype=torch.bool)
 
@@ -201,10 +253,11 @@ class ConditionalFlowMatchingTransformerModel(FlowTransformerBase):
         def velocity(x, t):
             if guide and lo <= t[0].item() < hi:
                 # double forward pass for CFG
-                v_double = self.forward(torch.cat([x, x]), torch.cat([obs, obs]), torch.cat([t, t]),
-                                        cond_mask=torch.cat([cond_mask, uncond_mask]))
+                v_double = self._denormalize(self._predict(
+                    torch.cat([x, x]), torch.cat([tokens, tokens]), torch.cat([t, t]),
+                    cond_mask=torch.cat([cond_mask, uncond_mask])))
                 v_cond, v_uncond = v_double.chunk(2, dim=0)
                 return v_uncond + cfg_scale * (v_cond - v_uncond)  # Amplify the difference
-            return self.forward(x, obs, t, cond_mask=cond_mask)
+            return self._denormalize(self._predict(x, tokens, t, cond_mask=cond_mask))
 
         return self._integrate(start_poses, velocity, num_steps, method, manifold, return_trajectory)

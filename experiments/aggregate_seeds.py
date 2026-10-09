@@ -40,11 +40,20 @@ METRICS = {
     'partial_balance_kl': ('One-token condition: imbalance KL', 'lower is better; 0 = 50/50'),
     'partial_energy_distance': ('One-token condition: energy distance', 'lower is better'),
     'condition_balance_kl': ('Multimodal condition: imbalance KL', 'lower is better; 0 = even'),
+    # ACRONYM pose recreation (utils/grasp_metrics.py); distances in cm
+    'recreation_err': ('Real grasp → nearest sample (cm)', 'lower is better, down to the data floor'),
+    'fidelity_err': ('Sample → nearest real grasp (cm)', 'lower is better, down to the data floor'),
+    'coverage_1cm': ('Real grasps with a sample within 1 cm', 'higher is better'),
+    'coverage_2cm': ('Real grasps with a sample within 2 cm', 'higher is better'),
+    'precision_1cm': ('Samples within 1 cm of a real grasp', 'higher is better'),
+    'precision_2cm': ('Samples within 2 cm of a real grasp', 'higher is better'),
+    'one_nna': ('1-NN two-sample accuracy', '0.5 = indistinguishable from data'),
     'class_accuracy': ('Class accuracy', 'higher is better'),
     'class_marginal_kl': ('Class marginal KL', 'lower is better'),
 }
 # Columns for the console summary (all metrics still go to the CSVs and plots).
-PRINT_METRICS = ('mode_accuracy', 'energy_distance', 'spread_ratio_trans', 'spread_ratio_rot',
+PRINT_METRICS = ('mode_accuracy', 'energy_distance', 'recreation_err', 'fidelity_err', 'one_nna',
+                 'spread_ratio_trans', 'spread_ratio_rot',
                  'path_straightness', 'partial_validity', 'partial_balance_kl',
                  'class_accuracy', 'class_marginal_kl')
 REFERENCE_COLOR = '#8a8a85'  # recessive grey for the real-data reference line

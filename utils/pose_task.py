@@ -7,7 +7,8 @@ of tokens. `load_pose_task` turns it into the distribution dicts the trainer use
 evaluation works for any task, including runs that predate task files.
 
 A file with `type: continuous` instead describes goals that vary continuously with the
-condition (`ContinuousGoalTask`), so no two training samples share a condition.
+condition (`ContinuousGoalTask`), so no two training samples share a condition, and one with
+`type: acronym` real grasp poses conditioned on the object (`utils.acronym`).
 """
 import math
 from dataclasses import dataclass
@@ -30,16 +31,20 @@ def _vec(value, dim):
     return list(value)
 
 
-def load_pose_task(path):
+def load_pose_task(path, device='cpu'):
     """Read a task file into the trainer's distribution dicts.
 
     Returns a dict with 'name', 'mode_names', 'tokens' (the vocabulary), 'obs_dim',
     'start_dist_params', 'goal_dist_params' and 'action_dist_params', laid out exactly as
     the pose trainer has always built them ([K, 1, 6] goal twists, [K, M, obs_dim] tokens).
+    An ACRONYM task's data goes to `device`.
     """
     spec = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
     if spec.get('type') == 'continuous':
         return _load_continuous_task(spec)
+    if spec.get('type') == 'acronym':
+        from utils.acronym import load_acronym_task
+        return load_acronym_task(spec, device)
     tokens, modes = spec['tokens'], spec['modes']
     obs_dim = len(next(iter(tokens.values())))
     for mode in modes:
@@ -159,6 +164,8 @@ def pose_batch_sampler(task, seq_len=1, device='cpu'):
     `load_pose_task` (either kind)."""
     if task['type'] == 'continuous':
         return task['task'].batch_sampler(task['start_dist_params'], seq_len, device)
+    if task['type'] == 'acronym':
+        return task['task'].batch_sampler(seq_len)
     from utils.train_utils import sample_pose_batch
     return lambda n: sample_pose_batch(n, task['start_dist_params'], task['goal_dist_params'],
                                        task['action_dist_params'], seq_len=seq_len, device=device)

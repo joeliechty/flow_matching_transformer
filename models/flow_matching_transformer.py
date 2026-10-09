@@ -54,9 +54,11 @@ class FlowMatchingTransformerModel(FlowTransformerBase):
 
     def _predict(self, x, phase):
         """Normalised velocity [batch, seq_len, output_dim]."""
-        c = self._time(phase)
-        h = self._trunk(self._embed(x), c)
-        return self.final_layer(h, c)
+        with self._autocast(x):
+            c = self._time(phase)
+            h = self._trunk(self._embed(x), c)
+            out = self.final_layer(h, c)
+        return out.float()
 
     def forward(self, x, phase):
         """

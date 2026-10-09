@@ -235,3 +235,69 @@ def get_2d_sincos_pos_embed(embed_dim, grid_h, grid_w):
     emb_w = _sincos_1d(embed_dim // 2, col_idx)   # [H*W, embed_dim/2]
     emb = torch.cat([emb_h, emb_w], dim=1)        # [H*W, embed_dim]
     return emb.unsqueeze(0)                        # [1, H*W, embed_dim]
+
+
+def farthest_point_sample(points, m):
+    """Indices [batch, m] of m farthest-point-sampled points of points [batch, P, 3], starting
+    from point 0 (the points are random surface samples, so the start needs no randomness)."""
+    B, P, _ = points.shape
+    idx = torch.zeros(B, m, dtype=torch.long, device=points.device)
+    dist = torch.full((B, P), float('inf'), device=points.device)
+    rows = torch.arange(B, device=points.device)
+    farthest = torch.zeros(B, dtype=torch.long, device=points.device)
+    for i in range(m):
+        idx[:, i] = farthest
+        d = ((points - points[rows, farthest].unsqueeze(1)) ** 2).sum(-1)
+        dist = torch.minimum(dist, d)
+        farthest = dist.argmax(-1)
+    return idx
+
+
+class PlainBlock(nn.Module):
+    """Pre-norm transformer block (RMSNorm, QK-normed self-attention, MLP), without adaLN."""
+
+    def __init__(self, dim, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1, self.norm2 = nn.RMSNorm(dim), nn.RMSNorm(dim)
+        self.attn = MultiHeadAttention(dim, num_heads)
+        self.mlp = FeedForward(dim, int(dim * mlp_ratio))
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        return x + self.mlp(self.norm2(x))
+
+
+class PointPatchEncoder(nn.Module):
+    """Point cloud [batch, P, 3] -> patch tokens [batch, num_patches, dim], the Point-BERT /
+    Point-MAE tokeniser [Yu et al. 2022; Pang et al. 2022]: farthest point sampling picks the
+    patch centres, each centre's patch_size nearest points (relative to the centre) go through a
+    shared mini-PointNet and are max-pooled, an MLP of the centre adds its position, and a few
+    plain transformer blocks mix the patches.
+
+    A batch usually holds several samples of one object, so identical clouds are encoded once.
+    """
+
+    def __init__(self, dim, num_patches=64, patch_size=32, num_layers=4, num_heads=4):
+        super().__init__()
+        self.num_patches, self.patch_size = num_patches, patch_size
+        self.point_mlp = nn.Sequential(nn.Linear(3, 128), nn.GELU(), nn.Linear(128, 256))
+        self.patch_proj = nn.Sequential(nn.Linear(256, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.centre_emb = nn.Sequential(nn.Linear(3, 128), nn.GELU(), nn.Linear(128, dim))
+        self.blocks = nn.ModuleList([PlainBlock(dim, num_heads) for _ in range(num_layers)])
+        self.norm = nn.RMSNorm(dim)
+
+    def _encode(self, points):
+        B = points.shape[0]
+        rows = torch.arange(B, device=points.device).unsqueeze(1)
+        centres = points[rows, farthest_point_sample(points, self.num_patches)]   # [B, M, 3]
+        d = ((centres.unsqueeze(2) - points.unsqueeze(1)) ** 2).sum(-1)          # [B, M, P]
+        knn = d.topk(self.patch_size, dim=-1, largest=False).indices             # [B, M, k]
+        patches = points[rows.unsqueeze(-1), knn] - centres.unsqueeze(2)         # [B, M, k, 3]
+        h = self.patch_proj(self.point_mlp(patches).amax(dim=2)) + self.centre_emb(centres)
+        for block in self.blocks:
+            h = block(h)
+        return self.norm(h)
+
+    def forward(self, points):
+        unique, inverse = torch.unique(points.flatten(1), dim=0, return_inverse=True)
+        return self._encode(unique.view(-1, *points.shape[1:]))[inverse]

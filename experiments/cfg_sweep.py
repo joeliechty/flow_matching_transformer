@@ -42,6 +42,8 @@ def main():
                         help="Flow-time ranges to guide in: 'full' or 'LO-HI' (LO <= t < HI)")
     parser.add_argument('--scales', type=float, nargs='+', default=list(DEFAULT_SWEEP))
     parser.add_argument('--eval_seed', type=int, default=0)
+    parser.add_argument('--level', type=str, default='heldout_grasps',
+                        help='ACRONYM tasks: the held-out level to score')
     parser.add_argument('--output', type=str, default='experiments/results/cfg_sweep.csv')
     args = parser.parse_args()
 
@@ -66,7 +68,7 @@ def main():
                 row = evaluate(meta, device, classifier,
                                num_samples=args.num_samples, num_steps=steps,
                                cfg_scale=scale, eval_seed=args.eval_seed,
-                               cfg_interval=parse_interval(interval))
+                               cfg_interval=parse_interval(interval), level=args.level)
             except Exception as e:
                 print(f"ERROR evaluating {tag}: {e}")
                 continue

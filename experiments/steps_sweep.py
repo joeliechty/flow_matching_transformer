@@ -39,6 +39,8 @@ def main():
                         help='ODE solvers to sweep; each runs --steps divided by its evaluations '
                              'per step, so every solver is compared at the same network evaluations')
     parser.add_argument('--eval_seed', type=int, default=0)
+    parser.add_argument('--level', type=str, default='heldout_grasps',
+                        help='ACRONYM tasks: the held-out level to score')
     parser.add_argument('--output', type=str, default='experiments/results/steps_sweep.csv')
     args = parser.parse_args()
 
@@ -60,7 +62,8 @@ def main():
             try:
                 row = evaluate(meta, device, classifier,
                                num_samples=args.num_samples, num_steps=steps,
-                               cfg_scale=args.cfg_scale, eval_seed=args.eval_seed, method=method)
+                               cfg_scale=args.cfg_scale, eval_seed=args.eval_seed, method=method,
+                               level=args.level)
             except Exception as e:
                 print(f"ERROR evaluating {tag}: {e}")
                 continue

@@ -141,6 +141,12 @@ class FlowTransformerBase(nn.Module):
         h = self.input_proj(x)
         return h + self.pos_emb[:, :h.shape[1], :]
 
+    @staticmethod
+    def _autocast(ref):
+        """bf16 autocast for the network on CUDA [mixed precision, as in DiT/SD3 training];
+        the pose maths around it stays in fp32."""
+        return torch.autocast('cuda', dtype=torch.bfloat16, enabled=ref.is_cuda)
+
     def _time(self, phase):
         """Flow time [batch] or [batch, 1] -> [batch, phase_dim]."""
         if phase.dim() == 2:

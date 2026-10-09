@@ -377,12 +377,17 @@ def generate_interpolated_poses(start_poses, goal_poses, n_steps=10):
     return generate_interpolated_states(start_poses, goal_poses, n_steps=n_steps, manifold='se3')
 
 
-def _build_cond_mask(batch_size, num_tokens, use_cfg, device):
+def _build_cond_mask(batch_size, num_tokens, use_cfg, device, per_token=True):
     """[batch, M] bool mask; True = replace that obs token with the null token.
 
-    Each token is dropped independently with p=0.1; with CFG, whole samples are also
-    dropped (unconditional) with p=0.1.
+    Each token is dropped independently with p=0.1 (unless per_token is False, as for the
+    patches of one point cloud); with CFG, whole samples are also dropped (unconditional)
+    with p=0.1.
     """
+    if not per_token:
+        uncond = (torch.rand(batch_size, device=device) < 0.1 if use_cfg
+                  else torch.zeros(batch_size, dtype=torch.bool, device=device))
+        return uncond.unsqueeze(-1).expand(batch_size, num_tokens)
     indep_mask = torch.rand(batch_size, num_tokens, device=device) < 0.1
     if use_cfg:
         uncond_mask = torch.rand(batch_size, device=device) < 0.1
@@ -527,16 +532,20 @@ def _run_flow_matching_step(model, optimizer, start, goal, obs, n_steps,
         v_target = v_target.reshape(B * n_steps, S, vel_dim)
         t_input = t.reshape(B * n_steps)
 
+        tokens = None
         if obs is not None:
-            obs = obs.repeat_interleave(n_steps, dim=0)
-            cond_mask = _build_cond_mask(obs.shape[0], obs.shape[1], use_cfg, device)
+            # encode each pair's condition once, then reuse it at its n_steps times
+            tokens = model.encode_obs(obs).repeat_interleave(n_steps, dim=0)
+            cond_mask = _build_cond_mask(tokens.shape[0], tokens.shape[1], use_cfg, device,
+                                         per_token=model.token_dropout)
         else:
             cond_mask = None
     else:
         raise ValueError(f"Unknown manifold: {manifold!r}.")
 
     if isinstance(model, ConditionalFlowMatchingTransformerModel):
-        loss = model.cfm_loss(x_t, t_input, v_target, obs, cond_mask=cond_mask, reduction='mean')
+        loss = model.cfm_loss(x_t, t_input, v_target, obs, cond_mask=cond_mask, reduction='mean',
+                              tokens=tokens if manifold == 'se3' else None)
     else:
         loss = model.cfm_loss(x_t, t_input, v_target, reduction='mean')
 

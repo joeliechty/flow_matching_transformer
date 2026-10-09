@@ -1,0 +1,22 @@
+# ACRONYM grasp poses on the acronym_10cat objects (configs/datasets/acronym_10cat.yaml),
+# conditioned on the object's point cloud (continuous conditioning, Part 1).
+# Loaded by utils/acronym.py (AcronymGraspTask); positions are in units of the dataset's
+# pos_scale (~6 cm).
+name: acronym_10cat_points
+type: acronym
+dataset: configs/datasets/acronym_10cat.yaml
+condition: points
+
+start:
+  trans_sigma: 1.0
+  rotation: uniform         # or gaussian (exp of N(0, rot_sigma²) per axis); --rot_prior overrides
+  rot_sigma: 1.0
+
+batch:
+  objects: 64
+  grasps_per_object: 16     # the per-object OT minibatch; --grasps_per_object overrides
+
+eval:
+  objects_per_level: 64
+  samples_per_object: 256
+  max_reference: 512

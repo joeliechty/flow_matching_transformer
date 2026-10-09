@@ -1,0 +1,12 @@
+# The two ACRONYM example objects that ship with their meshes (Mug, Table; github.com/NVlabs/acronym
+# data/examples), as training objects only: for smoke-testing the point-cloud path without
+# the ShapeNetSem meshes. Build with --mesh_root <acronym repo>/data/examples.
+name: acronym_examples
+cache: data/acronym/acronym_examples.pt
+files: [Mug_10f6e09036350e92b3f21f1137c3c347_0.0002682457830986903.h5,
+        Table_99cf659ae2fe4b87b72437fd995483b_0.009700376721042367.h5]
+min_success: 200
+heldout_grasp_fraction: 0.15
+split_seed: 0
+point_samplings: 4
+points_per_cloud: 2048

@@ -399,3 +399,21 @@ def visualize_image_trajectory(trajectory, num_samples=8, num_timesteps=10, save
     else:
         plt.show()
     plt.close(fig)
+
+
+# Franka hand wireframe (m) in its base frame: stem, crossbar and the two fingers
+GRIPPER_SEGMENTS = (((0, 0, 0), (0, 0, 0.066)), ((-0.041, 0, 0.066), (0.041, 0, 0.066)),
+                    ((-0.041, 0, 0.066), (-0.041, 0, 0.112)), ((0.041, 0, 0.066), (0.041, 0, 0.112)))
+
+
+def plot_grasps(ax, poses, tcp_offset, color, alpha=0.6, linewidth=1.0, label=None):
+    """Draw grasps (poses [N, 7] in metres, frame tcp_offset along z from the hand's base) as
+    gripper wireframes on a 3-D axis."""
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+    poses = torch.as_tensor(poses, dtype=torch.float32).reshape(-1, 7).cpu()
+    seg = torch.tensor(GRIPPER_SEGMENTS, dtype=torch.float32) - torch.tensor([0, 0, tcp_offset])
+    R = _quat_to_rot_mat(poses[:, 3:7], w_first=True)                          # [N, 3, 3]
+    lines = torch.einsum('nij,skj->nski', R, seg) + poses[:, None, None, :3]   # [N, 4, 2, 3]
+    ax.add_collection3d(Line3DCollection(lines.reshape(-1, 2, 3).numpy(), colors=color,
+                                         linewidths=linewidth, alpha=alpha, label=label))
+    return lines.reshape(-1, 3)

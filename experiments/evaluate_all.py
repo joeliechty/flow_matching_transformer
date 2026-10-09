@@ -38,6 +38,8 @@ from utils.eval_utils import (
     sample_goal_mixture,
     sample_goal_poses,
 )
+from utils.acronym import LEVELS, load_acronym_task
+from utils.grasp_metrics import mean_over_objects, recreation_metrics
 from utils.logging_utils import git_commit
 from utils.mnist_classifier import load_classifier
 from models.flow_transformer_base import SOLVER_EVALS
@@ -468,15 +470,100 @@ def evaluate_image(meta, device, classifier, num_samples=256, num_steps=100, cfg
 
 
 @functools.lru_cache(maxsize=None)
+def _acronym_task(config, device):
+    return load_acronym_task(OmegaConf.to_container(config.training.task_spec, resolve=True),
+                             device)['task']
+
+
+def _check_level(task, level):
+    if level not in LEVELS:
+        raise ValueError(f"Unknown level: {level!r}. Expected one of {tuple(LEVELS)}.")
+    if task.condition == 'ids' and level != 'heldout_grasps':
+        raise ValueError("an id-conditioned model knows only its training objects: "
+                         "evaluate it on --level heldout_grasps")
+
+
+def _acronym_metrics(task, objects, sample_sets, level):
+    """Pose-recreation metrics (`utils.grasp_metrics`) of each object's samples [n, 7] (pos_scale
+    units) against its reference grasps, averaged over objects."""
+    per_object = []
+    for obj, samples in zip(objects, sample_sets):
+        ref, _ = task.reference_and_floor(obj, level, samples.shape[0])
+        per_object.append(recreation_metrics(task.to_metres(samples), ref, task.tcp_offset))
+    return mean_over_objects(per_object)
+
+
+def evaluate_pose_acronym(meta, device, num_samples=256, num_steps=100, cfg_scale=3.0,
+                          eval_seed=0, method='euler', cfg_interval=None,
+                          level='heldout_grasps', objects_per_batch=16):
+    """Pose-recreation metrics of an ACRONYM model on one held-out level: num_samples grasps
+    of each of the level's fixed evaluation objects, each object scored against its own
+    held-out real grasps."""
+    cfg_scale = effective_cfg_scale(meta, cfg_scale)
+    config = OmegaConf.load(_config_path_for(meta["path"]))
+    model_config = OmegaConf.to_container(config.model, resolve=True)
+    conditional = meta['prefix'] == 'cond_'
+    model, _ = load_pose_model(str(meta["path"]), device=device, model_config=model_config,
+                               conditional=conditional)
+    task = _acronym_task(config, device)
+    _check_level(task, level)
+    objects = task.eval_objects(level)
+    torch.manual_seed(eval_seed)
+
+    finals, trajectories = [], []
+    for i in range(0, len(objects), objects_per_batch):
+        chunk = torch.tensor(objects[i:i + objects_per_batch], device=device)
+        n = len(chunk) * num_samples
+        x0 = convert_twist_to_pose(task.sample_start(n, device=device), dt=1.0,
+                                   return_representation='quat')
+        if conditional:
+            traj = model.inference(x0, task.obs(chunk.repeat_interleave(num_samples)),
+                                   num_steps=num_steps, return_trajectory=True,
+                                   cfg_scale=cfg_scale, method=method, cfg_interval=cfg_interval)
+        else:
+            traj = model.inference(x0, num_steps=num_steps, return_trajectory=True, method=method)
+        finals += list(traj[:, -1].split(num_samples))
+        trajectories.append(traj)
+    row = {
+        'task': 'pose', 'variant': variant_name(meta), 'conditional': conditional,
+        'ot': meta['ot'] == '_OT', 'pairing': SUFFIX_PAIRING[meta['ot']],
+        'cfg': meta['cfg'] == '_CFG', 'cfg_scale_at_inference': cfg_scale,
+        'num_steps': num_steps, 'num_samples': num_samples, 'num_objects': len(objects),
+        'level': level, 'epoch': meta['epoch'], **sampler_columns(num_steps, method, cfg_interval),
+    }
+    row.update(_acronym_metrics(task, objects, finals, level))
+    row['path_straightness'], row['transport_cost'] = path_straightness(torch.cat(trajectories))
+    return row
+
+
+def evaluate_pose_acronym_reference(config, epoch, device, num_samples=256, level='heldout_grasps'):
+    """Real grasps scored like the models (each object's floor set against its reference
+    set): the floor of every ACRONYM metric."""
+    task = _acronym_task(config, device)
+    _check_level(task, level)
+    objects = task.eval_objects(level)
+    floors = [task.reference_and_floor(obj, level, num_samples)[1] for obj in objects]
+    # the floor sets are in metres; the metrics take pos_scale units
+    floors = [torch.cat([f[:, :3] / task.pos_scale, f[:, 3:]], -1) for f in floors]
+    row = {'task': 'pose', 'variant': 'data', 'epoch': epoch, 'num_samples': num_samples,
+           'num_objects': len(objects), 'level': level, 'git_commit': _commit()}
+    row.update(_acronym_metrics(task, objects, floors, level))
+    return row
+
+
 def _commit():
     return git_commit()
 
 
 def evaluate(meta, device, classifier, **kwargs):
     """Run the task's evaluator. Returns None for MNIST when no classifier is loaded."""
+    level = kwargs.pop('level', 'heldout_grasps')
     if meta['task'] == 'pose':
         config = OmegaConf.load(_config_path_for(meta['path']))
-        if config.training.get('task_type') == 'continuous':
+        task_type = config.training.get('task_type')
+        if task_type == 'acronym':
+            row = evaluate_pose_acronym(meta, device, level=level, **kwargs)
+        elif task_type == 'continuous':
             row = evaluate_pose_continuous(meta, device, **kwargs)
         else:
             row = evaluate_pose(meta, device, **kwargs)
@@ -529,6 +616,9 @@ def main():
                         help='Apply guidance only at flow times LO <= t < HI')
     parser.add_argument('--eval_seed', type=int, default=0,
                         help='Seed for the sampling noise, shared across all variants')
+    parser.add_argument('--level', type=str, default='heldout_grasps', choices=tuple(LEVELS),
+                        help='ACRONYM tasks: the held-out level to score (--num_samples is then '
+                             'per object)')
     parser.add_argument('--output', type=str, default='experiments/results/metrics.csv')
     args = parser.parse_args()
 
@@ -551,7 +641,7 @@ def main():
             row = evaluate(meta, device, classifier,
                            num_samples=args.num_samples, num_steps=args.num_steps,
                            cfg_scale=args.cfg_scale, eval_seed=args.eval_seed,
-                           method=args.method, cfg_interval=args.cfg_interval)
+                           method=args.method, cfg_interval=args.cfg_interval, level=args.level)
         except Exception as e:
             print(f"ERROR evaluating {tag}: {e}")
             continue
@@ -566,9 +656,14 @@ def main():
         print("\n=== Scoring real goal samples (the 'data' reference row) ===")
         # A conditional run's config also carries the conditions, for the one-token metrics.
         source = next((m for m in pose_metas if m['prefix'] == 'cond_'), pose_metas[0])
-        rows.append(evaluate_pose_reference(_config_path_for(source['path']),
-                                            max(m['epoch'] for m in pose_metas), device,
-                                            num_samples=args.num_samples))
+        config = OmegaConf.load(_config_path_for(source['path']))
+        epoch = max(m['epoch'] for m in pose_metas)
+        if config.training.get('task_type') == 'acronym':
+            rows.append(evaluate_pose_acronym_reference(config, epoch, device,
+                                                        args.num_samples, args.level))
+        else:
+            rows.append(evaluate_pose_reference(_config_path_for(source['path']), epoch, device,
+                                                num_samples=args.num_samples))
 
     write_csv(rows, args.output)
 
