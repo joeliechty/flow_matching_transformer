@@ -48,6 +48,7 @@ METRICS = {
     'precision_1cm': ('Samples within 1 cm of a real grasp', 'higher is better'),
     'precision_2cm': ('Samples within 2 cm of a real grasp', 'higher is better'),
     'one_nna': ('1-NN two-sample accuracy', '0.5 = indistinguishable from data'),
+    'energy_distance_median': ('Energy distance, median object (cm)', 'lower is better; data ≈ 0'),
     'class_accuracy': ('Class accuracy', 'higher is better'),
     'class_marginal_kl': ('Class marginal KL', 'lower is better'),
 }

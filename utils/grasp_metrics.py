@@ -113,5 +113,9 @@ RECREATION_METRICS = ('energy_distance', 'recreation_err', 'fidelity_err',
 
 
 def mean_over_objects(per_object):
-    """Unweighted mean of each metric over a list of per-object metric dicts."""
-    return {k: sum(m[k] for m in per_object) / len(per_object) for k in per_object[0]}
+    """Unweighted mean of each metric over a list of per-object metric dicts, plus the median
+    energy distance (energy_distance_median): a few objects a model fails on outright (energy
+    distance in the tens of cm on unseen tall objects) can dominate the mean."""
+    out = {k: sum(m[k] for m in per_object) / len(per_object) for k in per_object[0]}
+    out['energy_distance_median'] = float(torch.tensor([m['energy_distance'] for m in per_object]).median())
+    return out
