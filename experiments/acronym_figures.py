@@ -241,6 +241,37 @@ def fig_steps(plt, out, part):
     plt.close(fig)
 
 
+LEVEL_COLORS = {'heldout_grasps': BLUE, 'heldout_objects': ORANGE, 'heldout_categories': '#1baf7a'}
+
+
+def fig_levels(plt, out, part='points'):
+    """Generalisation: the point-cloud baseline on each held-out level, against the id baseline
+    on held-out grasps (ids can't condition on unseen objects)."""
+    base = baseline_rule(part)[0]
+    metrics = ('one_nna', 'recreation_err', 'fidelity_err')
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5.2))
+    for level, color in LEVEL_COLORS.items():
+        for ax, metric in zip(axes, metrics):
+            vals = np.stack([values(part, base, metric, st, level=level) for st in STEPS], 1)
+            _band(ax, STEPS, vals, color, f'point clouds: {LEVEL_TITLE[level]}')
+            ax.axhline(data_value(part, metric, level=level), color=color, ls=':', lw=1.2, alpha=0.8)
+    if run_dir('ids').exists():
+        ids_base = baseline_rule('ids')[0]
+        for ax, metric in zip(axes, metrics):
+            vals = np.stack([values('ids', ids_base, metric, st) for st in STEPS], 1)
+            _band(ax, STEPS, vals, INK2, 'ids: held-out grasps of training objects', ls='--', marker='s')
+    for ax, metric in zip(axes, metrics):
+        _steps_axis(ax)
+        ax.set_ylabel(METRICS[metric])
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=10, bbox_to_anchor=(0.5, -0.04))
+    fig.suptitle(f'Generalisation, epoch {EPOCH}: the per-object OT baselines (points at M, ids at L) on each '
+                 'held-out level; dotted = real data of that level; mean over seeds', y=1.0)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    save(fig, out, 'generalisation.png')
+    plt.close(fig)
+
+
 ABLATION_AXES = [  # (title, [(arm, label)]); arm None = the baseline itself
     ('Condition pathway', [(None, 'cross-attention (baseline)'), ('cond_adaln', 'adaLN'),
                            ('cond_joint', 'joint attention')]),
@@ -381,7 +412,8 @@ def fig_training(plt, out, part):
     plt.close(fig)
 
 
-FIGURES = {'size': fig_size, 'overview': fig_overview, 'steps': fig_steps, 'ablations': fig_ablations,
+FIGURES = {'size': fig_size, 'overview': fig_overview, 'steps': fig_steps, 'levels': fig_levels,
+           'ablations': fig_ablations,
            'solvers': fig_solvers, 'guidance': fig_guidance, 'training': fig_training}
 
 
@@ -405,6 +437,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     for name, fig in FIGURES.items():
         if args.only in (None, name):
+            if name == 'levels' and args.part != 'points':
+                continue
             try:
                 fig(plt, out, args.part)
             except (FileNotFoundError, ValueError, IndexError) as e:
