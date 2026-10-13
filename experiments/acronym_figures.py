@@ -40,6 +40,7 @@ STEPS = (1, 2, 3, 5, 9, 20, 50, 100)
 SIZES = [('S', '256 wide, 6 blocks'), ('M', '384 wide, 8 blocks'), ('L', '512 wide, 12 blocks'),
          ('XL', '768 wide, 16 blocks')]
 PRIMARY = 'one_nna'
+GUIDANCE = 3.0  # the scale evaluate_all samples CFG-trained models at
 METRICS = {  # metric -> axis label
     'one_nna': '1-NN accuracy vs. held-out grasps\n(0.5 = indistinguishable), lower is better',
     'recreation_err': 'recreation error (cm)\nreal grasp → nearest sample',
@@ -57,6 +58,14 @@ VARIANTS = {  # variant -> (label, colour, linestyle, marker); dashed = CFG-trai
     'uncond_NOOT': ('unconditional, random', '#008300', ':', 'v'),
 }
 SIZE_COLORS = ('#eda100', ORANGE, BLUE, '#1baf7a')
+SHORT = {'cond_OT_NOCFG': 'per-object\nOT', 'cond_NOOT_NOCFG': 'random\npairing', 'cond_GOT_NOCFG': 'global\nOT',
+         'cond_OT_CFG': 'per-object\nOT + CFG', 'cond_NOOT_CFG': 'random\n+ CFG', 'cond_GOT_CFG': 'global\nOT + CFG',
+         'uncond_OT': 'uncond.\nOT', 'uncond_NOOT': 'uncond.\nrandom'}
+
+
+def heading(part):
+    title = PARTS[part][2]
+    return title[0].upper() + title[1:]
 
 
 def read(path):
@@ -156,7 +165,7 @@ def fig_size(plt, out, part, variant='cond_OT_NOCFG'):
             vals = np.stack([values(part, variant, metric, s, 'size', size) for s in STEPS], 1)
             _band(ax, STEPS, vals, color, label)
     for ax, metric in zip(axes, metrics):
-        data_line(ax, data_value(part, metric, 'size', chosen))
+        data_line(ax, data_value(part, metric, 'size', chosen), where='left')
         _steps_axis(ax)
         ax.set_ylabel(METRICS[metric])
     axes[0].set_ylim(0.48, None)
@@ -195,14 +204,14 @@ def fig_overview(plt, out, part):
                        facecolors=SURFACE if ls == '--' else color, edgecolors=color, linewidths=1.5, zorder=3)
             ax.plot([i - 0.25, i + 0.25], [vals.mean()] * 2, color=color, lw=2.5, zorder=4)
             ax.text(i, vals.max() + 0.01, f'{vals.mean():.3f}', ha='center', va='bottom', fontsize=9, color=INK2)
-        data_line(ax, data_value(part, PRIMARY), where='left')
+        data_line(ax, data_value(part, PRIMARY))
         ax.set_xticks(range(len(variants)))
-        ax.set_xticklabels([VARIANTS[v][0].replace(' + ', '\n+ ').replace(', ', ',\n') for v in variants], fontsize=9)
+        ax.set_xticklabels([SHORT[v] for v in variants], fontsize=9)
         ax.grid(axis='x', visible=False)
         ax.set_title(f'{steps} Euler step{"s" if steps > 1 else ""}')
     axes[0].set_ylabel(METRICS[PRIMARY])
-    fig.suptitle(f'{PARTS[part][2].capitalize()}, epoch {EPOCH}: {LEVEL_TITLE[PARTS[part][1]]}; '
-                 'one dot per seed, bar = mean (CFG-trained models sampled unguided)', y=1.0)
+    fig.suptitle(f'{heading(part)}, epoch {EPOCH}: {LEVEL_TITLE[PARTS[part][1]]}; '
+                 f'one dot per seed, bar = mean (CFG-trained models sampled at guidance {GUIDANCE:g})', y=1.0)
     fig.tight_layout()
     save(fig, out, f'{part}_overview.png')
     plt.close(fig)
@@ -220,13 +229,14 @@ def fig_steps(plt, out, part):
             vals = np.stack([values(part, v, metric, s) for s in STEPS], 1)
             _band(ax, STEPS, vals, color, label, ls=ls, marker=marker)
     for ax, metric in zip(axes, metrics):
-        data_line(ax, data_value(part, metric))
+        data_line(ax, data_value(part, metric), where='left')
         _steps_axis(ax)
         ax.set_ylabel(METRICS[metric])
-    axes[0].legend(fontsize=9.5, loc='upper right')
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=len(labels), fontsize=10, bbox_to_anchor=(0.5, -0.04))
     fig.suptitle(f'Sampling steps, {PARTS[part][2]}, epoch {EPOCH}: {LEVEL_TITLE[PARTS[part][1]]}; '
-                 'mean over seeds, shading = seed range', y=1.0)
-    fig.tight_layout()
+                 f'mean over seeds, shading = seed range (CFG-trained models at guidance {GUIDANCE:g})', y=1.0)
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
     save(fig, out, f'{part}_steps_sweep.png')
     plt.close(fig)
 
@@ -397,7 +407,7 @@ def main():
         if args.only in (None, name):
             try:
                 fig(plt, out, args.part)
-            except (FileNotFoundError, ValueError) as e:
+            except (FileNotFoundError, ValueError, IndexError) as e:
                 print(f'skip {name}: {e}')
 
 
