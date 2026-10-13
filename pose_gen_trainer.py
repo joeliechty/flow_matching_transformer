@@ -270,6 +270,10 @@ if __name__ == "__main__":
     ModelClass = ConditionalFlowMatchingTransformerModel if args.conditional else FlowMatchingTransformerModel
     model = ModelClass(**OmegaConf.to_container(config.model)).to(device)
     model.set_normalizer(**config.training.normalizer)
+    # point-cloud joint attention puts 64 patch tokens in every sample's sequence: checkpoint
+    # the blocks so it fits (memory only)
+    model.grad_checkpoint = (config.model.get('cond_mode') == 'joint'
+                             and config.model.get('obs_encoder') == 'point_patch')
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print()
     

@@ -9,6 +9,7 @@ velocity with Euler, midpoint or Heun steps.
 """
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 import torch.nn.functional as F
 
 from utils.tf_utils import add_twist_to_pose, _quat_to_ortho6d
@@ -153,9 +154,17 @@ class FlowTransformerBase(nn.Module):
             phase = phase.squeeze(-1)
         return self.phase_emb(phase)
 
+    # Recompute each block's activations in the backward pass instead of storing them (memory
+    # only; set by the trainer for point-cloud joint attention, whose 64 patch tokens join every
+    # sample's sequence)
+    grad_checkpoint = False
+
     def _trunk(self, h, c, context=None):
         for block in self.blocks:
-            h = block(h, c, context=context)
+            if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+                h = torch.utils.checkpoint.checkpoint(block, h, c, context, use_reentrant=False)
+            else:
+                h = block(h, c, context=context)
         return h
 
     def _denormalize(self, out):

@@ -119,6 +119,21 @@ class ConditionEncoderTest(unittest.TestCase):
                 a, b = model._predict(x, shared, t, m), model._predict(x, per_sample, t, m)
                 self.assertTrue(torch.allclose(a, b, atol=1e-5), cond_mode)
 
+    def test_checkpointing_changes_memory_not_gradients(self):
+        torch.manual_seed(0)
+        x = torch.cat([torch.randn(4, 1, 3), random_rotations(4).unsqueeze(1)], -1)
+        t, clouds, v = torch.rand(4), torch.randn(4, 256, 3), torch.randn(4, 1, 6)
+        model = _model('point_patch', 'joint', num_obs_tokens=8, obs_dim=3)
+        for p in model.parameters():
+            torch.nn.init.normal_(p, std=0.05)
+        grads = []
+        for ckpt in (False, True):
+            model.grad_checkpoint = ckpt
+            model.zero_grad()
+            model.cfm_loss(x, t, v, clouds).backward()
+            grads.append(torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]))
+        self.assertTrue(torch.allclose(grads[0], grads[1], atol=1e-6))
+
     def test_identical_clouds_are_encoded_once(self):
         model = _model('point_patch', 'cross_attn', num_obs_tokens=8, obs_dim=3)
         cloud = torch.randn(2, 256, 3)
