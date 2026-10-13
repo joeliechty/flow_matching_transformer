@@ -5,6 +5,14 @@
       ShapeNet id, scale, successful grasp count and size of each object.
   python -I prepare_acronym.py build --dataset configs/datasets/acronym_10cat.yaml [--mesh_root DIR]
       Pick the dataset's objects, split them and write its cache (the file's `cache` path).
+  python -I prepare_acronym.py watertight --dataset configs/datasets/acronym_10cat.yaml \
+          --obj_dir <ShapeNetSem>/models-OBJ/models --manifold_dir <Manifold>/build
+      Make watertight meshes of the cache's objects with Manifold [Huang et al. 2018], into
+      data/acronym/meshes/<category>/<id>.obj; then rebuild with --mesh_root data/acronym for
+      point clouds. ACRONYM ran `manifold -s` and then `simplify -m -r 0.02`; here `-s` (sharp
+      features) leaves garbage vertices in ~28% of these meshes and `simplify` aborts or hangs on
+      them, while plain `manifold` is closer to ACRONYM's own meshes on the two example objects
+      (0.8 and 1.3 mm mean chamfer, against 1.3 and 2.3 mm with -s, simplified or not).
 
 Grasps are kept only if the object stayed in the gripper (`object_in_gripper`). Each is stored
 as a pose (x, y, z, qw, qx, qy, qz) in metres in the object frame: the mesh frame shifted to the
@@ -15,6 +23,9 @@ approach axis z. Point clouds need the ShapeNetSem meshes (--mesh_root).
 import argparse
 import csv
 import os
+import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 import h5py
 import numpy as np
@@ -151,7 +162,8 @@ def build_cache(dataset, mesh_root=None):
     }
     path = os.path.join(REPO, data['cache'])
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(cache, path)
+    torch.save(cache, path + '.tmp')
+    os.replace(path + '.tmp', path)  # readers never see a half-written cache
     counts = {name: int((split == code).sum()) for name, code in
               [('train', TRAIN), *LEVELS.items()]}
     print(f'{len(objects)} objects, {counts}, pos_scale {cache["pos_scale"]:.4f} m -> {path}')
@@ -162,24 +174,80 @@ def sample_point_clouds(objects, mesh_root, data):
     import trimesh
     R, P = data['point_samplings'], data['points_per_cloud']
     clouds = np.zeros((len(objects), R, P, 3), dtype=np.float32)
+    offsets = []
     for i, obj in enumerate(objects):
         mesh = trimesh.load(os.path.join(mesh_root, obj['mesh_file']), force='mesh')
         mesh.apply_scale(obj['scale'])
+        # alignment check: the mesh's centroid against ACRONYM's centre of mass
+        offsets.append(np.linalg.norm(mesh.centroid - np.asarray(obj['com'])))
+        obj['centroid_offset_mm'] = float(1000 * offsets[-1])
         for r in range(R):
             pts, _ = trimesh.sample.sample_surface(mesh, P, seed=r)
             clouds[i, r] = pts - np.asarray(obj['com'])
+    offsets = 1000 * np.array(offsets)
+    print(f'mesh centroid vs ACRONYM centre of mass: median {np.median(offsets):.1f} mm, '
+          f'95th percentile {np.percentile(offsets, 95):.1f} mm, max {offsets.max():.1f} mm')
     return torch.from_numpy(clouds)
+
+
+def _within(mesh_file, source_file, margin=0.1):
+    """True if every vertex of mesh_file is finite and inside source_file's bounding box grown by
+    `margin` of its size."""
+    import trimesh
+    lo, hi = trimesh.load(source_file, force='mesh').bounds
+    v = trimesh.load(mesh_file, force='mesh').vertices
+    pad = margin * (hi - lo).max()
+    return bool(np.isfinite(v).all() and (v >= lo - pad).all() and (v <= hi + pad).all())
+
+
+def make_watertight(dataset, obj_dir, manifold_dir, workers=8, timeout=600):
+    """Watertight copies of the cache's meshes under data/acronym/<mesh_file>."""
+    with open(dataset) as f:
+        data = yaml.safe_load(f)
+    objects = torch.load(os.path.join(REPO, data['cache']), weights_only=False)['objects']
+    root = os.path.join(REPO, 'data', 'acronym')
+
+    def one(obj):
+        out = os.path.join(root, obj['mesh_file'])
+        if os.path.exists(out):
+            return None
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            watertight = os.path.join(tmp, 'watertight.obj')
+            source = os.path.join(obj_dir, obj['shapenet_id'] + '.obj')
+            cmd = [os.path.join(manifold_dir, 'manifold'), source, watertight]
+            try:
+                done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return f"{obj['file']}: manifold timed out"
+            if done.returncode != 0 or not os.path.exists(watertight):
+                return f"{obj['file']}: manifold failed: {done.stderr[-200:]}"
+            if not _within(watertight, source):
+                return f"{obj['file']}: manifold output has vertices far outside the model"
+            os.replace(watertight, out)
+        return None
+
+    with ThreadPoolExecutor(workers) as pool:
+        errors = [e for e in pool.map(one, objects) if e]
+    print(f'{len(objects) - len(errors)} watertight meshes under {root}/meshes')
+    for e in errors:
+        print('  ' + e)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    parser.add_argument('stage', choices=('index', 'build'))
+    parser.add_argument('stage', choices=('index', 'build', 'watertight'))
     parser.add_argument('--dataset', type=str, help='build: the dataset file (configs/datasets/)')
     parser.add_argument('--mesh_root', type=str, default=None,
                         help='build: folder holding meshes/<category>/<id>.obj (watertight); '
                              'without it the cache has no point clouds')
+    parser.add_argument('--obj_dir', type=str, help="watertight: ShapeNetSem's models-OBJ/models folder")
+    parser.add_argument('--manifold_dir', type=str, help='watertight: the folder holding the built '
+                                                          'manifold and simplify executables')
     args = parser.parse_args()
     if args.stage == 'index':
         build_index()
+    elif args.stage == 'watertight':
+        make_watertight(args.dataset, args.obj_dir, args.manifold_dir)
     else:
         build_cache(args.dataset, args.mesh_root)

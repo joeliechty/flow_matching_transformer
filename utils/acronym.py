@@ -86,8 +86,10 @@ class AcronymGraspTask:
         self.objects = cache['objects']
         self.categories = cache['categories']
         self.category_ids = torch.tensor([o['category_id'] for o in self.objects], device=device)
+        # point clouds condition the 'points' models; the others keep them on the CPU for figures
         points = cache.get('points')
-        self.points = points.to(device) / self.pos_scale if points is not None else None
+        self.points = (points.to(device if self.condition == 'points' else 'cpu') / self.pos_scale
+                       if points is not None else None)
         if self.condition == 'points' and self.points is None:
             raise ValueError(f"{data['cache']} has no point clouds: build it with "
                              "prepare_acronym.py build --mesh_root <meshes>")
