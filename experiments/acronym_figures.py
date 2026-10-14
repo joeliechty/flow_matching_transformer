@@ -291,26 +291,29 @@ GUIDANCE_SCALES = (1.0, 1.5, 3.0)
 
 
 def fig_ablations(plt, out, part):
-    """Single-axis ablations of the baseline: the primary metric against sampling steps."""
+    """Single-axis ablations of the baseline: the primary metric against sampling steps, one
+    row per held-out level (point clouds: unseen objects, then seen objects' held-out grasps)."""
     base, _ = baseline_rule(part)
     axes_present = [(t, arms) for t, arms in ABLATION_AXES
                     if any(a and run_dir(part, 'ablate', a).exists() for a, _ in arms)]
     if not axes_present:
         raise FileNotFoundError('no ablation results')
-    fig, axes = plt.subplots(1, len(axes_present), figsize=(5.2 * len(axes_present), 5), sharey=True,
-                             squeeze=False)
-    for ax, (title, arms) in zip(axes[0], axes_present):
-        for (arm, label), color, marker in zip(arms, ARM_COLORS, ARM_MARKERS):
-            sub = () if arm is None else ('ablate', arm)
-            if arm is not None and not run_dir(part, *sub).exists():
-                continue
-            vals = np.stack([values(part, base, PRIMARY, s, *sub) for s in STEPS], 1)
-            _band(ax, STEPS, vals, color, label, ls='--' if arm is None else '-', marker=marker)
-        data_line(ax, data_value(part, PRIMARY))
-        _steps_axis(ax)
-        ax.set_title(title)
-        ax.legend(fontsize=9, loc='upper right')
-    axes[0, 0].set_ylabel(METRICS[PRIMARY])
+    levels = [PARTS[part][1]] + (['heldout_grasps'] if part == 'points' else [])
+    fig, axes = plt.subplots(len(levels), len(axes_present), figsize=(5.2 * len(axes_present), 4.8 * len(levels)),
+                             sharey='row', squeeze=False)
+    for r, level in enumerate(levels):
+        for ax, (title, arms) in zip(axes[r], axes_present):
+            for (arm, label), color, marker in zip(arms, ARM_COLORS, ARM_MARKERS):
+                sub = () if arm is None else ('ablate', arm)
+                if arm is not None and not run_dir(part, *sub, level=level).exists():
+                    continue
+                vals = np.stack([values(part, base, PRIMARY, s, *sub, level=level) for s in STEPS], 1)
+                _band(ax, STEPS, vals, color, label, ls='--' if arm is None else '-', marker=marker)
+            data_line(ax, data_value(part, PRIMARY, level=level), where='left')
+            _steps_axis(ax)
+            ax.set_title(f'{title}\n{LEVEL_TITLE[level]}', fontsize=11)
+            ax.legend(fontsize=9, loc='upper right')
+        axes[r, 0].set_ylabel(METRICS[PRIMARY])
     fig.suptitle(f'Single-axis ablations, {PARTS[part][2]}, epoch {EPOCH}: each arm changes one choice of '
                  f'the baseline ({VARIANTS[base][0]}); mean over seeds, shading = seed range', y=1.0)
     fig.tight_layout()
