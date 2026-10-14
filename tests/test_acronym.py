@@ -107,17 +107,26 @@ class ConditionEncoderTest(unittest.TestCase):
         # with and without nulled samples, in every pathway
         torch.manual_seed(0)
         x = torch.cat([torch.randn(8, 1, 3), random_rotations(8).unsqueeze(1)], -1)
-        t, clouds = torch.rand(8), torch.randn(2, 256, 3).repeat_interleave(4, dim=0)
+        t = torch.rand(8)
         mask = torch.tensor([0, 1, 0, 0, 1, 0, 0, 0], dtype=torch.bool).unsqueeze(1).expand(8, 8)
-        for cond_mode in ('adaln', 'cross_attn', 'joint'):
-            model = _model('point_patch', cond_mode, num_obs_tokens=8, obs_dim=3)
-            for p in model.parameters():  # leave the zero-initialised start, so the condition matters
-                torch.nn.init.normal_(p, std=0.05)
-            shared = model.encode_obs(clouds)
-            per_sample = shared.unique[shared.index]
-            for m in (None, mask):
-                a, b = model._predict(x, shared, t, m), model._predict(x, per_sample, t, m)
-                self.assertTrue(torch.allclose(a, b, atol=1e-5), cond_mode)
+        # 2 clouds 4 times each (scores against every context), and 8 distinct clouds with a
+        # head size of 2 (keys and values gathered per sample)
+        for heads, clouds in ((4, torch.randn(2, 256, 3).repeat_interleave(4, dim=0)),
+                              (16, torch.randn(8, 256, 3))):
+            for cond_mode in ('adaln', 'cross_attn', 'joint'):
+                model = _model('point_patch', cond_mode, num_obs_tokens=8, obs_dim=3)
+                if heads != 4:
+                    model = ConditionalFlowMatchingTransformerModel(
+                        input_dim=7, output_dim=6, hidden_dim=32, num_layers=2, num_heads=heads,
+                        phase_dim=32, max_seq_len=1, cond_mode=cond_mode, obs_encoder='point_patch',
+                        num_obs_tokens=8, obs_dim=3)
+                for p in model.parameters():  # leave the zero-initialised start, so the condition matters
+                    torch.nn.init.normal_(p, std=0.05)
+                shared = model.encode_obs(clouds)
+                per_sample = shared.unique[shared.index]
+                for m in (None, mask):
+                    a, b = model._predict(x, shared, t, m), model._predict(x, per_sample, t, m)
+                    self.assertTrue(torch.allclose(a, b, atol=1e-5), (heads, cond_mode))
 
     def test_checkpointing_changes_memory_not_gradients(self):
         torch.manual_seed(0)

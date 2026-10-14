@@ -94,14 +94,19 @@ class CrossAttention(nn.Module):
         return self.dropout(self.proj(out))
 
     def _shared_context(self, x, contexts, index):
-        """Attention to contexts[index[b]] with the keys and values computed once per context:
-        scores and outputs are taken against every context and the sample's one picked out,
-        which is cheap for few contexts and keeps no per-sample keys or values."""
+        """Attention to contexts[index[b]] with the keys and values computed once per context.
+        With few contexts, scores and outputs are taken against every context and the sample's
+        one picked out, which keeps no per-sample keys or values; with many (more than twice the
+        head size, e.g. 256 objects in a batch), each sample's keys and values are gathered."""
         B, N, C = x.shape
         U, M, _ = contexts.shape
         h, d = self.num_heads, self.head_dim
         q = self.q_norm(self.q(x).reshape(B, N, h, d).transpose(1, 2))         # [B, h, N, d]
         k, v = self.kv(contexts).reshape(U, M, 2, h, d).permute(2, 0, 3, 1, 4)  # [U, h, M, d]
+        if U > 2 * d:
+            out = F.scaled_dot_product_attention(q, self.k_norm(k)[index], v[index],
+                                                 dropout_p=self.attn_dropout if self.training else 0.0)
+            return self.dropout(self.proj(out.transpose(1, 2).reshape(B, N, C)))
         pick = index.view(B, 1, 1, 1, 1)
         scores = torch.einsum('bhnd,uhmd->bhnum', q, self.k_norm(k)) * d ** -0.5
         attn = scores.gather(3, pick.expand(B, h, N, 1, M)).squeeze(3).softmax(-1)
