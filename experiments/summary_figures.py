@@ -794,6 +794,28 @@ def fig_sensitivity(plt, out, task='pose_continuous_goals', variant='cond_C2OTFI
 
 # -- Part 3: the current model and training framework ---------------------------------------
 
+# Energy distance is unbiased, so at the data floor it scatters around 0 and can fall below it (the
+# rerun with the geodesic-twist fix reaches the floor at 100 steps). The current-framework figures use a
+# symmetric-log axis: log above ED_LINEAR, linear through 0.
+ED_LINEAR = 1e-3
+
+
+def ed_axis(ax):
+    from matplotlib.ticker import SymmetricalLogLocator
+    ax.set_yscale('symlog', linthresh=ED_LINEAR, linscale=0.5)
+    ax.yaxis.set_major_locator(SymmetricalLogLocator(base=10, linthresh=ED_LINEAR, subs=[1.0, 2.0, 5.0]))
+    ax.axhline(0, color=GRID, lw=1.0, zorder=0)
+
+
+def ed_above(v):
+    """A y position just above v on the symmetric-log energy-distance axis."""
+    return v * 1.35 if v > ED_LINEAR else v + 0.25 * ED_LINEAR
+
+
+def ed_label(v):
+    return f'{v:.4f}' if abs(v) < ED_LINEAR else f'{v:.3g}'
+
+
 SOTA_TASKS = [  # (results folder, panel title)
     ('sota/pose_corners_3sigma', 'Discrete conditions (clean tokens)'),
     ('sota/pose_corners_3sigma_jitter', 'Continuous conditions (noisy tokens)'),
@@ -880,16 +902,16 @@ def fig_sota_framework(plt, out, task=None):
             x, vals = curve(t, v, 'energy_distance', 100)
             axes[2].fill_between(x, vals.min(0), vals.max(0), color=color, alpha=0.08, lw=0)
             axes[2].plot(x, vals.mean(0), **kw)
-    data_line(axes[0], data_value(task, 'energy_distance'))
+    data_line(axes[0], data_value(task, 'energy_distance'), 'one real draw')
     data_line(axes[1], data_value(task, 'spread_ratio_trans'))
-    data_line(axes[2], data_value(task, 'energy_distance'))
+    data_line(axes[2], data_value(task, 'energy_distance'), 'one real draw')
     for ax in axes[:2]:
         ax.set_xscale('log'); ax.set_xticks(STEPS); ax.set_xticklabels([str(s) for s in STEPS]); ax.minorticks_off()
         ax.set_xlabel('Euler steps at sampling (log)')
-    axes[0].set_yscale('log'); axes[2].set_yscale('log')
-    axes[0].set_ylabel('energy distance (log), lower is better')
+    ed_axis(axes[0]); ed_axis(axes[2])
+    axes[0].set_ylabel('energy distance (log above 10⁻³), lower is better')
     axes[1].set_ylabel('position spread ÷ real data')
-    axes[2].set_ylabel('energy distance at 100 steps (log)')
+    axes[2].set_ylabel('energy distance at 100 steps (log above 10⁻³)')
     axes[2].set_xlabel('training epoch')
     axes[0].set_title('Sampling steps, epoch 100'); axes[1].set_title('Spread around the mode, epoch 100')
     axes[2].set_title('Training')
@@ -918,10 +940,10 @@ def fig_sota_overview(plt, out):
                 ax.scatter(i + np.linspace(-0.12, 0.12, len(vals)), vals, s=36, marker=st['marker'],
                            facecolors=st['mfc'], edgecolors=st['color'], linewidths=1.5, zorder=3)
                 ax.plot([i - 0.25, i + 0.25], [vals.mean()] * 2, color=st['color'], lw=2.5, zorder=4)
-                ax.text(i, vals.max() * 1.35, f'{vals.mean():.3g}', ha='center', va='bottom', fontsize=9,
+                ax.text(i, ed_above(vals.max()), ed_label(vals.mean()), ha='center', va='bottom', fontsize=9,
                         color=INK2)
             data_line(ax, data_value(task, 'energy_distance'), where='left')
-            ax.set_yscale('log')
+            ed_axis(ax)
             ax.set_ylim(None, ax.get_ylim()[1] * 2.5)
             ax.set_xticks(range(len(variants)))
             ax.set_xticklabels([LABEL[v].replace(' (', '\n(').replace(', ', '\n', 1) if is_discrete(task)
@@ -930,7 +952,7 @@ def fig_sota_overview(plt, out):
             ax.grid(axis='x', visible=False)
             ax.set_title(f'{title}\n{steps} sampling step{"s" if steps > 1 else ""}', fontsize=11)
             if c == 0:
-                ax.set_ylabel('energy distance to real data (log)\nlower is better')
+                ax.set_ylabel('energy distance to real data (log above 10⁻³)\nlower is better')
     fig.suptitle(f'Every mode within 3σ, current framework, epoch {EPOCH}: one dot per seed, bar = mean '
                  f'(CFG models at guidance {GUIDANCE:g})', y=1.0)
     fig.tight_layout()
@@ -949,13 +971,13 @@ def fig_sota_steps(plt, out):
             ax.fill_between(STEPS, vals.min(0), vals.max(0), color=st['color'], alpha=0.10, lw=0)
             ax.plot(STEPS, vals.mean(0), color=st['color'], ls=st['ls'], marker=st['marker'], mfc=st['mfc'],
                     mec=st['color'], lw=1.8, ms=6, label=st['label'])
-        data_line(ax, data_value(task, 'energy_distance'))
-        ax.set_xscale('log'); ax.set_yscale('log')
+        data_line(ax, data_value(task, 'energy_distance'), 'one real draw')
+        ax.set_xscale('log'); ed_axis(ax)
         ax.set_xticks(STEPS); ax.set_xticklabels([str(s) for s in STEPS]); ax.minorticks_off()
         ax.set_xlabel('Euler steps at sampling (log)')
         ax.set_title(title)
         ax.legend(fontsize=9, loc='lower left')
-    axes[0].set_ylabel('energy distance (log), lower is better')
+    axes[0].set_ylabel('energy distance (log above 10⁻³), lower is better')
     fig.suptitle(f'Sampling steps, current framework, epoch {EPOCH}: mean over {len(SEEDS)} seeds, shading = seed range',
                  y=1.0)
     fig.tight_layout()
@@ -975,13 +997,13 @@ def fig_sota_ablations(plt, out):
                 vals = np.stack([per_seed(rows, base, 'energy_distance', num_steps=s) for s in STEPS], 1)
                 ax.fill_between(STEPS, vals.min(0), vals.max(0), color=color, alpha=0.10, lw=0)
                 ax.plot(STEPS, vals.mean(0), color=color, lw=1.8, ms=6, label=label, **st)
-            data_line(ax, data_value(task, 'energy_distance'))
-            ax.set_xscale('log'); ax.set_yscale('log')
+            data_line(ax, data_value(task, 'energy_distance'), 'one real draw')
+            ax.set_xscale('log'); ed_axis(ax)
             ax.set_xticks(STEPS); ax.set_xticklabels([str(s) for s in STEPS]); ax.minorticks_off()
             ax.set_title(f'{axis_title}\n{title}', fontsize=11)
             ax.legend(fontsize=9, loc='upper right')
             if c == 0:
-                ax.set_ylabel('energy distance (log), lower is better')
+                ax.set_ylabel('energy distance (log above 10⁻³), lower is better')
             if r == len(SOTA_TASKS) - 1:
                 ax.set_xlabel('Euler steps at sampling (log)')
     fig.suptitle(f'Single-axis ablations, epoch {EPOCH}: each arm changes one choice of the baseline '
@@ -1001,13 +1023,13 @@ def fig_sota_solvers(plt, out):
             vals = np.stack([per_seed(rows, base, 'energy_distance', method=method, nfe=n) for n in NFE], 1)
             ax.fill_between(NFE, vals.min(0), vals.max(0), color=color, alpha=0.10, lw=0)
             ax.plot(NFE, vals.mean(0), color=color, marker=marker, lw=1.8, ms=6, label=label)
-        data_line(ax, data_value(task, 'energy_distance'))
-        ax.set_xscale('log'); ax.set_yscale('log')
+        data_line(ax, data_value(task, 'energy_distance'), 'one real draw')
+        ax.set_xscale('log'); ed_axis(ax)
         ax.set_xticks(NFE); ax.set_xticklabels([str(n) for n in NFE]); ax.minorticks_off()
         ax.set_xlabel('network evaluations per sample (log)')
         ax.set_title(f"{title}\nbaseline: {vstyle(task, base)['label']}", fontsize=11)
         ax.legend(fontsize=10)
-    axes[0].set_ylabel('energy distance (log), lower is better')
+    axes[0].set_ylabel('energy distance (log above 10⁻³), lower is better')
     fig.suptitle(f'ODE solvers at equal cost, epoch {EPOCH} (mean over {len(SEEDS)} seeds, shading = seed range)', y=1.0)
     fig.tight_layout()
     save(fig, out, 'sota_solvers.png')
@@ -1034,10 +1056,10 @@ def fig_sota_guidance(plt, out):
                                               for g in GUIDANCE_SCALES[1:]], 1)
                 ax.fill_between(GUIDANCE_SCALES, vals.min(0), vals.max(0), color=color, alpha=0.10, lw=0)
                 ax.plot(GUIDANCE_SCALES, vals.mean(0), color=color, marker='o', lw=1.8, ms=6, label=label)
-            data_line(ax, data_value(task, metric))
+            data_line(ax, data_value(task, metric), 'one real draw' if metric == 'energy_distance' else 'real data')
             if metric == 'energy_distance':
-                ax.set_yscale('log')
-                ax.set_ylabel('energy distance (log), lower is better')
+                ed_axis(ax)
+                ax.set_ylabel('energy distance (log above 10⁻³), lower is better')
             else:
                 ax.set_ylabel('corner accuracy (data = ceiling;\nhigher over-separates)')
             ax.set_xticks(GUIDANCE_SCALES); ax.set_xticklabels([f'{g:g}' for g in GUIDANCE_SCALES])
@@ -1063,16 +1085,16 @@ def fig_sota_training(plt, out):
     fig, axes = plt.subplots(2, len(SOTA_TASKS), figsize=(6.8 * len(SOTA_TASKS), 8.4), sharex=True, squeeze=False)
     for c, (task, title) in enumerate(SOTA_TASKS):
         base, _ = baseline(task)
-        for r, (metric, ylabel) in enumerate((('energy_distance', 'energy distance (log), lower is better'),
+        for r, (metric, ylabel) in enumerate((('energy_distance', 'energy distance (log above 10⁻³), lower is better'),
                                                ('spread_ratio_trans', 'position spread ÷ real data'))):
             ax = axes[r, c]
             for steps, solver, label, color, marker in TRAINING_SAMPLERS:
                 x, vals = curve(task, base, metric, steps, solver)
                 ax.fill_between(x, vals.min(0), vals.max(0), color=color, alpha=0.12, lw=0)
                 ax.plot(x, vals.mean(0), color=color, marker=marker, lw=1.8, ms=6, label=label)
-            data_line(ax, data_value(task, metric))
+            data_line(ax, data_value(task, metric), 'one real draw' if metric == 'energy_distance' else 'real data')
             if metric == 'energy_distance':
-                ax.set_yscale('log')
+                ed_axis(ax)
                 ax.set_title(f"{title}\nbaseline: {vstyle(task, base)['label']}", fontsize=11)
             ax.set_ylabel(ylabel)
             if r == 1:
