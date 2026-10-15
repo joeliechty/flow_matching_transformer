@@ -802,6 +802,7 @@ OLD_FRAMEWORK = {'sota/pose_corners_3sigma': 'pose_corners_3sigma'}  # the same 
 # Phase 3's baseline candidates: conditional, no CFG; for noisy tokens neither global OT nor the
 # per-corner oracle, which uses the clean corner ids.
 BASELINE_EXCLUDE = ('cond_GOT_NOCFG', 'cond_OT_NOCFG')
+ED_FLOOR = 1e-4  # energy distance's noise level at 256 samples: the baseline rule clamps at it
 ABLATION_AXES = [  # (title, [(arm, label)]); arm None = the baseline itself
     ('Training-time density', [(None, 'uniform (baseline)'), ('t_logit_normal', 'logit-normal (SD3)'),
                                ('t_beta', 'Beta, noisy end (π0)')]),
@@ -839,14 +840,16 @@ def sota_variants(task):
 def baseline(task):
     """Phase 3's baseline variant, by the rule set before the results: among the conditional
     no-CFG candidates, the lowest mean over seeds of (log10 ED at 3 steps + log10 ED at 100) / 2.
+    Energy distance is unbiased and so can fall below 0 at the data floor (the rerun with the
+    geodesic-twist fix reaches it at 100 steps); it is clamped at ED_FLOOR, about its noise level.
     Returns (variant, {candidate: score})."""
     steps_rows, main_rows = results(task, 'steps_sweep'), results(task, 'metrics')
     scores = {}
     for v in sota_variants(task):
         if not v.endswith('_NOCFG') or (not is_discrete(task) and v in BASELINE_EXCLUDE):
             continue
-        three = np.log10(per_seed(steps_rows, v, 'energy_distance', num_steps=3))
-        hundred = np.log10(per_seed(main_rows, v, 'energy_distance'))
+        three = np.log10(np.maximum(per_seed(steps_rows, v, 'energy_distance', num_steps=3), ED_FLOOR))
+        hundred = np.log10(np.maximum(per_seed(main_rows, v, 'energy_distance'), ED_FLOOR))
         scores[v] = float(((three + hundred) / 2).mean())
     return min(scores, key=scores.get), scores
 
