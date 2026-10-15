@@ -48,6 +48,8 @@ minibatch OT, no CFG, sampled with 3–5 midpoint steps. 1-NN accuracy at 10 net
 6. **Keep the defaults for the prior and the training times.**
    - Uniform-SO(3) rotations and a Gaussian-twist prior tie.
    - Uniform t ties logit-normal and Beta.
+   - **15k steps are enough:** unseen-object quality is flat from epoch 50 of 100.
+     [Details](#7-training-length)
 7. **Expect a generalisation gap.**
    - Unseen objects score 0.62 and unseen categories 0.70, against 0.50 for real data.
    - A few unusually tall unseen objects fail outright. A 0.34 m bottle scores 0.99.
@@ -241,7 +243,14 @@ On the CFG-trained baselines:
 
 ### 7. Training length
 
-<!-- TODO training curves -->
+![Training length, point-cloud conditioning](docs/acronym/points_training.png)
+![Training length, ID conditioning](docs/acronym/ids_training.png)
+
+- **Unseen objects (point clouds)** plateau by epoch 50: 1-NN accuracy 0.622 at epoch 50, 0.621 at epoch 100.
+  Recreation error is lowest around epochs 40–50. Half the training would do.
+- **Seen objects (IDs)** are still improving at epoch 100: 0.528 at 50, 0.516 at 100, with recreation error still
+  falling. Train the ID model longer than 30k steps.
+- **Few-step quality:** unlike the synthetic task, 3-step Euler quality doesn't degrade with training here.
 
 ## Caveats
 

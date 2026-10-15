@@ -407,10 +407,11 @@ def fig_training(plt, out, part):
         data_line(ax, data_value(part, metric))
         ax.set_xlabel('training epoch (300 batches of 1024 each)')
         ax.set_ylabel(METRICS[metric])
-    axes[0].legend(fontsize=10, loc='upper right')
-    fig.suptitle(f'Training length, {PARTS[part][2]} baseline ({VARIANTS[base][0]}); mean over seeds, '
-                 'shading = seed range', y=1.0)
-    fig.tight_layout()
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=3, fontsize=10, bbox_to_anchor=(0.5, -0.04))
+    fig.suptitle(f'Training length, {PARTS[part][2]} baseline ({VARIANTS[base][0]}), '
+                 f'{LEVEL_TITLE[PARTS[part][1]]}; mean over seeds, shading = seed range', y=1.0)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
     save(fig, out, f'{part}_training.png')
     plt.close(fig)
 
