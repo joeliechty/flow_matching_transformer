@@ -2,6 +2,13 @@
 
 **Question:** what do I need to do to get the best samples from the flow matching transformer?
 
+> **Note (2026-10-15):** every model here was trained with a bug that the ACRONYM study found and fixed. About 10%
+> of the 3σ task's training pairs rotated the long way round (> π). With the fix, the discrete baseline is 6–13 seed
+> SDs better at 2+ sampling steps, and its 100-step energy distance falls from 0.0010 to the data floor. The 1-step
+> rotation over-spread also falls from 2.5× to 1.6×. The old evaluation also overstated the rotation spread ratio
+> (≈ 1.0 reported, ≈ 0.9 measured correctly). These results will be rerun; until then, read the numbers as the
+> pre-fix model's. See [acronym_ablations_summary.md](acronym_ablations_summary.md#gates) (gate G0).
+
 **Scope:** SE(3) pose generation with the current model and training framework
 ([readme section 8](readme.md#8-transformer-backbone-adaln-zero-and-the-training-recipe-5-16)), on one hard goal
 distribution (eight goal modes, every one within 3σ of every other) under two kinds of conditioning:

@@ -72,7 +72,17 @@ midpoint steps. 1-NN accuracy **0.516–0.517** on held-out grasps of the traini
    [Details](#6-guidance)
 4. **Sample with 3–5 midpoint steps** (0.517 at 3, 0.516 at 5). At a 2-evaluation budget take 2 Euler steps (0.585
    vs. 0.759). [Details](#5-ode-solvers-at-equal-cost)
-5. <!-- TODO Part 2 ablations: pathway, prior, grasps per object, t density -->
+5. **Put more grasps of each object in a batch** (`--grasps_per_object 64`, i.e. 16 objects of 64 grasps). It
+   straightens the paths: 1 step 0.653 vs. 0.812, 3 steps 0.531 vs. 0.551, the same at 100 steps. Don't go down to 4
+   per object (1 step 0.946). [Details](#4-single-axis-ablations)
+6. **Prefer joint attention for the ID tokens** (`--cond_mode joint`). It gives a small, consistent gain (0.513 vs.
+   0.516 at 100 steps, 4.3 seed SDs), at almost no cost with 2 tokens. adaLN and cross-attention are close behind.
+7. **Keep the defaults for the prior and the training times.** A Gaussian-twist prior is slightly better at 3 steps
+   (0.546 vs. 0.551) and level at 100. Logit-normal and Beta t tie.
+8. **Train longer than 30k steps.** Seen-object quality is still improving at the end of training.
+   [Details](#7-training-length)
+
+Items 5–6 were each measured against the baseline, not together.
 
 ### What transferred from the synthetic study
 
@@ -84,7 +94,8 @@ midpoint steps. 1-NN accuracy **0.516–0.517** on held-out grasps of the traini
 | Guidance only in the noisy half (t < 0.5) is nearly free | **Reversed**: the data half (t ≥ 0.5) hurts least, and any guidance hurts |
 | Midpoint is the best solver at ~10 evaluations; Heun is poor at low budgets | **Holds** |
 | Uniform t beats logit-normal and Beta | Ties: no gain from either |
-| Joint attention slightly beats adaLN for continuous conditions | Joint ties cross-attention; adaLN (pooled) is worst on unseen objects |
+| Joint attention slightly beats adaLN for continuous conditions | Point clouds: joint ties cross-attention at 8× the cost, and adaLN (pooled) is worst on unseen objects. IDs: joint is slightly best |
+| (no analogue) | More grasps of each object per batch (a bigger per-condition OT minibatch) gives much better 1–3 step samples |
 | (no analogue) | A bigger backbone helps seen objects but not unseen ones |
 
 The synthetic models were trained with a bug that this study found and fixed: about 10% of their training pairs
@@ -215,7 +226,19 @@ grasps / held-out categories.
 | logit-normal t | +0.8 / +0.7 / −0.2 | tie |
 | Beta t | −0.3 / +3.4 / −1.1 | tie, slightly worse on seen objects |
 
-<!-- TODO Part 2 ablations figure and table -->
+![Single-axis ablations, ID conditioning](docs/acronym/ids_ablations.png)
+
+ID conditioning, held-out grasps of training objects:
+
+| Arm | Δ score (SD) | 1-NN accuracy at 1 / 3 / 100 steps (baseline 0.812 / 0.551 / 0.516) |
+|---|---|---|
+| joint attention | −4.3 | 0.810 / 0.547 / 0.513 |
+| adaLN | −1.8 | 0.808 / 0.549 / 0.515 |
+| Gaussian-twist prior | −2.3 | 0.813 / 0.546 / 0.517 |
+| 64 grasps per object (16 objects) | −7.0 | 0.653 / 0.531 / 0.516 |
+| 4 grasps per object (256 objects) | +10.4 | 0.946 / 0.578 / 0.517 |
+| logit-normal t | −0.9 | 0.806 / 0.549 / 0.514 |
+| Beta t | +0.2 | 0.812 / 0.551 / 0.518 |
 
 ### 5. ODE solvers at equal cost
 

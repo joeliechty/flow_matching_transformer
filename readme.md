@@ -81,6 +81,11 @@ The `ConditionalFlowMatchingTransformerModel` extends the architecture to suppor
 * `cross_attn`: every block gets a cross-attention branch to the tokens [9]. With a single token this collapses to adding one vector per sample, because attention over one key always has weight 1.
 * `joint`: the tokens join the sequence, so self-attention mixes them in (DiT's in-context conditioning; SD3 [16] and π0 [17] attend jointly too, with separate weights per stream).
 
+What a token is made from is set by the task (`obs_encoder`, `OBS_ENCODERS`):
+* `mlp`: continuous token vectors, for the synthetic tasks and MNIST.
+* `embedding`: integer ids, here `[category, object]` for ACRONYM grasps.
+* `point_patch`: a point cloud, tokenised the Point-BERT / Point-MAE way [21] into 64 patches. Farthest-point sampling picks the centres, each centre's 32 nearest points go through a mini-PointNet, and 4 transformer layers mix the patches. A batch holds many grasps of few objects, so each cloud is encoded once and cross-attention computes its keys and values once (`SharedTokens`). adaLN pools the patches.
+
 ### 11. Classifier-Free Guidance (CFG) [3]
 Classifier-free guidance lets a single conditional model trade off sample diversity for stronger adherence to its conditioning at inference time, without training a separate classifier.
 * Training: With probability ~10% (see `_run_flow_matching_step` in [utils/train_utils.py](utils/train_utils.py)), conditioning tokens are replaced with a learned null embedding. The model therefore learns both the conditional vector field v(x, t | c) and the unconditional vector field v(x, t | ∅) simultaneously.
@@ -250,6 +255,27 @@ ABLATE_BASE="cond_pose_flow_matching_model_OT_NOCFG|--conditional --no_cfg" ./po
 ```
 Run `calibrate` before training. The published defaults (`--r_tar 0.01`, `--cond_scale 10`) barely change the pairing when one large offset (here the 5-unit translation to the goals) dominates every pairing cost. `experiments/pairing_diagnostics.py` measures this without training.
 
+### 6. Real Grasp Poses (ACRONYM)
+
+The real-data ablations generate Franka grasp poses on ACRONYM objects [20], conditioned on the object's point cloud (Part 1) or on its ids (Part 2). Results and recommendations are in [acronym_ablations_summary.md](acronym_ablations_summary.md).
+
+**Data.** The grasps are free. The meshes, needed for point clouds, come from ShapeNetSem on Hugging Face (gated: request access, then `hf auth login`). `prepare_acronym.py` indexes the grasp files, picks and splits the objects of a dataset file (`configs/datasets/`), makes watertight meshes with Manifold [22], and writes one cache:
+```bash
+python -I prepare_acronym.py index
+python -I prepare_acronym.py watertight --dataset configs/datasets/acronym_10cat.yaml \
+    --obj_dir <ShapeNetSem>/models-OBJ/models --manifold_dir <Manifold>/build
+python -I prepare_acronym.py build --dataset configs/datasets/acronym_10cat.yaml --mesh_root data/acronym
+python experiments/acronym_metric_check.py --task_config configs/pose_tasks/acronym_10cat_ids.yaml
+```
+
+**Training and evaluation.** The task files `configs/pose_tasks/acronym_10cat_{points,ids}.yaml` (`type: acronym`, `utils/acronym.py`) set the conditioning, the prior and the batch layout (objects × grasps per object, with the object as the OT condition). `pose_ablations.sh` detects them and scores every model on each held-out level (held-out grasps, objects and categories) with the pose-recreation metrics of `utils/grasp_metrics.py`:
+```bash
+export TASK_CONFIG=configs/pose_tasks/acronym_10cat_points.yaml BATCHES_PER_EPOCH=300
+./pose_ablations.sh size                                                  # S/M/L backbones
+MODEL_FLAGS="--hidden_dim 384 --num_layers 8 --num_heads 6" ./pose_ablations.sh all    # pairing x CFG
+python experiments/acronym_figures.py --part points                       # figures and the decision rules
+```
+
 ## Code Structure
 
 * `models/`: Neural network architectures.
@@ -264,13 +290,16 @@ Run `calibrate` before training. The published defaults (`--r_tar 0.01`, `--cond
   * `logging_utils.py`: Utilities for routing output streams, formatting console logs, and tracking metrics.
   * `pose_task.py`: Pose task files (`configs/pose_tasks/`): discrete goal modes named by tokens, or goals that vary continuously with the condition (`ContinuousGoalTask`).
   * `toy_tasks.py`: The 2-D toys (moons, fork) used to check the continuous-condition pairings.
+  * `acronym.py`: ACRONYM grasp poses as a task (`AcronymGraspTask`): batches, priors, and the held-out evaluation sets.
+  * `grasp_metrics.py`: Pose-recreation metrics on a jaw-swap-invariant control-point distance (1-NN accuracy, recreation and fidelity error, coverage, energy distance).
 * `pose_gen_trainer.py`: SE(3) pose-generation training loop with the built-in multimodal goal distribution, minibatch sequence formatting, loss computation, and checkpointing.
 * `pose_gen_inference.py`: ODE sampling (Euler, midpoint or Heun) for SE(3) pose action chunks from the trained vector field, plus 3D trajectory visualization.
 * `image_gen_trainer.py`: MNIST training entrypoint. Tokenizes images into 7×7 patch grids and reuses the shared training loop for Euclidean flow matching.
 * `image_gen_inference.py`: MNIST sampling entrypoint. Integrates patch-space noise back to images and tiles the noise → denoised trajectory.
 * `toy_gen_trainer.py`: Trains a conditional flow on a 2-D toy with one pairing.
+* `prepare_acronym.py`: One-time ACRONYM data preparation (index, object selection and splits, watertight meshes, point clouds).
 * `pose_ablations.sh`, `toy_ablations.sh`, `mnist_ablations.sh`: Ablation drivers (train every variant and seed, then evaluate).
-* `experiments/`: Evaluation and figures. `evaluate_all.py` (pose and MNIST metrics), `steps_sweep.py`, `cfg_sweep.py`, `evaluate_toys.py`, `pairing_diagnostics.py` (pairing statistics and knob calibration, no training), `aggregate_seeds.py`, and `summary_figures.py` (the figures in ablations_summary.md).
+* `experiments/`: Evaluation and figures. `evaluate_all.py` (pose and MNIST metrics), `steps_sweep.py`, `cfg_sweep.py`, `evaluate_toys.py`, `pairing_diagnostics.py` (pairing statistics and knob calibration, no training), `aggregate_seeds.py`, `summary_figures.py` (the figures in ablations_summary.md), and for ACRONYM `acronym_figures.py`, `acronym_metric_check.py` and `acronym_grasp_figure.py`.
 * `pyproject.toml`: Project metadata and build configuration, allowing the repository to be installed as a standard Python package.
 
 
@@ -312,3 +341,9 @@ Run `calibrate` before training. The published defaults (`--r_tar 0.01`, `--cond
 [18] Kynkäänniemi, T., Aittala, M., Karras, T., Laine, S., Aila, T., & Lehtinen, J. (2024). Applying Guidance in a Limited Interval Improves Sample and Distribution Quality in Diffusion Models. Advances in Neural Information Processing Systems 37 (NeurIPS 2024). https://arxiv.org/abs/2404.07724
 
 [19] Tancik, M., Srinivasan, P. P., Mildenhall, B., Fridovich-Keil, S., Raghavan, N., Singhal, U., Ramamoorthi, R., Barron, J. T., & Ng, R. (2020). Fourier Features Let Networks Learn High Frequency Functions in Low Dimensional Domains. Advances in Neural Information Processing Systems 33 (NeurIPS 2020). https://arxiv.org/abs/2006.10739
+
+[20] Eppner, C., Mousavian, A., & Fox, D. (2021). ACRONYM: A Large-Scale Grasp Dataset Based on Simulation. IEEE International Conference on Robotics and Automation (ICRA 2021). https://arxiv.org/abs/2011.09584
+
+[21] Yu, X., Tang, L., Rao, Y., Huang, T., Zhou, J., & Lu, J. (2022). Point-BERT: Pre-training 3D Point Cloud Transformers with Masked Point Modeling. CVPR 2022. https://arxiv.org/abs/2111.14819 — and Pang, Y., Wang, W., Tay, F. E. H., Liu, W., Tian, Y., & Yuan, L. (2022). Masked Autoencoders for Point Cloud Self-supervised Learning. ECCV 2022. https://arxiv.org/abs/2203.06604
+
+[22] Huang, J., Su, H., & Guibas, L. (2018). Robust Watertight Manifold Surface Generation Method for ShapeNet Models. arXiv. https://arxiv.org/abs/1802.01698
