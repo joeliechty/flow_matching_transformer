@@ -859,8 +859,9 @@ def ablation_rows(task, arm, name):
     return {s: read(d / f'seed_{s}/{name}.csv') for s in SEEDS}
 
 
-def fig_sota_framework(plt, out, task='sota/pose_corners_3sigma'):
+def fig_sota_framework(plt, out, task=None):
     """The new framework against the old one on the same task: sampling steps, spread, training."""
+    task = task or SOTA_TASKS[0][0]
     old = OLD_FRAMEWORK[task]
     fig, axes = plt.subplots(1, 3, figsize=(17, 5.2))
     for v in ('cond_OT_NOCFG', 'cond_NOOT_NOCFG'):
@@ -1086,6 +1087,9 @@ def main():
     parser.add_argument('--out', default='docs/ablations')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--part', choices=('discrete', 'continuous', 'sota'), default='discrete')
+    parser.add_argument('--sota_root', default='sota',
+                        help="sota part: the results folder under experiments/results/ ('sota_geo' for the "
+                             'rerun with the geodesic-twist fix)')
     parser.add_argument('--only', nargs='+', default=None,
                         help='continuous part: just these figures (calibration toys overview steps violins sensitivity); '
                              'sota part: baseline framework overview steps ablations solvers guidance training')
@@ -1104,6 +1108,12 @@ def main():
             figs[name]()
         return
     if args.part == 'sota':
+        if args.sota_root != 'sota':
+            global SOTA_TASKS, OLD_FRAMEWORK
+            remap = lambda task: task.replace('sota/', args.sota_root + '/', 1)
+            SOTA_TASKS = [(remap(t), title) for t, title in SOTA_TASKS]
+            OLD_FRAMEWORK = {remap(t): old for t, old in OLD_FRAMEWORK.items()}
+
         def print_baselines():
             for task, _ in SOTA_TASKS:
                 choice, scores = baseline(task)
