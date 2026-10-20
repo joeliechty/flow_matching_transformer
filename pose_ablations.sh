@@ -460,7 +460,7 @@ guidance_stage() {
   for seed in $SEEDS; do
     # shellcheck disable=SC2086  # the level flag is intentionally word-split
     "$PYTHON" experiments/cfg_sweep.py --checkpoint_dir "$CKPT_ROOT/seed_$seed" --epoch "$EVAL_EPOCH" \
-      --num_samples "$NUM_SAMPLES" --scales 1 1.5 3 --intervals full 0-0.5 0.25-0.75 0.5-1 \
+      --num_samples "$NUM_SAMPLES" --scales 1 1.1 1.2 1.3 1.5 3 --intervals full 0-0.5 0.25-0.75 0.5-1 \
       --num_steps 9 100 --output "$RESULTS_ROOT${PRIMARY_LEVEL:+/$PRIMARY_LEVEL}/seed_$seed/guidance_sweep.csv" \
       ${PRIMARY_LEVEL:+--level $PRIMARY_LEVEL}
   done

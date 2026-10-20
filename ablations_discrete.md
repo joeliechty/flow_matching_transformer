@@ -22,6 +22,7 @@ Where the two agree, the result is likely to hold for other discrete-conditionin
      ACRONYM.
    - With a few tokens it costs nothing extra; adaLN and cross-attention are close behind.
 3. **Train without CFG and don't guide** (`--no_cfg`).
+   - No guidance scale helps, not even 1.1–1.3, where the original CFG paper found its best results.
 4. **Sample with 5 midpoint steps** (10 network evaluations). With a budget of only 2 evaluations, take 2 Euler steps.
    Never use Heun.
 5. **Keep the framework's defaults** for everything else:
@@ -86,14 +87,37 @@ on ACRONYM.
 
 ![Guidance](docs/combined/discrete_guidance.png)
 
-- **Every guidance setting is worse than none.**
-  - ACRONYM: 0.535–0.571 at scale 1.5 and 0.64–0.73 at scale 3, against 0.518 unguided.
-  - Synthetic: guidance 3 over the whole path gives 0.072 against −0.0001 unguided.
-- **Where it is applied matters.** Guidance over the whole path does the most damage. On the synthetic task,
-  guiding only the noisy half (t < 0.5) keeps it small (0.0029 at scale 3). On ACRONYM, both halves are similar at
-  scale 1.5.
-- **Guidance trades coverage for precision.** On ACRONYM, guided samples sit closer to real grasps but cover fewer of
-  them: recreation error 2.15 cm against 1.77 cm at scale 3.
+- **No guidance setting is better than none**, including the small scales (1.1–1.3) where the original CFG paper
+  found its best results.
+  - ACRONYM: scale 1.1, and 1.2 on the noisy half or the middle of the path, are level with unguided (0.518–0.521),
+    none better. Larger scales are worse: 0.523–0.541 at 1.3, 0.54–0.57 at 1.5 and 0.64–0.73 at 3.
+  - Synthetic: guiding only the noisy half (t < 0.5) is level up to scale 1.3, and the middle (0.25 ≤ t < 0.75) at
+    1.1. Every other setting is worse, e.g. 0.0007 at 1.1 over the whole path and 0.072 at 3, against −0.0001
+    unguided.
+- **Where it is applied matters.** Guidance over the whole path does the most damage. On the synthetic task the
+  noisy half is least harmful by far (0.0029 at scale 3). On ACRONYM the three partial intervals are similar.
+
+![What guidance does](docs/combined/discrete_sharpening.png)
+
+- **Guidance narrows the samples.** On the synthetic task it separates the corners more sharply than the real data
+  does: 0.80 at scale 1.1 and 1.00 at 3, against 0.75 unguided and 0.73 for real data. On ACRONYM the spread of the
+  grasps falls to 98% of the real spread at 1.3 and 93% at 3.
+- **Mild guidance improves the nearest-neighbour errors while the distribution gets worse.** On ACRONYM, scale
+  1.2–1.5 brings generated grasps closer to real ones (fidelity error 1.97 → 1.76–1.85 cm) and real grasps closer to
+  generated ones (recreation error 1.78 → as low as 1.73 cm). The samples concentrate on the common grasps, so the average
+  distance falls, but the rarer grasps are under-sampled, which 1-NN accuracy detects. At scale 3 recreation error
+  rises to 2.15 cm.
+
+**How this fits the literature.** CFG was introduced as a way to trade diversity for fidelity, like truncation in
+GANs ([Ho & Salimans 2022](https://arxiv.org/abs/2207.12598)). Even there, the distribution metric (FID) improved
+only at small scales, best at 1.1 on ImageNet 64×64, and got worse beyond them. The large FID gains in later image
+models come mostly from correcting model error: an imperfect conditional model spreads samples too widely, and
+guidance pulls them back ([Karras et al. 2024](https://arxiv.org/abs/2406.02507)). FID also rewards class-typical
+images ([Kynkäänniemi et al. 2023](https://arxiv.org/abs/2203.06026)). Guidance doesn't sample the conditional
+distribution; it pushes samples towards the edges of it ([Bradley & Nakkiran 2024](https://arxiv.org/abs/2408.09000),
+[Chidambaram et al. 2024](https://arxiv.org/abs/2409.13074)). Here the ID-conditioned models are close to the data
+floor, so there is little error for guidance to correct, and both metrics measure the distribution directly, so they
+see the narrowing.
 
 ### Sampling: solver and number of steps
 

@@ -28,6 +28,8 @@ Where the two agree, the result is likely to hold for other continuous-condition
    - With many tokens (a point cloud's 64 patches) it costs 8× more to train.
    - Don't use adaLN on a pooled condition.
 3. **Train without CFG and don't guide** (`--no_cfg`).
+   - No guidance scale helps on ACRONYM, not even 1.1–1.3, where the original CFG paper found its best results.
+     The synthetic task's gain from mild guidance is smaller than its measurement noise.
 4. **Sample with 5 midpoint steps** (10 network evaluations). With a budget of only 2 evaluations, take 2 Euler steps.
    Never use Heun.
 5. **Keep the framework's defaults** for everything else:
@@ -97,11 +99,39 @@ Euler steps.*
 
 ![Guidance](docs/combined/continuous_guidance.png)
 
-- **Guidance over the whole path is harmful in both.**
-- **The noisy half (t < 0.5) is the least harmful place to guide.**
-  - On the synthetic task, mild guidance there (scale 1.5) helps slightly: −0.0001 vs. 0.0002, better on every seed.
-  - On ACRONYM even that hurts (0.639 vs. 0.617).
+- **On ACRONYM no guidance setting is better than none**, including the small scales (1.1–1.3) where the original
+  CFG paper found its best results. Scale 1.1 on the noisy half or the middle of the path is level (0.617–0.619),
+  none better. Everything else is worse, from 0.621 (1.1 on the data half) to 0.81 (3 over the whole path).
+- **On the synthetic task mild guidance gives a small, consistent gain**: −0.0001 against 0.0002 unguided, better on
+  every seed. It needs scale 1.1 over the whole path, 1.3 on the middle of the path (0.25 ≤ t < 0.75), or 1.5 on the
+  noisy half (t < 0.5). The gain is below the noise of one real draw, and stronger guidance is worse.
+- **Up to scale 1.5, the noisy half (t < 0.5) is the least harmful place to guide** in both, and the whole path
+  the most harmful.
+
+![What guidance does](docs/combined/continuous_sharpening.png)
+
+- **Guidance narrows the samples.** On the synthetic task it separates the corners more sharply: 0.75 at scale 1.1
+  and 1.00 at 3. On ACRONYM the orientation spread falls from 100% of the real spread to 98% at 1.3 and 93% at 3;
+  the position spread, 2.5% too wide unguided, falls to 96% at 3.
+- **That explains the one gain.** Without guidance, the synthetic model blurs the noisy-token corners together: it
+  separates them at 0.69, against 0.73 for real data. Mild guidance restores the real separation.
+- **On unseen objects narrowing doesn't help.** Generated grasps move closer to real ones (fidelity error 2.43 →
+  2.31 cm at scale 1.3), but real grasps never get closer to generated ones (recreation error 2.13 cm unguided, 2.13–
+  2.16 cm at 1.1–1.3, 2.64 at 3). The model's error on a new shape is grasps in the wrong places, not samples that are
+  too spread out.
 - **Since the real data shows no gain, train without CFG.** That also halves the sampling cost.
+
+**How this fits the literature.** CFG was introduced as a way to trade diversity for fidelity, like truncation in
+GANs ([Ho & Salimans 2022](https://arxiv.org/abs/2207.12598)). Even there, the distribution metric (FID) improved
+only at small scales, best at 1.1–1.3 on ImageNet, and got worse beyond them. The large FID gains in later image
+models come mostly from correcting model error: an imperfect conditional model spreads samples too widely, and
+guidance pulls them back ([Karras et al. 2024](https://arxiv.org/abs/2406.02507)). FID also rewards class-typical
+images ([Kynkäänniemi et al. 2023](https://arxiv.org/abs/2203.06026)). Guidance doesn't sample the conditional
+distribution; it pushes samples towards the edges of it ([Bradley & Nakkiran 2024](https://arxiv.org/abs/2408.09000),
+[Chidambaram et al. 2024](https://arxiv.org/abs/2409.13074)). The results here match that: guidance helped only
+where the model was too blurry (the synthetic corners). One disagreement: for images, guidance is reported to be
+most harmful in the noisy part of the path and best kept to the middle
+([Kynkäänniemi et al. 2024](https://arxiv.org/abs/2404.07724)). Here the noisy half is the least harmful place.
 
 ### Sampling: solver and number of steps
 

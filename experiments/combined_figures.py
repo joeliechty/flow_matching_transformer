@@ -313,37 +313,87 @@ def fig_solvers(plt, out, kind):
     plt.close(fig)
 
 
-GUIDANCE = (1.0, 1.5, 3.0)
+GUIDANCE = (1.0, 1.1, 1.2, 1.3, 1.5, 3.0)
+SMALL_GUIDANCE = (1.0, 1.1, 1.2, 1.3, 1.5)  # the zoomed row: Ho & Salimans' best FID was at 1.1-1.3
 INTERVALS = [('full', 'whole path', INK2, 's'), ('0-0.5', 't < 0.5 (noisy half)', BLUE, 'o'),
-             ('0.5-1', 't ≥ 0.5 (data half)', YELLOW, '^')]
+             ('0.25-0.75', '0.25 ≤ t < 0.75 (middle)', GREEN, 'D'), ('0.5-1', 't ≥ 0.5 (data half)', YELLOW, '^')]
+
+
+def guidance_sources(kind):
+    """{evaluation: (sub-folder, CFG variant)} for the guidance sweeps."""
+    return {'syn': (('ablate', 'cfg'), 'cond_C2OT_CFG') if kind == 'continuous' else ((), 'cond_OT_CFG'),
+            'acr': ((), 'cond_OT_CFG')}
+
+
+def guided(ev, kind, metric, interval, scales):
+    """[seeds, scales] of `metric` at 100 steps, guiding within `interval` (scale 1 = unguided)."""
+    sub, var = guidance_sources(kind)[ev]
+    return np.stack([per_seed(ev, kind, var, metric, 'guidance_sweep', sub, num_steps=100,
+                              cfg_interval='full' if g == 1.0 else interval, cfg_scale_at_inference=g)
+                     for g in scales], 1)
 
 
 def fig_guidance(plt, out, kind):
-    """Guidance scale and interval at 100 steps, on the CFG-trained recommended model."""
-    sources = {'syn': (('ablate', 'cfg'), 'cond_C2OT_CFG') if kind == 'continuous' else ((), 'cond_OT_CFG'),
-               'acr': ((), 'cond_OT_CFG')}
-    fig, axes = two_panels(plt)
-    for ax, ev in zip(axes, ('syn', 'acr')):
-        sub, var = sources[ev]
-        metric = EVALS[ev][2]
-        for interval, label, color, marker in INTERVALS:
-            vals = np.stack([per_seed(ev, kind, var, metric, 'guidance_sweep', sub, num_steps=100,
-                                      cfg_interval='full' if g == 1.0 else interval, cfg_scale_at_inference=g)
-                             for g in GUIDANCE], 1)
-            band(ax, GUIDANCE, vals, color, f'guidance on {label}', marker=marker)
-        data_line(ax, data_value(ev, kind), 'real data' if ev == 'acr' else 'one real draw', where='left')
-        ax.set_xticks(GUIDANCE)
-        ax.set_xticklabels(['1 (none)', '1.5', '3'])
-        ax.set_xlabel('guidance scale')
-        metric_axis(ax, ev)
-        panel_title(ax, ev, kind)
-        ax.legend(fontsize=10, loc='upper left')
+    """Guidance scale and interval at 100 steps, on the CFG-trained recommended model; the bottom row zooms
+    into the small scales."""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    for row, scales in enumerate((GUIDANCE, SMALL_GUIDANCE)):
+        for ax, ev in zip(axes[row], ('syn', 'acr')):
+            for interval, label, color, marker in INTERVALS:
+                band(ax, scales, guided(ev, kind, EVALS[ev][2], interval, scales), color, f'guidance on {label}',
+                     marker=marker)
+            if row == 0:
+                data_line(ax, data_value(ev, kind), 'real data' if ev == 'acr' else 'one real draw', where='left')
+            ticks = scales if row else (1.0, 1.5, 3.0)
+            ax.set_xticks(ticks)
+            ax.set_xticklabels(['1\n(none)' if g == 1.0 else f'{g:g}' for g in ticks])
+            ax.set_xlabel('guidance scale' + (' (zoom on 1–1.5)' if row else ''))
+            metric_axis(ax, ev)
+            panel_title(ax, ev, kind)
+            ax.legend(fontsize=9, loc='upper left')
     fig.suptitle('Classifier-free guidance on the CFG-trained model, 100 Euler steps (mean over seeds, shading = '
                  'seed range)', y=1.0)
     fig.tight_layout()
     save(fig, out, f'{kind}_guidance.png')
     plt.close(fig)
 
+
+
+def fig_sharpening(plt, out, kind):
+    """What whole-path guidance does to the samples: corner separation (synthetic), nearest-neighbour errors
+    and spread (ACRONYM), at 100 steps."""
+    x = np.arange(len(GUIDANCE))
+    labels = ['1\n(none)' if g == 1.0 else f'{g:g}' for g in GUIDANCE]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+    ax = axes[0]
+    band(ax, x, guided('syn', kind, 'mode_accuracy', 'full', GUIDANCE), BLUE, 'generated samples')
+    data_line(ax, data_value('syn', kind, 'mode_accuracy'), 'real data', where='right')
+    ax.set_ylabel('corner accuracy\n(real data = target; higher over-separates)')
+    ax.set_title(f"{EVALS['syn'][1]}: {KINDS[kind]['syn'][3]}", fontsize=11)
+    ax.legend(fontsize=9.5, loc='upper left')
+    ax = axes[1]
+    band(ax, x, guided('acr', kind, 'recreation_err', 'full', GUIDANCE), BLUE,
+         'recreation error: real grasp → nearest generated', marker='o')
+    band(ax, x, guided('acr', kind, 'fidelity_err', 'full', GUIDANCE), ORANGE,
+         'fidelity error: generated → nearest real', marker='s')
+    ax.set_ylabel('mean nearest-neighbour distance (cm)\n(lower is better)')
+    ax.set_title(f"{EVALS['acr'][1]}: {KINDS[kind]['acr'][3]}", fontsize=11)
+    ax.legend(fontsize=9.5, loc='upper left')
+    ax = axes[2]
+    band(ax, x, guided('acr', kind, 'spread_ratio_trans', 'full', GUIDANCE), BLUE, 'position', marker='o')
+    band(ax, x, guided('acr', kind, 'spread_ratio_rot', 'full', GUIDANCE), ORANGE, 'orientation', marker='s')
+    data_line(ax, 1.0, 'real data', where='right')
+    ax.set_ylabel('spread of generated / spread of real\n(below 1 = narrower than the data)')
+    ax.set_title(f"{EVALS['acr'][1]}: {KINDS[kind]['acr'][3]}", fontsize=11)
+    ax.legend(fontsize=9.5, loc='lower left')
+    for ax in axes:
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.set_xlabel('guidance scale, whole path (evenly spaced, not to scale)')
+    fig.suptitle('What guidance does to the samples, 100 Euler steps (mean over seeds, shading = seed range)', y=1.0)
+    fig.tight_layout()
+    save(fig, out, f'{kind}_sharpening.png')
+    plt.close(fig)
 
 def _curve(ev, kind, tag):
     task, level, base, _ = KINDS[kind][ev]
@@ -408,7 +458,7 @@ def fig_size(plt, out, kind):
 
 
 FIGURES = {'scorecard': fig_scorecard, 'pairing': fig_pairing, 'pathway': fig_pathway, 'solvers': fig_solvers,
-           'guidance': fig_guidance, 'training': fig_training, 'size': fig_size}
+           'guidance': fig_guidance, 'sharpening': fig_sharpening, 'training': fig_training, 'size': fig_size}
 
 
 def main():
