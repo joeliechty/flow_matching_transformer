@@ -5,6 +5,8 @@ This repository serves as a practical tutorial and reference implementation for 
 
 Standard diffusion or flow matching models operate in flat Euclidean space for tasks like image generation. For robotics, flow matching can be done in either a latent Eucldean space or on the SE(3) manifold. This repo explains how to do the latter. It covers how to implement the transformer architecture in a flow matching model as well as some tips and tricks that researchers have discovered make these models perform better including optimal transport, classifier free guidance, and using adaptive layer norms.
 
+Which of these tricks actually help was tested on synthetic SE(3) tasks and on real robot grasps (ACRONYM). The recipe and the evidence are in [Findings: Pose Generation](#findings-pose-generation).
+
 ## Core Concepts and Tutorial Overview
 
 This repository is designed to teach several advanced concepts in generative modeling and manifold mathematics.
@@ -64,7 +66,7 @@ The core architecture ([models/flow_transformer_base.py](models/flow_transformer
 * **RMSNorm and QK-norm.** Blocks normalise with RMSNorm, and attention RMS-normalises each head's queries and keys, which bounds the attention logits [16]. Attention runs through `F.scaled_dot_product_attention`.
 * **Normalisation.** On SE(3) the network sees standardised positions and predicts a standardised twist; the trainer measures the statistics from the task (`pose_normalizer_stats`), and the loss is computed in standardised units. Without it, the translation to the goals (about 5 units) dominates the loss over the rotation.
 * **EMA weights and gradient clipping.** Training keeps an exponential moving average of the weights (decay 0.999 for pose, 0.9999 for MNIST), checkpoints save it, and the loaders sample from it. Gradients are clipped at norm 1.
-* **Solvers.** Sampling integrates with Euler, midpoint or Heun steps (`method`). On SE(3), midpoint and Heun apply their twists through the exponential map, so they stay on the manifold.
+* **Solvers.** Sampling integrates with Euler, midpoint or Heun steps (`method`). On SE(3), midpoint and Heun apply their twists through the exponential map, so they stay on the manifold. For pose, 5 midpoint steps matched 100 Euler steps, and Heun was the worst at low budgets ([Findings](#sampling-solver-and-number-of-steps)).
 
 The flow time's featurisation is a contested choice, so it is a flag (`--time_emb`): sinusoids of t (the default), of 1000·t (DiT's training scale, used by SD3 and Flux), or Gaussian Fourier features [19].
 
@@ -81,6 +83,8 @@ The `ConditionalFlowMatchingTransformerModel` extends the architecture to suppor
 * `cross_attn`: every block gets a cross-attention branch to the tokens [9]. With a single token this collapses to adding one vector per sample, because attention over one key always has weight 1.
 * `joint`: the tokens join the sequence, so self-attention mixes them in (DiT's in-context conditioning; SD3 [16] and π0 [17] attend jointly too, with separate weights per stream).
 
+For clean discrete labels the three pathways performed about the same in the pose experiments. For a point cloud, adaLN on the pooled feature generalised worse to unseen objects than attention did ([Findings](#how-the-condition-enters-the-network)).
+
 What a token is made from is set by the task (`obs_encoder`, `OBS_ENCODERS`):
 * `mlp`: continuous token vectors, for the synthetic tasks and MNIST.
 * `embedding`: integer ids, here `[category, object]` for ACRONYM grasps.
@@ -91,6 +95,140 @@ Classifier-free guidance lets a single conditional model trade off sample divers
 * Training: With probability ~10% (see `_run_flow_matching_step` in [utils/train_utils.py](utils/train_utils.py)), conditioning tokens are replaced with a learned null embedding. The model therefore learns both the conditional vector field v(x, t | c) and the unconditional vector field v(x, t | ∅) simultaneously.
 * Inference: At each ODE step, two forward passes are run — one with the real condition, one with the null condition — and the result is extrapolated as `v = v_uncond + cfg_scale * (v_cond - v_uncond)` (see `inference` in [models/conditional_flow_matching_transformer.py](models/conditional_flow_matching_transformer.py)). `cfg_scale = 1.0` recovers the standard conditional flow; higher values push the trajectory more aggressively toward the conditioned mode at the cost of diversity.
 * Guidance intervals: `cfg_interval=(lo, hi)` applies guidance only at flow times `lo <= t < hi` and the plain conditional velocity elsewhere [18].
+* In this repo's pose experiments, no guidance setting improved on unguided sampling; see [Guidance](#guidance) under Findings.
+
+## Findings: Pose Generation
+
+The pose model was put through a series of ablation studies, first on synthetic SE(3) goal distributions and then on real robot grasps. This section gives the recipe they support, what each choice did, the pitfalls found on the way, and what is still open. The full evidence is in two reports, one per kind of conditioning: [ablations_discrete.md](ablations_discrete.md) for a label that many samples share, and [ablations_continuous.md](ablations_continuous.md) for a signal that differs for every sample. MNIST hasn't been run under the current framework ([docs/mnist_todo.md](docs/mnist_todo.md)), so none of this is verified for images.
+
+### What Was Tested
+* **Synthetic goal distributions** ([configs/pose_tasks/](configs/pose_tasks/)), conditioned on tokens that name a goal corner:
+  * `four_corners`: four far-apart modes. Every model solved it, so it was dropped after the first round.
+  * `corners_two_orientations`: each corner holds two orientations 5σ apart, so each condition is bimodal. A model has to keep both orientations rather than average them.
+  * `corners_3sigma`: the same eight modes packed so that every pair is within 3σ. The corners overlap: only 73.4% of real samples are nearest a mode of their own corner. This is the main synthetic task.
+  * Continuous versions: `corners_3sigma_jitter` and `corners_two_orientations_jitter` add noise to every token, and `continuous_goals` puts each goal anywhere on a disk. No two samples share a condition.
+  * Two 2-D toys (moons and fork, `toy_gen_trainer.py`) checked the continuous-condition pairings against their papers before the pose runs.
+* **Real grasps from ACRONYM [20].** Successful Franka grasps on 10 object categories (606 training objects, 711k grasps), conditioned on the object's point cloud or on its `[category, object]` ids. Models are scored on held-out grasps of training objects, on 151 unseen objects, and on unseen categories (Cup, Camera, Guitar).
+* **Metrics.** Every metric compares samples with real samples the model never trained on, and is reported next to the score of a real sample set of the same size (the data floor).
+  * Synthetic: **energy distance** per goal mode (0 = matches the data). Corner accuracy and spread ratio show *how* the samples are wrong.
+  * ACRONYM: **1-NN accuracy**, how well a nearest-neighbour test tells generated grasps from real ones (0.5 = it can't). The readable companions are recreation error (real grasp → nearest sample) and fidelity error (sample → nearest real grasp), in cm on the gripper's control points, with the jaw swap symmetrised.
+* **Protocol.** 5 seeds per setting on the synthetic tasks, 3 on ACRONYM. Each alternative retrains the recommended setting with one choice changed, and differences are judged against the seed-to-seed standard deviation (SD).
+
+Numbers below are energy distance for the synthetic tasks and 1-NN accuracy for ACRONYM, lower is better for both, sampled with Euler steps unless a solver is named.
+
+### The Recommended Recipe
+1. **Keep the framework of section 8 and its defaults.** No alternative beat uniform training times, sinusoids of t or, for grasp-like poses that can face any direction, a uniform-SO(3) rotation prior.
+2. **Pair noise with data by minibatch OT within each condition** (`--pairing ot`, the default).
+   * Put many samples of each condition in a batch. On ACRONYM, 16 objects × 64 grasps (`--grasps_per_object 64`) beat 64 objects × 16 grasps.
+   * If no two samples share a condition, use C²OT with the OT batch equal to the network batch (`--pairing c2ot --ot_batch_mult 1`, with `--r_tar` from `./pose_ablations.sh calibrate`).
+   * Never pair across conditions (`--pairing global`).
+3. **Feed a rich condition through attention.** For a point cloud use `--cond_mode cross_attn`; for a few tokens `--cond_mode joint`. For clean discrete labels the pathway barely matters, and joint attention was slightly best.
+4. **Train without CFG and sample unguided** (`--no_cfg`).
+5. **Sample with 5 midpoint steps** (`method='midpoint'`, 10 network evaluations). With a budget of 2 evaluations, take 2 Euler steps. Avoid Heun.
+6. **Size the backbone to the number of conditions.** The default 1.3M-parameter model learns the synthetic tasks fully. 606 object ids wanted the largest backbone tried, 80M parameters (`--hidden_dim 512 --num_layers 12 --num_heads 8`). Point clouds need 38M (`--hidden_dim 384 --num_layers 8 --num_heads 6`), and more doesn't help on unseen objects.
+7. **Train longer only when there are many conditions.** The synthetic tasks reach the data floor within 10–20 of 100 epochs, and point-cloud models plateau halfway through their 30k steps. The id model was still improving at 30k steps.
+
+On the 3σ task this recipe reaches energy distance 0.0004 at 5 midpoint steps and the metric's floor at 9:
+```bash
+python pose_gen_trainer.py --conditional --no_cfg --task_config configs/pose_tasks/corners_3sigma.yaml --num_epochs 100
+```
+
+![Every alternative against the recommended setting, discrete conditioning](docs/combined/discrete_scorecard.png)
+![Every alternative against the recommended setting, continuous conditioning](docs/combined/continuous_scorecard.png)
+
+*Each row swaps one recommended setting for an alternative, in both evaluations (circles: synthetic 3σ task; squares: ACRONYM). Each marker is how much worse (right) or better (left) that makes the samples, in seed SDs; the grey band is no clear difference. Left: 3 Euler steps; right: 100.*
+
+### What Each Choice Did
+
+#### Pairing Noise with Data
+* **OT across a mixed-condition batch hurts conditional models.** The first round paired across all conditions at once, so each condition trained only on the noise nearest its own goals. Conditional models were then worse with OT than without (mean distance to the target mode 0.85 vs. 0.29 at 100 steps). Pairing within each condition fixed it. With continuous conditions, global OT fails the same way: 0.032 at 100 steps on the 3σ noisy-token task, and 0.719 vs. 0.621 on ACRONYM's unseen objects.
+* **OT within each condition is what makes few-step sampling work, and it costs nothing at 100 steps.**
+  * Synthetic 3σ task, 3 steps: 0.0057 vs. 0.087 for random pairing (15×).
+  * ACRONYM ids: 0.812 vs. 0.983 at 1 step and 0.551 vs. 0.627 at 3. Point clouds, unseen objects at 3 steps: 0.653 vs. 0.710.
+  * Random pairing catches up by about 20 steps and is level at 100. OT costs about 1.1× the training time and nothing at sampling.
+* **Why it matters for multimodal conditions.** Without OT the network learns the average velocity towards a condition's modes, so few-step samples land between them. On the two-orientations task, 44% of 3-step samples ended between the two orientations without OT, against 16% with OT and 9% of real samples.
+* **More samples of each condition per batch straighten the paths further** (ACRONYM). With 64 grasps of each of 16 objects, 1 step scores 0.653 (ids) and 0.722 (point clouds), against 0.812 and 0.836 with 16 grasps of each of 64 objects. With 4 grasps of each of 256 objects it is 0.95. All are level at 100 steps.
+* **Continuous conditions need condition-aware pairing (section 6), calibrated per task.**
+  * On the toys the implementation reproduces C²OT: one-step W₂² 0.071 on moons, against the paper's 0.077.
+  * On poses the published knob defaults barely change the pairing, because the translation from the noise to the goals, shared by every pair, dominates the cost. `./pose_ablations.sh calibrate` picks the loosest setting whose prior skew stays within a bound, without training.
+  * The OT batch sets a trade-off. An OT batch of 4 network batches gave better one-step samples, but was 1.5–2.3× worse than random pairing at 100 steps. With the OT batch equal to the network batch, the pairing was never worse than random.
+  * On the 3σ noisy-token task, C²OT matches an oracle that pairs within the true corners: 0.0056 at 3 steps, against 0.085 for random pairing.
+  * After calibrating, check how well the conditions separate, not only the skew bound. On overlapping modes every setting passed the bound, and the fixed-weight and cluster pairings at the loosest setting under-separated the corners (corner accuracy 0.61–0.62 vs. 0.73 for real data). C²OT, which sets its weight per batch, held up.
+
+#### How the Condition Enters the Network
+* **Clean discrete labels: the pathway barely matters.** On the synthetic task adaLN, cross-attention and joint attention are within seed noise at every step count. On ACRONYM ids joint attention is slightly best, 0.513 at 100 steps against 0.516 for cross-attention and 0.515 for adaLN, consistently across step counts.
+* **Rich continuous conditions: use attention.**
+  * adaLN on a pooled point-cloud feature memorises. It is better on seen objects, but worse on unseen objects (0.639 vs. 0.621) and unseen categories (0.716 vs. 0.696).
+  * On the synthetic noisy tokens, attention separates the corners closer to the data (corner accuracy: joint 0.722, cross-attention 0.704, adaLN 0.682, real data 0.734), with energy distance tied.
+  * Joint attention ties cross-attention on point clouds, but it puts all 64 patch tokens in every sample's sequence, so it trains 8× slower.
+
+#### Guidance
+* **Training with CFG doesn't hurt; guiding does.** Sampled unguided, CFG-trained models match those trained without CFG.
+* **Guidance 3, the inference script's default, is the worst setting tested everywhere.**
+  * Synthetic 3σ task: 0.072 at 100 steps, against the unguided floor. Samples are pushed outward past their corner, and corner accuracy rises to 1.00 against the data's 0.73: the samples are easier to classify than real data, which is a distortion.
+  * Where each condition's modes are its own (two orientations), guidance also unbalances the split between them, as far as 25/75.
+  * ACRONYM: 0.73 (ids) and 0.81 (point clouds), against 0.516 and 0.621 unguided.
+* **Small scales don't help either.** At 1.1–1.3, where the original CFG paper found its best FID [3], nothing beats unguided sampling on ACRONYM. On the synthetic noisy-token task mild guidance gives a small, consistent gain (−0.0001 vs. 0.0002), because the unguided model blurs the noisy corners together (corner accuracy 0.685 vs. 0.734). That gain is smaller than the noise of one real draw.
+* **Guidance sharpens the samples rather than correcting them.** On ACRONYM ids, scales 1.2–1.5 lower both nearest-neighbour errors (fidelity 1.97 → 1.76–1.85 cm, recreation 1.78 → as low as 1.73 cm) while 1-NN accuracy gets worse. The samples concentrate on the common grasps and under-sample the rare ones. This fits the literature: guidance trades diversity for fidelity, and its gains on distribution metrics come mostly from tightening a model that spreads its samples too widely. These models don't.
+* **Where along the path it acts matters.** Guiding the whole path does the most damage. On the synthetic task the noisy half (t < 0.5) is by far the least harmful (0.0029 vs. 0.072 at scale 3), unlike images, where the middle of the path was best [18]. On ACRONYM the partial intervals are closer together.
+
+#### Sampling: Solver and Number of Steps
+* **Midpoint is the best solver from 4 network evaluations up.** 5 midpoint steps (10 evaluations) reach the 100-step quality: 0.0004 on the synthetic task, against 0.0015 for Euler at the same cost, and 0.621 on ACRONYM's unseen objects. On ACRONYM ids, 3 midpoint steps already match 100 Euler steps (0.517 vs. 0.516).
+* **At 2 evaluations, two Euler steps beat one midpoint step** (ACRONYM ids 0.585 vs. 0.759; point clouds 0.677 vs. 0.801).
+* **Heun is the worst at low budgets** and only catches up at about 18 evaluations. At 2 evaluations on the synthetic task it scores 0.20, 26× Euler, with 3.2× the data's rotation spread. A likely cause, not verified: Heun averages twists evaluated at orientations a full step apart without moving them into a common frame, whereas midpoint's second evaluation is only half a step away.
+* **Midpoint narrows OT's advantage without removing it.** Random pairing gains the most from it, but OT is still 7–12× better at 4–6 evaluations on the synthetic task.
+
+#### Training Times, Time Embedding and Prior
+* **Training-time density.** Logit-normal (SD3's) helps the synthetic task at 1–3 Euler steps (0.0076 vs. 0.0116 at 1 step), but its one-step samples spread 2.5× too widely in rotation, against 1.6× with uniform times. It ties from 9 steps on, and ties everywhere on ACRONYM. π0's Beta ties with uniform.
+* **Time embedding.** Sinusoids of 1000·t and Gaussian Fourier features are worse at 1–3 steps (one step: 0.018 and 0.029 vs. 0.012) and tie from 9 steps.
+* **Rotation prior.** On ACRONYM a Gaussian-twist prior ties the uniform-SO(3) one (ids: 0.546 vs. 0.551 at 3 steps, level at 100).
+
+#### Model Size and Training Length
+* **Capacity helps on seen conditions, not on new ones.** ACRONYM ids at 10M / 30M / 80M parameters: 0.529 / 0.520 / 0.516, with diminishing returns. Point clouds from 14M to 93M: held-out grasps of training objects improve from 0.522 to 0.515, but unseen objects stay at 0.62 and unseen categories at 0.69–0.70.
+* **The synthetic tasks are learned almost at once.** Energy distance is at the floor by epoch 10–20, although the spread keeps tightening towards the data's until epoch 100 (0.94 at epoch 40, 0.92 at 100; real data 0.91).
+* **Few-step Euler sampling gets worse with longer training on the synthetic task** (3 steps: 0.0033 at epoch 10, 0.0057 at 100), as the samples contract towards the mode centres (position spread 0.99 → 0.67 of the data's). Midpoint sampling doesn't degrade, and neither does Euler on ACRONYM. If you'll sample with 1–3 Euler steps on a small task, use an early checkpoint.
+* **ACRONYM:** unseen-object quality is flat from epoch 50 (0.622 at 50, 0.621 at 100), while the id model is still improving at the end (0.528 at 50, 0.516 at 100).
+
+#### Generalising to New Objects (ACRONYM)
+![Generalisation](docs/acronym/generalisation.png)
+
+*Per-object OT baselines at epoch 100 on each held-out level; dotted lines are real data. Left: 1-NN accuracy; middle: recreation error; right: fidelity error.*
+
+* **Conditioning on geometry costs nothing on known objects.** On held-out grasps of training objects, the point-cloud model matches the id model at every step count (0.516 at 100 steps for both).
+* **New objects leave a gap.** Unseen objects score 0.62 and unseen categories 0.70, against 0.50 for real data. Model size, pairing, training times and the prior don't close it; the point-cloud encoder and the number of training objects are the untested levers.
+* **The gap has a heavy tail.** The median unseen object's samples are close to its real grasps (energy distance 0.09 cm), but a few unusually large objects, such as tall bottles and toy figures of 0.25–0.34 m, fail outright (1-NN accuracy ≥ 0.97). That looks like extrapolation beyond the training objects' sizes.
+
+#### The Current Framework vs. the Original Model
+* **The original model** had plain adaLN with LayerNorm, a quaternion input, a fixed grid of 10 training times, dropout 0.1 and no EMA. Its best configurations stayed 10–40× above the energy-distance floor and spread their samples 1.04–1.15× (3σ task) to 1.3–1.5× (two orientations) as widely as the data.
+* **The current framework (section 8)** reaches the floor: on the 3σ task with OT at 100 steps, 0.0082 → −0.0001. Few-step samples are 2.2–2.6× better, the spread is 0.93–0.95× (real data 0.91×), the seed range is about 10× narrower, and training converges by epoch 10–20 instead of wandering.
+* **The settled practices were adopted together,** so the gain isn't attributed to any one of them. The original model's code and checkpoints load at tag `pose-continuous-v1`.
+
+### Pitfalls Found Along the Way
+* **Take the short way round in rotation.** q and −q are the same rotation, so the twist between two poses must use the quaternion difference with qw ≥ 0 (`compute_twist_between_poses` in [utils/tf_utils.py](utils/tf_utils.py)). Before this fix, about 10% of the 3σ task's training pairs rotated by more than π. Fixing it improved the synthetic baseline by 6–13 seed SDs at 2 or more steps and cut the one-step rotation over-spread from 2.5× to 1.6×. Assigning samples to modes needs the same care: the old evaluation mishandled quaternions with negative w.
+* **Pair within conditions**, as above. Plain minibatch OT over a conditional batch silently skews each condition's prior.
+* **Use metrics that collapse can't game.**
+  * The mean distance to the target mode scored collapsed few-step samples as improvements, since real samples themselves sit 0.219 from their mode.
+  * Compute energy distance per mode. Over the whole mixture, the gaps between modes dilute the within-mode errors by about 1/K.
+  * On ACRONYM, recreation and fidelity error bottom out at 4–10 steps because they reward slight contraction. 1-NN accuracy falls monotonically with steps, which is why it is the primary metric there.
+  * Averaged over objects, energy distance is dominated by the few objects a model fails on, so report the median as well.
+  * Training losses aren't comparable across pairings: OT makes the regression target less noisy, so its loss is lower whether or not its model is better.
+* **Prepare meshes without simplifying.** Manifold's `-s` flag and the `simplify` step, which ACRONYM used, corrupted 239 of the 852 ShapeNetSem meshes here. Plain `manifold` gives surfaces within 0.8–1.3 mm of ACRONYM's own.
+* **Speed-ups that changed nothing measurable:** bf16 autocast, and encoding each point cloud once per object with shared keys and values.
+
+### Still Open
+* **Generalisation to new objects** is the real gap (above).
+* **The best settings were tested one at a time, not combined**, e.g. 64 grasps per object with joint attention and midpoint sampling.
+* **The ACRONYM id model isn't converged** at 30k steps, and might keep improving with a larger backbone.
+* **At 100 steps the best synthetic models sit at the metric's floor**; 256 evaluation samples can't separate them.
+* **Not tried:** a diagnosis of Heun's failure, C²OT and autoguidance on ACRONYM, and a grasp-success metric (these studies measure pose recreation only).
+
+### Full Reports
+* [ablations_discrete.md](ablations_discrete.md) and [ablations_continuous.md](ablations_continuous.md): the current recommendations, with one figure per topic (`python experiments/combined_figures.py --kind discrete` or `--kind continuous`).
+* The per-study write-ups, with every arm's numbers and the commands to rerun them, are kept at git tags:
+  * `pose-two-orientations-v1`: the four-corners task, the conditional-OT fix and the validation of the metrics.
+  * `pose-continuous-v1`: the original model on the two-orientations and 3σ tasks, and the continuous-condition pairings (toys, calibration, OT batch size).
+  * `pose-3sigma-geo-v1`: the current framework on the 3σ tasks, after the rotation fix (`ablations_summary.md`).
+  * `acronym-continuous-v1` and `acronym-discrete-v1`: the ACRONYM study (`acronym_ablations_summary.md`).
 
 ## Installation
 
@@ -174,7 +312,7 @@ python pose_gen_inference.py --conditional --actions top right --num_samples 5 -
 Additional Inference Flags:
 * `--conditional` / `-C`: Loads the conditional model variant; must match the trained checkpoint.
 * `--actions` / `-A`: One or more action tokens (`top`, `bottom`, `left`, `right`) to condition on. Omit on a conditional model to use the null token (unconditional path).
-* `--cfg_scale` / `-CFG`: Classifier-free guidance scale (default `3.0`; `1.0` disables CFG).
+* `--cfg_scale` / `-CFG`: Classifier-free guidance scale (default `3.0`; `1.0` disables CFG). Scale 3 was the worst setting in every pose experiment; unguided sampling was best ([Findings](#guidance)).
 * `--no_cfg` / `-NOCFG`: Forces `cfg_scale=1.0` (matches a model trained with `--no_cfg`).
 * `--no_ot` / `-NOOT`: Loads a checkpoint that was trained without OT pairing.
 * `--checkpoint_path` / `-CP`: Directory containing the checkpoint and config (defaults to `checkpoints/`).
