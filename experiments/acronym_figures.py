@@ -1,4 +1,5 @@
-"""Figures and decision rules for the ACRONYM grasp-pose ablations (acronym_ablations_summary.md).
+"""Figures and decision rules for the ACRONYM grasp-pose ablations (the full report acronym_ablations_summary.md is at
+tag acronym-discrete-v1; ablations_continuous.md and ablations_discrete.md now summarise it).
 
 Reads what ./pose_ablations.sh writes for an ACRONYM task and writes PNGs to docs/acronym/:
 

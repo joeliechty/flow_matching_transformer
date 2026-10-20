@@ -1,4 +1,5 @@
-"""Figures for ablations_summary.md: the pose ablations on the two multimodal tasks.
+"""Figures for the synthetic pose study's full report (ablations_summary.md, at tag pose-3sigma-geo-v1;
+ablations_continuous.md and ablations_discrete.md now summarise it): the pose ablations on the two multimodal tasks.
 
 Reads what ./pose_ablations.sh writes for each task (the eval stage at epoch 100, the curves
 stage and the training logs), samples the epoch-100 models for the per-sample figures, and

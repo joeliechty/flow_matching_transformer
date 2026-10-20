@@ -3,7 +3,7 @@
 Everything below is deferred: the code supports it, but nothing here has been run on the current
 model and training framework (adaLN-Zero, RMSNorm + QK-norm, EMA, gradient clipping, continuous
 time; readme section 8). The pose results these mirror are in
-[ablations_summary.md](../ablations_summary.md).
+[ablations_discrete.md](../ablations_discrete.md) and [ablations_continuous.md](../ablations_continuous.md).
 
 Checkpoints from before this framework (`checkpoints/mnist/`, `checkpoints/pre_ablation/`) can't be
 loaded by the current code. Check out tag `pose-continuous-v1` to evaluate them.

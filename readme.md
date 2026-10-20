@@ -45,12 +45,12 @@ The way out is to let noise move only between *nearby* conditions. If the condit
 * **Fixed large weight (`c2ot_fixed`) [12, 13].** The same cost with one large w, fixed at the start of training. This is the minibatch form of dynamic conditional OT (COT-FM) and Bayesian OT flow matching; their theory shows that the weighted problem recovers the conditional OT plan as w → ∞.
 * **Cluster, then match (`cluster`) [11].** COT Policy quantizes the conditions with K-means (K about the batch size, with PCA first for image observations) and adds `γ · ‖c̄_i − c̄_j‖²` on the cluster centroids. γ is set per batch so the condition term outweighs the sample term about 10× (`--cond_scale`, default 10). The network still sees the raw condition.
 
-Three practical points, from this repo's experiments ([ablations_summary.md](ablations_summary.md#part-2-original-model-continuous-conditioning)):
+Three practical points, from this repo's experiments (the calibration study is in `ablations_summary.md` at tag `pose-3sigma-geo-v1`; the current recommendations are in [ablations_continuous.md](ablations_continuous.md)):
 * **Calibrate the knob per task.** The published defaults (`--r_tar 0.01`, `--cond_scale 10`) work on 2-D toys, but on the pose tasks they barely change the pairing. There, a 5-unit translation shared by every pair dominates the cost. `experiments/pairing_diagnostics.py --calibrate` picks the loosest setting whose prior skew stays within a bound, without training.
 * **The OT batch size sets a trade-off.** C²OT solves one assignment over an OT batch several times the network batch and splits it into network batches (`--ot_batch_mult`). That gives each sample more partners with nearby conditions and makes one-step samples better. Here it also made 20–100-step samples worse than random pairing. With the OT batch equal to the network batch, the pairing beat random pairing at 1–5 steps and matched it beyond.
 * **Beyond minibatches.** Semidiscrete flow matching (SD-FM) [14] pairs fresh noise with the whole dataset through a learned dual potential, which removes the minibatch limit. Conditional variable flow matching [15] amortizes conditional OT across continuous conditions. Neither is implemented here.
 
-The comparison of these pairings on continuous-condition pose tasks is in [ablations_summary.md](ablations_summary.md#2-pairings-continuous-conditions), with the original model's results in its [Part 2](ablations_summary.md#part-2-original-model-continuous-conditioning).
+How these pairings compare on continuous-condition pose tasks, synthetic and real, is in [ablations_continuous.md](ablations_continuous.md#pairing-noise-with-data).
 
 ### 7. Time Sampling [4, 16, 17]
 Training draws the flow time `t ∈ [0, 1]` (t = 0 is noise, t = 1 data) continuously, so the network sees every time it is queried at during sampling (`_run_flow_matching_step` in [utils/train_utils.py](utils/train_utils.py)).
@@ -228,7 +228,7 @@ With `--return_trajectory`, the script tiles intermediate timesteps so you can s
 
 ### 5. Pairing Experiments with Continuous Conditions
 
-These experiments compare the pairings of section 6. The results are in [ablations_summary.md](ablations_summary.md#2-pairings-continuous-conditions).
+These experiments compare the pairings of section 6. The results are in [ablations_continuous.md](ablations_continuous.md#pairing-noise-with-data).
 
 **Toys first.** `toy_gen_trainer.py` trains a conditional flow on one of two 2-D toys (`utils/toy_tasks.py`). `moons` is C²OT's 8 Gaussians → moons, conditioned on the target's x-coordinate. `fork` is COT Policy's fork: y given x, with two branches for x > 0. Hyperparameters follow C²OT's toy setup.
 ```bash
@@ -257,7 +257,7 @@ Run `calibrate` before training. The published defaults (`--r_tar 0.01`, `--cond
 
 ### 6. Real Grasp Poses (ACRONYM)
 
-The real-data ablations generate Franka grasp poses on ACRONYM objects [20], conditioned on the object's point cloud (Part 1) or on its ids (Part 2). Results and recommendations are in [acronym_ablations_summary.md](acronym_ablations_summary.md).
+The real-data ablations generate Franka grasp poses on ACRONYM objects [20], conditioned on the object's point cloud (Part 1) or on its ids (Part 2). Results and recommendations, side by side with the synthetic 3σ task, are in [ablations_continuous.md](ablations_continuous.md) (point clouds) and [ablations_discrete.md](ablations_discrete.md) (ids).
 
 **Data.** The grasps are free. The meshes, needed for point clouds, come from ShapeNetSem on Hugging Face (gated: request access, then `hf auth login`). `prepare_acronym.py` indexes the grasp files, picks and splits the objects of a dataset file (`configs/datasets/`), makes watertight meshes with Manifold [22], and writes one cache:
 ```bash
@@ -299,7 +299,7 @@ python experiments/acronym_figures.py --part points                       # figu
 * `toy_gen_trainer.py`: Trains a conditional flow on a 2-D toy with one pairing.
 * `prepare_acronym.py`: One-time ACRONYM data preparation (index, object selection and splits, watertight meshes, point clouds).
 * `pose_ablations.sh`, `toy_ablations.sh`, `mnist_ablations.sh`: Ablation drivers (train every variant and seed, then evaluate).
-* `experiments/`: Evaluation and figures. `evaluate_all.py` (pose and MNIST metrics), `steps_sweep.py`, `cfg_sweep.py`, `evaluate_toys.py`, `pairing_diagnostics.py` (pairing statistics and knob calibration, no training), `aggregate_seeds.py`, `summary_figures.py` (the figures in ablations_summary.md), and for ACRONYM `acronym_figures.py`, `acronym_metric_check.py` and `acronym_grasp_figure.py`.
+* `experiments/`: Evaluation and figures. `evaluate_all.py` (pose and MNIST metrics), `steps_sweep.py`, `cfg_sweep.py`, `evaluate_toys.py`, `pairing_diagnostics.py` (pairing statistics and knob calibration, no training), `aggregate_seeds.py`, `combined_figures.py` (the figures in ablations_continuous.md and ablations_discrete.md), the per-study figure scripts `summary_figures.py` and `acronym_figures.py` (which also print the size and baseline rules), and for ACRONYM `acronym_metric_check.py` and `acronym_grasp_figure.py`.
 * `pyproject.toml`: Project metadata and build configuration, allowing the repository to be installed as a standard Python package.
 
 
