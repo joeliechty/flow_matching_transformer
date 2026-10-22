@@ -1,0 +1,20 @@
+# ACRONYM grasp poses [Eppner et al. 2021] for the real-data ablations: 10 training categories
+# of varied geometry and 3 held-out categories (Cup is close to Mug/Bowl/Vase; Camera and
+# Guitar are not). Built once by `python -I prepare_acronym.py build --dataset <this file>`
+# from data/acronym/raw/grasps (and the ShapeNetSem meshes, for point clouds); read by
+# utils/acronym.py through the task files configs/pose_tasks/acronym_10cat_*.yaml.
+#   Objects: per training category up to 100 objects with >= 200 successful grasps (one file
+#            per ShapeNet id), 20% of them held out; per held-out category up to 32 objects.
+#   Grasps:  15% of each training object's successful grasps are held out.
+name: acronym_10cat
+cache: data/acronym/acronym_10cat.pt
+train_categories: [Mug, Bowl, Bottle, Vase, Laptop, CellPhone, Book, Pencil, ToyFigure, Chair]
+heldout_categories: [Cup, Camera, Guitar]
+min_success: 200
+max_objects_per_category: 100
+max_objects_per_heldout_category: 32
+heldout_object_fraction: 0.2
+heldout_grasp_fraction: 0.15
+split_seed: 0
+point_samplings: 16       # surface samplings stored per object; training draws one per batch
+points_per_cloud: 2048

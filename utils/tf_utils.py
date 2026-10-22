@@ -565,9 +565,11 @@ def compute_twist_between_poses(pose1, pose2=None, dt=1.0, relative_pose=None):
     # Compute linear velocity in world frame (position difference)
     linear_vel_world = (pos2 - pos1) / dt
     
-    # Compute quaternion difference (relative rotation)
+    # Compute quaternion difference (relative rotation). q and -q are the same rotation: take
+    # the one with qw >= 0, so the twist is the shortest (geodesic) rotation, angle <= π
     quat_diff = _quaternion_difference(quat1, quat2)
-    
+    quat_diff = torch.where(quat_diff[..., :1] < 0, -quat_diff, quat_diff)
+
     # Convert quaternion difference to angular velocity in world frame
     qw = quat_diff[..., 0]
     qxyz = quat_diff[..., 1:4]

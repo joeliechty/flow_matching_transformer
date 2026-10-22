@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# SE(3) pose ablations: train the 6 variants (4 conditional OT x CFG + 2 unconditional
+# OT / no-OT) for every seed, then evaluate them. Identical hyperparameters across
+# variants — only the OT/CFG/conditional knobs differ.
+#
+#   ./pose_ablations.sh [train|eval|all|curves|diagnostics|calibrate|sensitivity|ablate|solver|guidance|size]
+#                                                             (default: all = train + eval)
+#
+# curves: main metrics (100 and 3 Euler steps, 5 midpoint steps) at every saved epoch, for training plots.
+# diagnostics: pairing statistics at several OT batch sizes, no training (pairing_diagnostics.py).
+# calibrate: choose each condition-aware pairing's knob for this task without training (the
+#            loosest setting whose prior skew stays <= MAX_SKEW, default 0.02), written to
+#            experiments/results/<dir>/pairing_calibration.env. The jitter and continuous sets
+#            train with these flags, so run it before 'train'.
+# sensitivity: retrain one pairing (SENS_PAIRING=c2ot|c2ot_fixed|cluster) with its calibrated
+#              knob moved each way and the OT batch size varied, 3 seeds each, under
+#              <dir>/sensitivity/<setting>/.
+# ablate: single-axis ablations of the contested design choices. Each arm retrains ABLATE_BASE
+#         ("<checkpoint name>|<trainer flags>", the chosen baseline variant) with one choice
+#         changed, under <dir>/ablate/<arm>/, then evaluates it. ABLATE_ARMS picks arms (default:
+#         every arm but cfg). The cfg arm retrains the baseline with CFG (for 'guidance' when the
+#         variant set has no CFG model).
+# solver: eval only. Euler, midpoint and Heun at equal network evaluations, unguided
+#         (solver_sweep.csv).
+# guidance: eval only. Guidance scales applied over the whole path or only within flow-time
+#           intervals, at 9 and 100 steps, for the CFG-trained models in CKPT_ROOT
+#           (guidance_sweep.csv). For a continuous task point CKPT_ROOT/RESULTS_ROOT at ablate/cfg.
+# size: backbone sizes (SIZES, default "S M L"; S/M/L/XL below) of SIZE_BASE (default the
+#       per-object OT, no-CFG variant), SIZE_SEEDS (default "1 2"), under <dir>/size/<size>/.
+#
+# The variant set follows the task (override with VARIANT_SET):
+#   discrete    clean tokens: 4 conditional (OT x CFG) + 2 unconditional variants
+#   jitter      noisy tokens (token_sigma > 0): conditional, no CFG, one per pairing
+#               (independent, ot = per-condition oracle, global, c2ot, c2ot_fixed, cluster)
+#   continuous  `type: continuous` tasks: the jitter set without the oracle
+#   acronym     `type: acronym` tasks (real grasps, utils/acronym.py): conditional independent /
+#               per-object OT (/ global OT, for point clouds) pairing x CFG, plus 2 unconditional
+# The jitter and continuous sets pair over OT_BATCH_MULT (default 4) network batches at once.
+# ACRONYM tasks take their batch layout from the task file, default to SEEDS="1 2 3" and JOBS=2,
+# add MODEL_FLAGS (the backbone size, e.g. "--hidden_dim 384 --num_layers 8 --num_heads 6"),
+# COND_MODE (default cross_attn), N_STEPS (flow times per pair, default 2) and BATCHES_PER_EPOCH
+# (default 100) to every run, and are scored on each held-out level (all three for point clouds,
+# held-out grasps for ids) into epoch_<E>/<level>/; NUM_SAMPLES is per object.
+#
+# The task (goal modes and conditioning tokens) comes from TASK_CONFIG, a file in
+# configs/pose_tasks/. Each task gets its own folders, <dir> below: sota/pose for the original
+# four_corners task and sota/pose_<name> for any other task. (Runs from before the current model
+# and training framework are in <dir> without "sota/"; this code can't load them, see tag
+# pose-continuous-v1.)
+#
+# Layout:
+#   checkpoints/<dir>/seed_<N>/                     checkpoints (every 10 epochs), configs, logs
+#   experiments/results/<dir>/epoch_<E>/seed_<N>/   metrics, CFG + sampling-steps sweeps, grids
+#   experiments/results/<dir>/epoch_<E>/            *_summary.csv + plots, mean ± std over seeds
+#   experiments/results/<dir>/training_curves/seed_<N>/metrics_epoch<E>_steps<S>.csv   (curves; Euler)
+#   experiments/results/<dir>/training_curves/seed_<N>/metrics_epoch<E>_midpoint<S>.csv (curves; midpoint)
+#   <dir>/sensitivity/<setting>/ and <dir>/ablate/<arm>/ hold the same layout per setting / arm
+#
+# Env overrides: SEEDS="1 2 3 4 5" JOBS=6 EPOCHS=100 PYTHON=python VARIANT_SET OT_BATCH_MULT
+#                TASK_CONFIG=configs/pose_tasks/four_corners.yaml
+#                EVAL_EPOCH=<EPOCHS>  evaluate the checkpoints saved at this epoch
+#                CKPT_ROOT, RESULTS_BASE (the per-task results folder), RESULTS_ROOT (relative to
+#                the repo root), FMT_REPO_ROOT
+# JOBS=6 measured best on an RTX 4090 (~2.7x sequential throughput; 12 barely helps).
+# Runs whose final-epoch checkpoint already exists are skipped, so re-running resumes.
+
+set -euo pipefail
+
+STAGE="${1:-all}"
+EPOCHS="${EPOCHS:-100}"
+EVAL_EPOCH="${EVAL_EPOCH:-$EPOCHS}"
+BATCH=128
+PYTHON="${PYTHON:-python}"
+export MPLBACKEND="${MPLBACKEND:-Agg}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${FMT_REPO_ROOT:-$SCRIPT_DIR}"
+TASK_CONFIG="${TASK_CONFIG:-configs/pose_tasks/four_corners.yaml}"
+TASK="$(basename "$TASK_CONFIG" .yaml)"
+if [[ "$TASK" == four_corners ]]; then TASK_DIR=sota/pose; else TASK_DIR="sota/pose_$TASK"; fi
+CKPT_ROOT="${CKPT_ROOT:-checkpoints/$TASK_DIR}"
+RESULTS_BASE="${RESULTS_BASE:-experiments/results/$TASK_DIR}"
+RESULTS_ROOT="${RESULTS_ROOT:-$RESULTS_BASE/epoch_$EVAL_EPOCH}"
+
+STAGES="train|eval|all|curves|diagnostics|calibrate|sensitivity|ablate|solver|guidance|size"
+if [[ ! "$STAGE" =~ ^($STAGES)$ ]]; then
+  echo "usage: $0 [$STAGES]" >&2; exit 2
+fi
+
+if (( EVAL_EPOCH % 10 != 0 )); then
+  echo "ERROR: EVAL_EPOCH=$EVAL_EPOCH — checkpoints are only saved every 10 epochs" >&2
+  exit 2
+fi
+
+if [[ ! -f "$REPO_ROOT/pose_gen_trainer.py" ]]; then
+  echo "ERROR: no flow_matching_transformer checkout at $REPO_ROOT" >&2
+  echo "       set FMT_REPO_ROOT=/path/to/flow_matching_transformer and retry" >&2
+  exit 1
+fi
+cd "$REPO_ROOT"
+
+if [[ ! -f "$TASK_CONFIG" ]]; then
+  echo "ERROR: no task file at $TASK_CONFIG" >&2
+  exit 1
+fi
+
+if ! "$PYTHON" -c 'import torch' 2>/dev/null; then
+  echo "ERROR: '$PYTHON' can't import torch — run 'conda activate FmT' or set PYTHON=" >&2
+  exit 1
+fi
+
+if [[ -z "${VARIANT_SET:-}" ]]; then
+  if grep -Eq '^type: *acronym' "$TASK_CONFIG"; then VARIANT_SET=acronym
+  elif grep -Eq '^type: *continuous' "$TASK_CONFIG"; then VARIANT_SET=continuous
+  elif grep -Eq '^token_sigma: *0*\.?0*[1-9]' "$TASK_CONFIG"; then VARIANT_SET=jitter
+  else VARIANT_SET=discrete; fi
+fi
+
+# checkpoint name | trainer flags
+case "$VARIANT_SET" in
+  discrete)
+    VARIANTS=(
+      "cond_pose_flow_matching_model_OT_CFG|--conditional"
+      "cond_pose_flow_matching_model_OT_NOCFG|--conditional --no_cfg"
+      "cond_pose_flow_matching_model_NOOT_CFG|--conditional --no_ot"
+      "cond_pose_flow_matching_model_NOOT_NOCFG|--conditional --no_ot --no_cfg"
+      "pose_flow_matching_model_OT_CFG|"
+      "pose_flow_matching_model_NOOT_CFG|--no_ot"
+    )
+    EXTRA_FLAGS=""; NUM_SAMPLES=256 ;;
+  jitter|continuous)
+    CALIB_ENV="$RESULTS_BASE/pairing_calibration.env"
+    if [[ -f "$CALIB_ENV" ]]; then
+      # shellcheck disable=SC1090
+      source "$CALIB_ENV"
+    elif [[ "$STAGE" == train || "$STAGE" == all || "$STAGE" == sensitivity ]]; then
+      echo "ERROR: no $CALIB_ENV — run '$0 calibrate' first" >&2
+      exit 1
+    fi
+    VARIANTS=("cond_pose_flow_matching_model_NOOT_NOCFG|--conditional --no_cfg --pairing independent")
+    if [[ "$VARIANT_SET" == jitter ]]; then
+      VARIANTS+=("cond_pose_flow_matching_model_OT_NOCFG|--conditional --no_cfg --pairing ot")
+    fi
+    VARIANTS+=(
+      "cond_pose_flow_matching_model_GOT_NOCFG|--conditional --no_cfg --pairing global"
+      "cond_pose_flow_matching_model_C2OT_NOCFG|--conditional --no_cfg --pairing c2ot ${C2OT_FLAGS:-}"
+      "cond_pose_flow_matching_model_C2OTFIX_NOCFG|--conditional --no_cfg --pairing c2ot_fixed ${C2OTFIX_FLAGS:-}"
+      "cond_pose_flow_matching_model_CLUSTER_NOCFG|--conditional --no_cfg --pairing cluster ${CLUSTER_FLAGS:-}"
+    )
+    EXTRA_FLAGS="--ot_batch_mult ${OT_BATCH_MULT:-4}"
+    # the continuous task scores 16 test conditions, 64 samples each
+    if [[ "$VARIANT_SET" == continuous ]]; then NUM_SAMPLES=1024; else NUM_SAMPLES=256; fi ;;
+  acronym)
+    BATCH=""  # the task file's objects x grasps_per_object
+    VARIANTS=(
+      "cond_pose_flow_matching_model_NOOT_NOCFG|--conditional --no_cfg --pairing independent"
+      "cond_pose_flow_matching_model_OT_NOCFG|--conditional --no_cfg --pairing ot"
+      "cond_pose_flow_matching_model_NOOT_CFG|--conditional --pairing independent"
+      "cond_pose_flow_matching_model_OT_CFG|--conditional --pairing ot"
+    )
+    if grep -Eq '^condition: *points' "$TASK_CONFIG"; then
+      VARIANTS+=(
+        "cond_pose_flow_matching_model_GOT_NOCFG|--conditional --no_cfg --pairing global"
+        "cond_pose_flow_matching_model_GOT_CFG|--conditional --pairing global"
+      )
+      LEVELS="heldout_grasps heldout_objects heldout_categories"; PRIMARY_LEVEL=heldout_objects
+    else
+      LEVELS="heldout_grasps"; PRIMARY_LEVEL=heldout_grasps
+    fi
+    VARIANTS+=(
+      "pose_flow_matching_model_OT_CFG|--pairing ot"
+      "pose_flow_matching_model_NOOT_CFG|--no_ot"
+    )
+    EXTRA_FLAGS="${MODEL_FLAGS:-} --cond_mode ${COND_MODE:-cross_attn} --n_steps ${N_STEPS:-2}"
+    EXTRA_FLAGS+=" --num_batches_per_epoch ${BATCHES_PER_EPOCH:-100}"
+    NUM_SAMPLES=256 ;;
+  *) echo "ERROR: unknown VARIANT_SET=$VARIANT_SET" >&2; exit 2 ;;
+esac
+if [[ "$VARIANT_SET" == acronym ]]; then
+  SEEDS="${SEEDS:-1 2 3}"; JOBS="${JOBS:-2}"
+else
+  SEEDS="${SEEDS:-1 2 3 4 5}"; JOBS="${JOBS:-6}"; LEVELS=""; PRIMARY_LEVEL=""
+fi
+echo "Task $TASK: variant set $VARIANT_SET"
+
+# Single-axis ablation arms: "<arm>|<trainer flags>", each changing one contested choice
+ABLATION_ARMS=(
+  "t_logit_normal|--t_dist logit_normal"
+  "t_beta|--t_dist beta"
+  "time_x1000|--time_emb sinusoidal_x1000"
+  "time_fourier|--time_emb fourier"
+  "cond_cross_attn|--cond_mode cross_attn"
+  "cond_joint|--cond_mode joint"
+  "cond_adaln|--cond_mode adaln"
+  "rot_gauss|--rot_prior gaussian"
+  "k4|--grasps_per_object 4"
+  "k64|--grasps_per_object 64"
+  "cfg|"
+)
+DEFAULT_ARMS="t_logit_normal t_beta time_x1000 time_fourier cond_cross_attn cond_joint"
+if [[ "$VARIANT_SET" == acronym ]]; then
+  DEFAULT_ARMS="cond_adaln cond_joint rot_gauss k4 k64 t_logit_normal t_beta"
+fi
+
+# Backbone sizes for the size stage: "<name>|<trainer flags>"
+SIZE_FLAGS=(
+  "S|--hidden_dim 256 --num_layers 6 --num_heads 4"
+  "M|--hidden_dim 384 --num_layers 8 --num_heads 6"
+  "L|--hidden_dim 512 --num_layers 12 --num_heads 8"
+  "XL|--hidden_dim 768 --num_layers 16 --num_heads 12"
+)
+
+trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+
+train_one() {  # <seed> <checkpoint name> [trainer flags...]   (the flags win over EXTRA_FLAGS)
+  local seed=$1 name=$2; shift 2
+  local dir="$CKPT_ROOT/seed_$seed" start=$SECONDS
+  # shellcheck disable=SC2086  # EXTRA_FLAGS is intentionally word-split
+  if "$PYTHON" pose_gen_trainer.py $EXTRA_FLAGS "$@" --num_epochs "$EPOCHS" ${BATCH:+--batch_size "$BATCH"} \
+       --seed "$seed" --task_config "$TASK_CONFIG" --save_path "$dir/" \
+       > "$dir/${name}_console.txt" 2>&1; then
+    echo "  done    seed $seed  $name  ($(( SECONDS - start ))s)"
+  else
+    echo "  FAILED  seed $seed  $name — see $dir/${name}_console.txt" >&2
+    return 1
+  fi
+}
+
+train_pool() {  # <root> <"setting|checkpoint name|trainer flags">...
+  # Every setting x seed from one job pool, into <root>/<setting>/seed_<N>/.
+  local root=$1; shift
+  local entry setting rest name flags seed running=0 failed=0
+  for entry in "$@"; do
+    setting="${entry%%|*}"; rest="${entry#*|}"; name="${rest%%|*}"; flags="${rest#*|}"
+    for seed in $SEEDS; do
+      mkdir -p "$root/$setting/seed_$seed"
+      if [[ -f "$root/$setting/seed_$seed/${name}_epoch_${EPOCHS}.pt" ]]; then
+        echo "  skip    $setting seed $seed (already trained)"
+        continue
+      fi
+      if (( running >= JOBS )); then
+        wait -n || failed=1
+        running=$(( running - 1 ))
+      fi
+      # shellcheck disable=SC2086  # flags are intentionally word-split
+      ( CKPT_ROOT="$root/$setting"; train_one "$seed" "$name" $flags ) &
+      running=$(( running + 1 ))
+    done
+  done
+  while (( running > 0 )); do
+    wait -n || failed=1
+    running=$(( running - 1 ))
+  done
+  if (( failed )); then
+    echo "ERROR: some training runs failed (see above)" >&2
+    exit 1
+  fi
+}
+
+train_stage() {
+  echo "=== Training pose ablations ($TASK): seeds [$SEEDS], $EPOCHS epochs, $JOBS at a time ==="
+  local running=0 failed=0 seed entry name flags
+  for seed in $SEEDS; do
+    mkdir -p "$CKPT_ROOT/seed_$seed"
+    for entry in "${VARIANTS[@]}"; do
+      name="${entry%%|*}"; flags="${entry#*|}"
+      if [[ -f "$CKPT_ROOT/seed_$seed/${name}_epoch_${EPOCHS}.pt" ]]; then
+        echo "  skip    seed $seed  $name (already trained)"
+        continue
+      fi
+      if (( running >= JOBS )); then
+        wait -n || failed=1
+        running=$(( running - 1 ))
+      fi
+      # shellcheck disable=SC2086  # flags are intentionally word-split
+      train_one "$seed" "$name" $flags &
+      running=$(( running + 1 ))
+    done
+  done
+  while (( running > 0 )); do
+    wait -n || failed=1
+    running=$(( running - 1 ))
+  done
+  if (( failed )); then
+    echo "ERROR: some training runs failed (see above)" >&2
+    exit 1
+  fi
+}
+
+eval_stage() {
+  if [[ -n "$LEVELS" ]]; then  # ACRONYM: every held-out level into its own folder
+    local level root="$RESULTS_ROOT"
+    for level in $LEVELS; do
+      RESULTS_ROOT="$root/$level" LEVEL_FLAG="--level $level" eval_one_level
+    done
+    RESULTS_ROOT="$root"
+    return
+  fi
+  LEVEL_FLAG="" eval_one_level
+}
+
+eval_one_level() {
+  echo "=== Evaluating pose ablations ($TASK${LEVEL_FLAG:+, ${LEVEL_FLAG#--level }}): seeds [$SEEDS], epoch-$EVAL_EPOCH checkpoints ==="
+  local seed ckpt out
+  for seed in $SEEDS; do
+    ckpt="$CKPT_ROOT/seed_$seed"; out="$RESULTS_ROOT/seed_$seed"
+    if [[ ! -d "$ckpt" ]]; then
+      echo "ERROR: no checkpoints at $ckpt — run '$0 train' first" >&2
+      exit 1
+    fi
+    echo "--- seed $seed ---"
+    # shellcheck disable=SC2086  # LEVEL_FLAG is intentionally word-split
+    "$PYTHON" experiments/evaluate_all.py --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" \
+      --num_samples "$NUM_SAMPLES" --output "$out/metrics.csv" $LEVEL_FLAG
+    # shellcheck disable=SC2086
+    "$PYTHON" experiments/steps_sweep.py  --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" \
+      --num_samples "$NUM_SAMPLES" --output "$out/steps_sweep.csv" $LEVEL_FLAG
+    # guidance and the 3-D grids only apply to the discrete set (CFG-trained, token conditions)
+    if [[ "$VARIANT_SET" == discrete ]]; then
+      "$PYTHON" experiments/cfg_sweep.py  --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --output "$out/cfg_sweep.csv"
+      "$PYTHON" experiments/make_grids.py --checkpoint_dir "$ckpt" --epoch "$EVAL_EPOCH" --results_dir "$out" --skip_image
+    fi
+  done
+  "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT"
+}
+
+curve_one() {  # <seed> <epoch> <steps> [solver]
+  local seed=$1 epoch=$2 steps=$3 method=${4:-euler} out="$CURVES_ROOT/seed_$1"
+  local name="steps${steps}"
+  [[ "$method" == euler ]] || name="${method}${steps}"
+  local csv="$out/metrics_epoch${epoch}_${name}.csv"
+  [[ -f "$csv" ]] && return 0
+  mkdir -p "$out"
+  # shellcheck disable=SC2086  # the level flag is intentionally word-split
+  "$PYTHON" experiments/evaluate_all.py --checkpoint_dir "$CKPT_ROOT/seed_$seed" --epoch "$epoch" \
+    --num_steps "$steps" --method "$method" --num_samples "$NUM_SAMPLES" --output "$csv" \
+    ${PRIMARY_LEVEL:+--level $PRIMARY_LEVEL} \
+    > "$out/metrics_epoch${epoch}_${name}_console.txt" 2>&1 \
+    || { echo "  FAILED  seed $seed epoch $epoch, $steps $method steps" >&2; return 1; }
+}
+
+curves_stage() {
+  CURVES_ROOT="$RESULTS_BASE/training_curves"
+  echo "=== Training curves ($TASK): seeds [$SEEDS], every 10 epochs to $EPOCHS, $JOBS at a time ==="
+  local running=0 failed=0 seed epoch run
+  for seed in $SEEDS; do
+    for (( epoch = 10; epoch <= EPOCHS; epoch += 10 )); do
+      for run in "100 euler" "3 euler" "5 midpoint"; do
+        if (( running >= JOBS )); then
+          wait -n || failed=1
+          running=$(( running - 1 ))
+        fi
+        # shellcheck disable=SC2086  # run is "<steps> <solver>"
+        curve_one "$seed" "$epoch" $run &
+        running=$(( running + 1 ))
+      done
+    done
+  done
+  while (( running > 0 )); do
+    wait -n || failed=1
+    running=$(( running - 1 ))
+  done
+  if (( failed )); then
+    echo "ERROR: some curve evaluations failed (see above)" >&2
+    exit 1
+  fi
+  echo "Done. Curves in $CURVES_ROOT/"
+}
+
+diagnostics_stage() {
+  echo "=== Pairing diagnostics ($TASK): OT batches of 1, 4 and 10 network batches ==="
+  "$PYTHON" experiments/pairing_diagnostics.py --task "$TASK_CONFIG" \
+    --ot_batch "$BATCH" $(( 4 * BATCH )) $(( 10 * BATCH )) \
+    --output "$RESULTS_BASE/pairing_diagnostics.csv"
+}
+
+calibrate_stage() {
+  echo "=== Calibrating pairing knobs ($TASK): OT batch of ${OT_BATCH_MULT:-4} network batches ==="
+  "$PYTHON" experiments/pairing_diagnostics.py --task "$TASK_CONFIG" --calibrate \
+    --ot_batch $(( ${OT_BATCH_MULT:-4} * BATCH )) --batches 100 --max_skew "${MAX_SKEW:-0.02}" \
+    --output "$RESULTS_BASE/pairing_calibration.csv"
+}
+
+sensitivity_stage() {
+  # One pairing with its calibrated knob halved and doubled, and the OT batch at 1 and 10
+  # network batches. The main runs already cover the calibrated setting at 4.
+  local pairing="${SENS_PAIRING:?set SENS_PAIRING=c2ot, c2ot_fixed or cluster}" suffix knob value flags
+  case "$pairing" in
+    c2ot)       suffix=C2OT;    flags="${C2OT_FLAGS:-}" ;;
+    c2ot_fixed) suffix=C2OTFIX; flags="${C2OTFIX_FLAGS:-}" ;;
+    cluster)    suffix=CLUSTER; flags="${CLUSTER_FLAGS:-}" ;;
+    *) echo "ERROR: SENS_PAIRING must be c2ot, c2ot_fixed or cluster" >&2; exit 2 ;;
+  esac
+  read -r knob value <<< "${flags#--}"
+  local settings=() entry
+  for factor in 0.5 2; do
+    local v
+    v=$("$PYTHON" -c "print(f'{$value * $factor:.4g}')")
+    settings+=("${knob}_$v|--$knob $v")
+  done
+  settings+=("ot_batch_x1|--ot_batch_mult 1" "ot_batch_x10|--ot_batch_mult 10")
+  local variant="cond_pose_flow_matching_model_${suffix}_NOCFG" root="$CKPT_ROOT/sensitivity" entries=()
+  SEEDS="${SENS_SEEDS:-1 2 3}"
+  echo "=== Sensitivity ($TASK): $pairing, settings [${settings[*]%%|*}], seeds [$SEEDS] ==="
+  for entry in "${settings[@]}"; do
+    entries+=("${entry%%|*}|$variant|--conditional --no_cfg --pairing $pairing $flags ${entry#*|}")
+  done
+  train_pool "$root" "${entries[@]}"
+  local name
+  for entry in "${settings[@]}"; do
+    name="${entry%%|*}"
+    CKPT_ROOT="$root/$name"
+    RESULTS_ROOT="$RESULTS_BASE/sensitivity/$name/epoch_$EVAL_EPOCH"
+    echo "=== Sensitivity eval: $pairing, $name ==="
+    eval_stage
+  done
+}
+
+ablate_stage() {
+  local base="${ABLATE_BASE:?set ABLATE_BASE=\"<checkpoint name>|<trainer flags>\" (the baseline variant)}"
+  local base_name="${base%%|*}" base_flags="${base#*|}" root="$CKPT_ROOT/ablate"
+  local wanted=" ${ABLATE_ARMS:-$DEFAULT_ARMS} "
+  local entries=() arms=() entry arm
+  for entry in "${ABLATION_ARMS[@]}"; do
+    arm="${entry%%|*}"
+    [[ "$wanted" == *" $arm "* ]] || continue
+    arms+=("$arm")
+    if [[ "$arm" == cfg ]]; then  # the baseline, trained with CFG
+      entries+=("cfg|${base_name/_NOCFG/_CFG}|${base_flags/--no_cfg/}")
+    else
+      entries+=("$arm|$base_name|$base_flags ${entry#*|}")
+    fi
+  done
+  echo "=== Ablations ($TASK): base $base_name, arms [${arms[*]}], seeds [$SEEDS], $JOBS at a time ==="
+  train_pool "$root" "${entries[@]}"
+  for arm in "${arms[@]}"; do
+    CKPT_ROOT="$root/$arm"
+    RESULTS_ROOT="$RESULTS_BASE/ablate/$arm/epoch_$EVAL_EPOCH"
+    echo "=== Ablation eval: $arm ==="
+    eval_stage
+  done
+}
+
+solver_stage() {
+  echo "=== Solvers at equal network evaluations ($TASK): seeds [$SEEDS], epoch $EVAL_EPOCH ==="
+  local seed
+  for seed in $SEEDS; do
+    # shellcheck disable=SC2086  # the level flag is intentionally word-split
+    "$PYTHON" experiments/steps_sweep.py --checkpoint_dir "$CKPT_ROOT/seed_$seed" --epoch "$EVAL_EPOCH" \
+      --num_samples "$NUM_SAMPLES" --cfg_scale 1.0 --method euler midpoint heun \
+      --steps 2 4 6 10 18 40 100 --output "$RESULTS_ROOT${PRIMARY_LEVEL:+/$PRIMARY_LEVEL}/seed_$seed/solver_sweep.csv" \
+      ${PRIMARY_LEVEL:+--level $PRIMARY_LEVEL}
+  done
+  "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT${PRIMARY_LEVEL:+/$PRIMARY_LEVEL}"
+}
+
+guidance_stage() {
+  echo "=== Guidance intervals ($TASK): CFG models in $CKPT_ROOT, seeds [$SEEDS], epoch $EVAL_EPOCH ==="
+  local seed
+  for seed in $SEEDS; do
+    # shellcheck disable=SC2086  # the level flag is intentionally word-split
+    "$PYTHON" experiments/cfg_sweep.py --checkpoint_dir "$CKPT_ROOT/seed_$seed" --epoch "$EVAL_EPOCH" \
+      --num_samples "$NUM_SAMPLES" --scales 1 1.1 1.2 1.3 1.5 3 --intervals full 0-0.5 0.25-0.75 0.5-1 \
+      --num_steps 9 100 --output "$RESULTS_ROOT${PRIMARY_LEVEL:+/$PRIMARY_LEVEL}/seed_$seed/guidance_sweep.csv" \
+      ${PRIMARY_LEVEL:+--level $PRIMARY_LEVEL}
+  done
+  "$PYTHON" experiments/aggregate_seeds.py --results_dir "$RESULTS_ROOT${PRIMARY_LEVEL:+/$PRIMARY_LEVEL}"
+}
+
+size_stage() {
+  local base="${SIZE_BASE:-cond_pose_flow_matching_model_OT_NOCFG|--conditional --no_cfg --pairing ot}"
+  local base_name="${base%%|*}" base_flags="${base#*|}" root="$CKPT_ROOT/size"
+  local wanted=" ${SIZES:-S M L} " entries=() sizes=() entry size
+  for entry in "${SIZE_FLAGS[@]}"; do
+    size="${entry%%|*}"
+    [[ "$wanted" == *" $size "* ]] || continue
+    sizes+=("$size")
+    entries+=("$size|$base_name|$base_flags ${entry#*|}")
+  done
+  SEEDS="${SIZE_SEEDS:-1 2}"
+  echo "=== Backbone sizes ($TASK): base $base_name, sizes [${sizes[*]}], seeds [$SEEDS], $JOBS at a time ==="
+  train_pool "$root" "${entries[@]}"
+  for size in "${sizes[@]}"; do
+    CKPT_ROOT="$root/$size"
+    RESULTS_ROOT="$RESULTS_BASE/size/$size/epoch_$EVAL_EPOCH"
+    echo "=== Size eval: $size ==="
+    eval_stage
+  done
+}
+
+if [[ "$STAGE" == curves ]]; then curves_stage; exit 0; fi
+if [[ "$STAGE" == diagnostics ]]; then diagnostics_stage; exit 0; fi
+if [[ "$STAGE" == calibrate ]]; then calibrate_stage; exit 0; fi
+if [[ "$STAGE" == sensitivity ]]; then sensitivity_stage; exit 0; fi
+if [[ "$STAGE" == ablate ]]; then ablate_stage; exit 0; fi
+if [[ "$STAGE" == solver ]]; then solver_stage; exit 0; fi
+if [[ "$STAGE" == guidance ]]; then guidance_stage; exit 0; fi
+if [[ "$STAGE" == size ]]; then size_stage; exit 0; fi
+if [[ "$STAGE" == train || "$STAGE" == all ]]; then train_stage; fi
+if [[ "$STAGE" == eval  || "$STAGE" == all ]]; then eval_stage; fi
+echo "Done. Summaries in $RESULTS_ROOT/"

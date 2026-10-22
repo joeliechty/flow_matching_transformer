@@ -17,11 +17,17 @@ build/
 # model checkpoints
 checkpoints/
 
+# experiment outputs and eval artifacts
+experiments/results/
+eval_assets/
+huggingface/_stage/
+
 # images
 *.png
 *.jpg
 *.jpeg
 *.gif
+!docs/**/*.png
 
 # logs
 setup_log.txt

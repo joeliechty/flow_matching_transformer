@@ -23,7 +23,7 @@ def load_model(checkpoint_path, device='cpu', model_config=None, conditional=Fal
         checkpoint_path, device=device, model_config=model_config
     )
     model.eval()
-    print(f"Loaded model from {checkpoint_path}")
+    print(f"Loaded model from {checkpoint_path} ({'EMA' if 'ema_state_dict' in checkpoint else 'raw'} weights)")
     if 'epoch' in checkpoint:
         print(f"  Epoch: {checkpoint['epoch']}")
     if 'loss' in checkpoint:
@@ -32,7 +32,8 @@ def load_model(checkpoint_path, device='cpu', model_config=None, conditional=Fal
 
 
 def generate_from_noise(model, batch_size, obs=None, num_steps=100,
-                        return_trajectory=False, cfg_scale=3.0, device='cpu'):
+                        return_trajectory=False, cfg_scale=3.0, device='cpu', method='euler',
+                        cfg_interval=None):
     """
     Sample [B, SEQ_LEN, PATCH_DIM] noise and integrate the flow.
 
@@ -48,12 +49,12 @@ def generate_from_noise(model, batch_size, obs=None, num_steps=100,
         if is_conditional:
             result = model.inference(
                 x0, obs, num_steps=num_steps, return_trajectory=return_trajectory,
-                cfg_scale=cfg_scale, manifold='euclidean',
+                cfg_scale=cfg_scale, manifold='euclidean', method=method, cfg_interval=cfg_interval,
             )
         else:
             result = model.inference(
                 x0, num_steps=num_steps, return_trajectory=return_trajectory,
-                manifold='euclidean',
+                manifold='euclidean', method=method,
             )
 
     if return_trajectory:
